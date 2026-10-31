@@ -9,6 +9,9 @@ description = "Graph-based critic targets and costs"
 requires-python = ">=3.10"
 dependencies = ["numpy", "scipy"]
 
+[project.optional-dependencies]
+yaml = ["PyYAML>=6"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["graphcritic"]

@@ -1,11 +1,10 @@
 """Graph-based critic target construction and cost-unit conversion."""
 
-from typing import Literal
-
 import numpy as np
 from numpy.typing import NDArray
 
-from graphcritic.types import NodeSet, TransitionSet
+from graphcritic.config import TargetConfig
+from graphcritic.types import NodeSet, TargetSet, TransitionSet
 
 
 def critic_targets(
@@ -13,7 +12,7 @@ def critic_targets(
     nodes: NodeSet,
     cost: NDArray[np.float64],
     gamma: float,
-    c_max: float,
-    unit: Literal["steps", "cost"] = "steps",
-) -> NDArray[np.float64]:
+    c_max_steps: float,
+    cfg: TargetConfig,
+) -> TargetSet:
     raise NotImplementedError

@@ -3,13 +3,13 @@
 import numpy as np
 from numpy.typing import NDArray
 
-from graphcritic.types import NodeSet
+from graphcritic.config import GraphConfig
+from graphcritic.types import NodeSet, TransitionSet
 
 
 def build_nodes(
-    feat: NDArray[np.float64],
-    radius: float,
-    goal_mask: NDArray[np.bool_],
-    consistency: bool = True,
+    trans: TransitionSet,
+    cfg: GraphConfig,
 ) -> NodeSet:
+    """Build state nodes for every current and episode-final next state."""
     raise NotImplementedError

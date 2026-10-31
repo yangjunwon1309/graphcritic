@@ -3,3 +3,4 @@ outputs/
 checkpoints/
 .pixi/
 __pycache__/
+.local-memory/

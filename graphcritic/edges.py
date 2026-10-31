@@ -9,5 +9,4 @@ def build_edges(
     compress: bool = True,
     edge_filter: object | None = None,
 ) -> EdgeSet:
-    """Build directed graph edges from transitions and node assignments."""
     raise NotImplementedError

@@ -9,8 +9,6 @@ from numpy.typing import NDArray
 
 @dataclass
 class TransitionSet:
-    """Chunk transitions with features and source dataset row indices."""
-
     feat: NDArray[np.float64]  # shape: (N, p)
     next_feat: NDArray[np.float64]  # shape: (N, p)
     episode_id: NDArray[np.int64]  # shape: (N,)
@@ -22,8 +20,6 @@ class TransitionSet:
 
 @dataclass
 class NodeSet:
-    """Representative rows and transition-to-node assignments."""
-
     rep_row: NDArray[np.int64]  # shape: (V,)
     assign: NDArray[np.int64]  # shape: (M,)
     is_goal: NDArray[np.bool_]  # shape: (V,)
@@ -31,8 +27,6 @@ class NodeSet:
 
 @dataclass
 class EdgeSet:
-    """Directed graph edges with duration and success/failure counts."""
-
     src: NDArray[np.int64]  # shape: (E,)
     dst: NDArray[np.int64]  # shape: (E,)
     kappa: NDArray[np.float64]  # shape: (E,)
@@ -42,8 +36,6 @@ class EdgeSet:
 
 @dataclass
 class GraphArtifact:
-    """Graph, solved cost-to-go values, successors, and provenance metadata."""
-
     nodes: NodeSet
     edges: EdgeSet
     cost: NDArray[np.float64]  # shape: (V,)

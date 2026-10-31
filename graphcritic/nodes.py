@@ -12,5 +12,4 @@ def build_nodes(
     goal_mask: NDArray[np.bool_],
     consistency: bool = True,
 ) -> NodeSet:
-    """Merge nearby feature rows and return graph-node assignments."""
     raise NotImplementedError

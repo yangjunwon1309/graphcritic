@@ -12,5 +12,4 @@ def edge_weights(
     edges: EdgeSet,
     policy: Literal["hop", "time", "lcb"],
 ) -> NDArray[np.float64]:
-    """Return edge costs for the requested graph-weight policy."""
     raise NotImplementedError

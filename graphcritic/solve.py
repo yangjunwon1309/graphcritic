@@ -11,5 +11,4 @@ def solve(
     edges: EdgeSet,
     w: NDArray[np.float64],
 ) -> tuple[NDArray[np.float64], NDArray[np.int64]]:
-    """Solve graph costs to success nodes and return successor indices."""
     raise NotImplementedError

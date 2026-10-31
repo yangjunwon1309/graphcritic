@@ -16,5 +16,4 @@ def critic_targets(
     c_max: float,
     unit: Literal["steps", "cost"] = "steps",
 ) -> NDArray[np.float64]:
-    """Construct chunk-aware graph critic targets."""
     raise NotImplementedError

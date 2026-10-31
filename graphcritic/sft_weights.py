@@ -14,5 +14,4 @@ def sft_weights(
     beta: float,
     clip: float,
 ) -> NDArray[np.float64]:
-    """Return clipped exponential cost-domain advantage weights."""
     raise NotImplementedError

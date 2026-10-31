@@ -1,0 +1,8 @@
+[submodule "third_party/fql"]
+	path = third_party/fql
+	url = https://github.com/yangjunwon1309/fql.git
+	branch = graph-critic
+[submodule "third_party/qc"]
+	path = third_party/qc
+	url = https://github.com/yangjunwon1309/qc.git
+	branch = graph-critic

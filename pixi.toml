@@ -1,0 +1,26 @@
+[workspace]
+name = "graphcritic"
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+[feature.core.dependencies]
+scipy = "*"
+pytest = "*"
+
+[feature.numpy126.dependencies]
+numpy = ">=1.26,<2"
+
+[feature.numpy2.dependencies]
+numpy = ">=2,<3"
+
+[feature.bench.dependencies]
+# TODO: fork requirements.txt 확인 후 고정
+
+[feature.kitchen.dependencies]
+# TODO: fork requirements.txt 확인 후 고정
+
+[environments]
+core = ["core", "numpy126"]
+core-numpy2 = ["core", "numpy2"]
+bench = ["core", "numpy126", "bench"]
+kitchen = ["core", "numpy126", "kitchen"]

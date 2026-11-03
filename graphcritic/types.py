@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from graphcritic.config import GraphConfig
 
 
-SCHEMA_VERSION = "0.1"
+SCHEMA_VERSION = "0.2"
 
 
 class SchemaError(ValueError):
@@ -98,7 +98,7 @@ def _content_hash(
 
 @dataclass
 class TransitionSet:
-    """Flat dataset rows; each row represents one environment step."""
+    """Flat dataset rows; success labels are explicit for both state endpoints."""
 
     feat: NDArray[np.float32]
     next_feat: NDArray[np.float32]
@@ -107,6 +107,7 @@ class TransitionSet:
     success: NDArray[np.bool_]
     terminal: NDArray[np.bool_]
     row_idx: NDArray[np.int64]
+    success_cur: NDArray[np.bool_] | None = None
 
     def __post_init__(self) -> None:
         self.feat = _array(self.feat, np.float32, "feat")
@@ -116,7 +117,19 @@ class TransitionSet:
         self.success = _array(self.success, np.bool_, "success")
         self.terminal = _array(self.terminal, np.bool_, "terminal")
         self.row_idx = _array(self.row_idx, np.int64, "row_idx")
+        if self.success_cur is None:
+            self.success_cur = np.zeros(self.success.shape, dtype=np.bool_)
+            if self.success.size > 1:
+                same_episode = self.episode_id[1:] == self.episode_id[:-1]
+                self.success_cur[1:] = self.success[:-1] & same_episode
+        else:
+            self.success_cur = _array(self.success_cur, np.bool_, "success_cur")
         self.validate()
+
+    @property
+    def success_next(self) -> NDArray[np.bool_]:
+        """Explicit alias for `success`, whose schema meaning is `s_{t+1}`."""
+        return self.success
 
     @property
     def n_rows(self) -> int:
@@ -128,7 +141,7 @@ class TransitionSet:
         if self.feat.shape[1] == 0 or self.next_feat.shape != self.feat.shape:
             raise SchemaError("feat and next_feat must have the same non-empty feature dimension")
         n_rows = self.feat.shape[0]
-        for name in ("episode_id", "t", "success", "terminal", "row_idx"):
+        for name in ("episode_id", "t", "success", "success_cur", "terminal", "row_idx"):
             if getattr(self, name).shape != (n_rows,):
                 raise SchemaError(f"{name} must have shape ({n_rows},)")
         if not np.all(np.isfinite(self.feat)) or not np.all(np.isfinite(self.next_feat)):
@@ -151,6 +164,12 @@ class TransitionSet:
             if not np.all(~self.terminal[start : end - 1]) or not self.terminal[end - 1]:
                 raise SchemaError("terminal must be true only on each episode's final row")
         nonterminal_rows = np.flatnonzero(~self.terminal)
+        if nonterminal_rows.size and np.any(
+            self.success[nonterminal_rows] != self.success_cur[nonterminal_rows + 1]
+        ):
+            raise SchemaError(
+                "success for s_{t+1} must equal the following row's success_cur on nonterminal rows"
+            )
         if nonterminal_rows.size and np.any(
             np.any(self.next_feat[nonterminal_rows] != self.feat[nonterminal_rows + 1], axis=1)
         ):
@@ -228,12 +247,7 @@ class NodeSet:
         ):
             raise SchemaError("assign_next[i] must equal assign_cur[i + 1] on nonterminal rows")
 
-        # A successful transition labels its next state as a goal; the same state
-        # is also the current state of the next row when the episode continues.
-        cur_success = np.zeros(trans.n_rows, dtype=np.bool_)
-        same_episode_next = trans.episode_id[1:] == trans.episode_id[:-1]
-        cur_success[1:] = trans.success[:-1] & same_episode_next
-        if np.any(self.is_goal[self.assign_cur] != cur_success):
+        if np.any(self.is_goal[self.assign_cur] != trans.success_cur):
             raise SchemaError("goal-node membership for current states disagrees with success labels")
         if np.any(self.is_goal[self.assign_next] != trans.success):
             raise SchemaError("goal-node membership for next states disagrees with success labels")

@@ -1,9 +1,16 @@
-psi: null
-radius: null
-h: null
-gamma: null
-pessimism:
-  mode: null
-  delta: null
-  lambda: null
-c_max: null
+{
+  "gamma": 0.99,
+  "radius": 0.25,
+  "feature": {"name": "identity", "standardize": false},
+  "compress": false,
+  "consistency": false,
+  "weight_policy": "time",
+  "pessimism": {
+    "mode": "union",
+    "delta": 0.05,
+    "lam": null,
+    "prior_data": [1.0, 1.0],
+    "prior_bridge": [1.0, 1.0]
+  },
+  "c_max_steps": null
+}

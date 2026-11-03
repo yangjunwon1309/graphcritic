@@ -106,6 +106,7 @@ def _transition_arrays(trans: TransitionSet) -> dict[str, NDArray[Any]]:
         "episode_id": trans.episode_id,
         "t": trans.t,
         "success": trans.success,
+        "success_cur": trans.success_cur,
         "terminal": trans.terminal,
         "row_idx": trans.row_idx,
     }
@@ -143,7 +144,9 @@ def load_transitions(
     expected_dataset_id: str | None = None,
 ) -> tuple[TransitionSet, dict[str, Any]]:
     arrays, metadata = _read_pair(path)
-    required = {"feat", "next_feat", "episode_id", "t", "success", "terminal", "row_idx"}
+    required = {
+        "feat", "next_feat", "episode_id", "t", "success", "success_cur", "terminal", "row_idx"
+    }
     if set(arrays) != required:
         raise SchemaError(f"transition arrays must be exactly {sorted(required)}")
     _require_hash(metadata, {}, arrays)

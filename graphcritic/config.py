@@ -84,7 +84,7 @@ class GraphConfig:
         if not isinstance(self.compress, bool):
             raise SchemaError("compress must be boolean")
         if self.consistency:
-            raise SchemaError("consistency=True is not supported by the v0.1 schema")
+            raise SchemaError("consistency=True is not supported by the current graph implementation")
         if self.weight_policy not in {"hop", "time", "lcb"}:
             raise SchemaError("weight_policy must be 'hop', 'time', or 'lcb'")
         if self.c_max_steps is not None and (

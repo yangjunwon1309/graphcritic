@@ -3,4 +3,5 @@ outputs/
 checkpoints/
 .pixi/
 __pycache__/
+*.egg-info/
 .local-memory/

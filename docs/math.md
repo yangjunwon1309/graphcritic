@@ -1,6 +1,6 @@
 # Graph Critic formalization
 
-This note fixes the notation used by the v0.1 row schema and graph-cost construction. It states the exact finite-graph result used by the implementation; statistical calibration and critic approximation guarantees require separate assumptions and are not claimed here.
+This note fixes the notation used by the v0.2 row schema and graph-cost construction. It states the exact finite-graph result used by the implementation; statistical calibration and critic approximation guarantees require separate assumptions and are not claimed here.
 
 ## Data and graph notation
 
@@ -10,7 +10,7 @@ Let a flat dataset contain rows `i = 0, ..., N-1`, each representing one environ
 (s_i,a_i,s'_i,r_i,d_i),
 \]
 
-where `d_i` marks the last row of its episode and `z_i` is the binary success label for the next state `s'_i`. The adapter supplies a feature map `ψ`, with `x_i = ψ(s_i)` and `x'_i = ψ(s'_i)`. Rows belonging to one episode are contiguous, and their local times start at zero and increase by one.
+where `d_i` marks the last row of its QC sampler segment. The schema stores two labels: `z_i^cur` for current state `s_i` and `z_i^next` for next state `s'_i`. `episode_id` names a sampler segment, so rows are contiguous and local times start at zero and increase by one. Sticky robomimic done rows each end a segment while source rows remain in place.
 
 The graph builder assigns each current and next state to nodes:
 
@@ -19,7 +19,7 @@ The graph builder assigns each current and next state to nodes:
 \nu'_i = \texttt{assign\_next}[i].
 \]
 
-For every nonterminal row, `ν'_i = ν_{i+1}`. A node is a goal exactly when all represented state occurrences are success states. The finite directed edge set is `E`; edge `e=(u,v)` stores duration upper bound `κ_e ≥ 1`, positive count `n_e^+`, negative count `n_e^-`, and kind (data or bridge).
+For every nonterminal row, `ν'_i = ν_{i+1}`. Current and next occurrences use their corresponding success labels. Goal nodes represent only successful state occurrences; goal and non-goal states are never merged. The finite directed edge set is `E`; edge `e=(u,v)` stores duration upper bound `κ_e ≥ 1`, positive count `n_e^+`, negative count `n_e^-`, and kind (data or bridge).
 
 ## Edge costs and graph value
 
@@ -60,10 +60,10 @@ The implementation evaluates the general quantile with `scipy.special.betaincinv
 
 ## Chunk targets and validity
 
-For a chunk starting at row `i` with horizon `h`, define `valid_i` iff (1) `i+h-1 < N`, (2) all rows `i,...,i+h-1` belong to the same episode, and (3) none of `i,...,i+h-2` is terminal. This matches QC's `sample_sequence` endpoint-validity mask. Let
+For a chunk starting at row `i` with horizon `h`, define `valid_i` iff (1) `i+h-1 < N` and (2) none of `i,...,i+h-2` is terminal. This matches QC's `sample_sequence` endpoint-validity mask: a terminal on the final chunk row is allowed, but a terminal before it invalidates the chunk. Let
 
 \[
-k_i = \min\{j \in \{0,\ldots,h-1\}: z_{i+j}=1\},
+k_i = \min\{j \in \{0,\ldots,h-1\}: z_{i+j}^{next}=1\},
 \]
 
 when the set is nonempty. Let `C_max = c · c_max_steps`. The step-unit target is
@@ -72,13 +72,16 @@ when the set is nonempty. Let `C_max = c · c_max_steps`. The step-unit target i
 y_i =
 \begin{cases}
 0, & \neg valid_i,\\
-k_i+1, & valid_i\text{ and }k_i\text{ exists},\\
+0, & valid_i\text{ and }z_i^{cur}=1,\\
+k_i+1, & valid_i,\ z_i^{cur}=0,\text{ and }k_i\text{ exists},\\
 h + \min\left(C_G(\nu'_{i+h-1})/c,\;c_{\max}^{\mathrm{steps}}\right),
-& valid_i\text{ and no success occurs in the chunk}.
+& valid_i,\ z_i^{cur}=0,\text{ and no success occurs in the chunk}.
 \end{cases}
 \]
 
-Invalid targets are zero-filled because multiplying a NaN target by a zero loss mask still yields NaN. For `unit="nats"`, multiply the step target by `c`. Horizon `h=1` gives the FQL target. A cost critic can be trained with squared error to `y`; the actor consumes `Q=-C_\theta`.
+A chunk that starts in an already-successful current state has zero remaining cost. Otherwise, a success on the next state of its `j`th transition costs `j+1` steps.
+
+Invalid targets are zero-filled because multiplying a NaN target by a zero loss mask still yields NaN. For `unit="nats"`, multiply the step target by `c`. A cost critic can be trained with squared error to `y`; the actor consumes `Q=-C_\theta`.
 
 For valid rows, the BOOST-style weighted-SFT weight is defined in nats as
 

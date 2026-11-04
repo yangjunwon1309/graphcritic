@@ -23,7 +23,9 @@ def edge_weights(
         bridge = edges.kind == 1
         if np.any(bridge):
             policy = cfg.bridge.cost.policy
-            if policy == "prior":
+            if policy == "time":
+                lambda_bridge = c * cfg.bridge.cost.lambda0_steps
+            elif policy == "prior":
                 radius = (
                     cfg.bridge.radius * float(d_step)
                     if cfg.bridge.radius_unit == "step" and d_step is not None

@@ -233,7 +233,7 @@ def build_nodes(
     trans.validate()
     cfg.validate()
     x, ref, is_success, stored_modes = state_table(trans)
-    if stdz.mean.shape != (trans.feat.shape[1],):
+    if stdz.input_dim != trans.feat.shape[1]:
         raise SchemaError("standardizer feature dimension does not match transitions")
     z = stdz.transform(x) if cluster_features is None else np.asarray(cluster_features, dtype=np.float32)
     if z.ndim != 2 or z.shape[0] != x.shape[0] or z.shape[1] == 0 or not np.all(np.isfinite(z)):

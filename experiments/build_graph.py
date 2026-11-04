@@ -72,6 +72,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--force", action="store_true", help="Write artifacts despite a failed training gate")
     parser.add_argument("--gate-cap-frac", type=float, default=0.5)
     parser.add_argument("--gate-reachable", type=float, default=0.5)
+    parser.add_argument("--gate-failed-reachable", type=float, default=0.3)
     parser.add_argument("--gate-path-exec", type=float, default=0.7)
     return parser.parse_args(argv)
 
@@ -83,6 +84,11 @@ def main(argv: list[str] | None = None) -> int:
         if len(set(args.h)) != len(args.h) or any(h < 1 for h in args.h):
             raise ValueError("--h values must be unique positive integers")
         cfg = GraphConfig.from_yaml(args.config)
+        if args.path_exec and cfg.bridge.cost.policy == "time":
+            raise ValueError(
+                "time-policy paths must be evaluated with experiments/eval_graph_policy.py; "
+                "--path-exec is the legacy open-loop diagnostic"
+            )
         sim_state = None
         if args.toy is not None:
             trans, toy_info = _toy_data(args.toy, args.seed)
@@ -183,12 +189,26 @@ def main(argv: list[str] | None = None) -> int:
                 for value in diagnostics["targets_by_horizon"].values()
             ]
         cap_frac = max(cap_fracs, default=0.0)
-        reachable = float(diagnostics["graph"]["reachable_frac"] if "graph" in diagnostics else diagnostics["reachable_frac"])
+        graph_diagnostics = diagnostics["graph"] if "graph" in diagnostics else diagnostics
+        reachable = float(graph_diagnostics["reachable_frac"])
+        failed_reachable = float(graph_diagnostics["reachable_frac_failed_eps"])
+        bridge_use = float(graph_diagnostics["bridge_use_frac"])
+        stitch_gain = float(graph_diagnostics["stitch_gain"]["frac_gt_1_step"])
         gate_reasons = []
         if cap_frac > args.gate_cap_frac:
             gate_reasons.append(f"valid non-success cap fraction {cap_frac:.4f} exceeds {args.gate_cap_frac:.4f}")
         if reachable < args.gate_reachable:
             gate_reasons.append(f"reachable fraction {reachable:.4f} is below {args.gate_reachable:.4f}")
+        if cfg.graph_kind == "state" and cfg.bridge.cost.policy == "time":
+            if failed_reachable < args.gate_failed_reachable:
+                gate_reasons.append(
+                    f"failed-episode reachable fraction {failed_reachable:.4f} "
+                    f"is below {args.gate_failed_reachable:.4f}"
+                )
+            if bridge_use <= 0:
+                gate_reasons.append("no finite shortest path uses a bridge")
+            if stitch_gain <= 0:
+                gate_reasons.append("no successful-episode state gains more than one step from stitching")
         path_rate = (
             diagnostics.get("graph", {}).get("path_exec_switch_le_3")
             if "graph" in diagnostics else diagnostics.get("path_exec_switch_le_3")
@@ -203,6 +223,9 @@ def main(argv: list[str] | None = None) -> int:
             "reasons": gate_reasons,
             "cap_fraction": cap_frac,
             "reachable_fraction": reachable,
+            "reachable_fraction_failed_eps": failed_reachable,
+            "bridge_use_frac": bridge_use,
+            "stitch_gain_frac_gt_1_step": stitch_gain,
             "force": bool(args.force),
         }
         diagnostics_path = args.out / "diagnostics.json"

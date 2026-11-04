@@ -13,9 +13,10 @@ if str(ROOT) not in sys.path:
 
 import numpy as np
 
-from graphcritic.featurize import state_table
+from graphcritic.config import FeatureConfig
+from graphcritic.featurize import StateFeaturizer, state_table
 from graphcritic.modes import resolve_state_modes, state_episode_time
-from graphcritic.types import SimStateSet
+from graphcritic.types import SimStateSet, SchemaError
 from graphcritic.io import load_sim_state, load_transitions
 
 
@@ -27,6 +28,10 @@ def _args() -> argparse.Namespace:
     source.add_argument("--robomimic-env")
     parser.add_argument("--sim-state", type=Path)
     parser.add_argument("--mode-fn", default="none")
+    parser.add_argument(
+        "--feature", choices=("identity", "ogbench_scene_pos", "robomimic_pos"),
+        default="identity",
+    )
     parser.add_argument("--min-dwell", type=int, default=3)
     parser.add_argument("--tau", type=float, default=0.2)
     parser.add_argument("--out", type=Path)
@@ -49,15 +54,28 @@ def main() -> int:
         sim_state = None
 
     x, _, success, _ = state_table(trans)
+    feature_cfg = FeatureConfig(name=args.feature, standardize=True)
+    featurizer = StateFeaturizer.fit(trans, feature_cfg, sim_state=sim_state)
+    aux = None
+    if sim_state is not None:
+        aux = {"qpos": sim_state.qpos, "qvel": sim_state.qvel}
+        if sim_state.button_states is not None:
+            aux["button_states"] = sim_state.button_states
+    phi = featurizer.transform(x, aux=aux)
     valid_rows = np.flatnonzero(~trans.terminal)
-    std = np.std(x.astype(np.float64), axis=0)
-    delta = np.abs(trans.next_feat[valid_rows].astype(np.float64) - trans.feat[valid_rows])
-    rho = np.median(delta, axis=0) / np.maximum(std, 1e-12)
-    suggested = np.flatnonzero(rho <= args.tau).astype(int).tolist()
-
     modes = resolve_state_modes(
         trans, args.mode_fn, sim_state=sim_state, min_dwell=args.min_dwell
     )
+    same_mode = modes[valid_rows] == modes[valid_rows + 1]
+    valid_rows = valid_rows[same_mode]
+    delta = np.abs(phi[valid_rows + 1].astype(np.float64) - phi[valid_rows])
+    std = np.std(phi.astype(np.float64), axis=0)
+    rho = np.median(delta, axis=0) / np.maximum(std, 1e-12)
+    d_step_values = np.linalg.norm(delta, axis=1)
+    d_step_values = d_step_values[np.isfinite(d_step_values) & (d_step_values > 1e-8)]
+    d_step = float(np.median(d_step_values)) if d_step_values.size else 1.0
+    suggested = np.flatnonzero(rho <= args.tau).astype(int).tolist()
+
     episodes, times = state_episode_time(trans)
     segments = 0
     for ep in np.unique(episodes):
@@ -69,7 +87,10 @@ def main() -> int:
     report = {
         "n_rows": trans.n_rows,
         "n_states": int(x.shape[0]),
-        "feature_dim": int(x.shape[1]),
+        "raw_observation_dim": int(x.shape[1]),
+        "feature": featurizer.meta(),
+        "feature_dim": int(phi.shape[1]),
+        "d_step": d_step,
         "tau": float(args.tau),
         "rho": [float(v) for v in rho],
         "suggested_dims": suggested,
@@ -80,10 +101,18 @@ def main() -> int:
             str(int(mode)): int(count) for mode, count in zip(goal_modes, goal_counts, strict=True)
         },
     }
+    if args.feature == "ogbench_scene_pos":
+        if sim_state is None:
+            raise SchemaError("ogbench_scene_pos inspection requires a simulator sidecar")
+        from envs.ogbench_layout import verify_scene_position_layout
+        check_rows = np.arange(min(1000, trans.n_rows), dtype=np.int64)
+        report["layout_check"] = verify_scene_position_layout(
+            trans.feat, sim_state.qpos[: trans.n_rows], rows=check_rows
+        )
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print("dim\tstd\trho\tselect")
+    print("feature_dim\tstd\trho\tselect")
     for dim, (scale, value) in enumerate(zip(std, rho, strict=True)):
         print(f"{dim}\t{scale:.6g}\t{value:.6g}\t{'keep' if value <= args.tau else 'drop'}")
     print(json.dumps({key: value for key, value in report.items() if key != "rho"}, sort_keys=True))

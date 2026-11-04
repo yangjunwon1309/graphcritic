@@ -245,6 +245,9 @@ def _graph_arrays(artifact: GraphArtifact) -> dict[str, NDArray[Any]]:
         "dataset_id": np.asarray(artifact.meta["dataset_id"]),
         "feature_checkpoint_sha256": np.asarray(checkpoint_hash),
     }
+    tau_hash = artifact.meta.get("tau_model_sha256")
+    if tau_hash is not None:
+        arrays["tau_model_sha256"] = np.asarray(str(tau_hash))
     arrays.update({f"feature_{name}": value for name, value in artifact.feature_stats.items()})
     return arrays
 
@@ -280,8 +283,13 @@ def load_graph(path: str | Path, *, trans: TransitionSet | None = None) -> Graph
         "dataset_id", "feature_checkpoint_sha256",
         "feature_mean", "feature_std",
     }
-    if set(arrays) != required:
+    optional = {"tau_model_sha256"}
+    if not required.issubset(arrays) or set(arrays) - required - optional:
         raise SchemaError(f"graph arrays must be exactly {sorted(required)}")
+    if "tau_model_sha256" in arrays:
+        meta = metadata.get("meta")
+        if not isinstance(meta, dict) or str(arrays["tau_model_sha256"].item()) != meta.get("tau_model_sha256"):
+            raise SchemaError("tau model hash array does not match graph metadata")
     nodes = NodeSet(
         rep_feat=arrays["rep_feat"],
         rep_ref=arrays["rep_ref"],

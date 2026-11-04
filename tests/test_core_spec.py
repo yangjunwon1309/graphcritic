@@ -3,7 +3,7 @@
 import numpy as np
 
 from envs.toy import make_chain, make_grid
-from graphcritic.config import GraphConfig, PessimismConfig
+from graphcritic.config import BridgeConfig, BridgeCostConfig, GraphConfig, PessimismConfig
 from graphcritic.pipeline import build_artifact
 from graphcritic.stats import beta_lcb
 from graphcritic.types import EdgeSet, NodeSet
@@ -51,7 +51,13 @@ def test_boost_hop_cost_equivalence():
 
 def test_toy_chain_and_grid_costs():
     chain, chain_info = make_chain(L=14, n_episodes=12, p_forward=1.0, seed=5)
-    cfg = GraphConfig(gamma=0.99, radius=0.25, compress=False, weight_policy="time")
+    cfg = GraphConfig(
+        gamma=0.99, radius=0.25, compress=False, weight_policy="time",
+        bridge=BridgeConfig(
+            radius=1e-4,
+            cost=BridgeCostConfig(tau_model="geometric", lambda0_steps=100.0),
+        ),
+    )
     chain_graph = build_artifact(chain, cfg, dataset_id="chain", source="test")
     c = step_cost(cfg.gamma)
     for node, feature in enumerate(chain_graph.nodes.rep_feat[:, 0]):
@@ -82,7 +88,13 @@ def test_lcb_closed_form_matches_beta_quantile():
 
 def test_artifact_hash_is_deterministic():
     trans, _ = make_chain(L=9, n_episodes=5, p_forward=1.0, seed=13)
-    cfg = GraphConfig(radius=0.25, compress=False, weight_policy="time")
+    cfg = GraphConfig(
+        radius=0.25, compress=False, weight_policy="time",
+        bridge=BridgeConfig(
+            radius=1e-4,
+            cost=BridgeCostConfig(tau_model="geometric", lambda0_steps=100.0),
+        ),
+    )
     first = build_artifact(trans, cfg, dataset_id="same-data", source="test")
     second = build_artifact(trans, cfg, dataset_id="same-data", source="test")
     assert first.content_hash == second.content_hash

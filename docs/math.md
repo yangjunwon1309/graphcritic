@@ -1,76 +1,60 @@
-# Graph Critic v0.2 graph formalization
+# Graph Critic v0.3 bridge formalization
 
-This note describes the schema-0.3 implementation of the v0.2 graph redesign. It separates exact properties of the finite graph from assumptions about real simulator behavior and statistical calibration.
+This note describes the direct, closed-loop travel-time bridge schema. Graph construction uses only transitions, features, labels, modes, and optional simulator-state sidecars. It does not roll out a simulator policy. Simulator use is isolated to the later graph-tracking evaluation.
 
-## State occurrences and replay data
+## State occurrences and position features
 
-Each transition row `i` stores `(s_i, a_i, s'_i)`, a segment ID, local time, terminal status, success labels for both endpoints, and discrete modes `m_i` and `m'_i`. The state table contains the `N` current-state occurrences followed by one final next-state occurrence for each terminal row. For a nonterminal row, its next-state occurrence is the next row's current state. `graph_kind="state"` gives each occurrence its own vertex; no geometric clustering occurs.
+Each transition row `i` stores `(s_i, a_i, s'_i)`, episode/time labels, terminal status, success labels for both endpoints, and discrete modes. The state table contains all current observations followed by one final next-state occurrence for each terminal row. `graph_kind="state"` gives every occurrence its own vertex. Goal vertices are a distribution of success-labeled occurrences, not a single representative state.
 
-Let `φ(s)` be the configured identity, selected, or TDR feature. The median within-mode one-step feature distance is `d_step`. Bridge radius is absolute or `radius × d_step`.
+Let `φ(s)` be the configured feature and let `d_step` be the median within-mode one-step Euclidean distance in that feature space. A step-unit radius `r` means `r × d_step` in feature units.
 
-The graph has two edge types:
+For OGBench Scene, `ogbench_scene_pos` uses the 40-value observation layout checked against the installed `SceneEnv.compute_observation()` implementation. It keeps eef xyz/yaw, gripper opening, cube xyz and `cos(4θ), sin(4θ)` computed from the sidecar quaternion, drawer position, and window position. It drops joint velocities, contact, cube quaternion/raw yaw, button observations, and drawer/window velocities. The 90-degree symmetric cube yaw encoding is invariant to the cube's four equivalent orientations. Each group is standardized per dimension and scaled by the inverse square root of its width. `robomimic_pos` applies the same rule to eef position plus sign-canonicalized quaternion, gripper width, and object xyz.
 
-- A temporal edge follows one recorded transition, has `κ=1`, and cost `c=-log γ`.
-- A bridge from source `u` to anchor `v` replays the anchor's recorded actions for `L` steps and lands at `v+L`. It requires matching modes, an eligible time gap, distance within radius, and a valid same-mode landing segment. It has `κ=L`, stores `dist=d(φ(u),φ(v))`, and records `anchor=v`.
+## Edge schema and costs
 
-The bridge points to the landing state, not the anchor. It represents borrowing the anchor's action sequence for an open-loop replay. The source and anchor may be nearby but are distinct occurrences.
+Temporal edge `(u,next(u))` has `κ=1` and weight `c=-log(γ)`.
 
-## Bridge cost policies
+A v0.3 bridge is a direct edge `(u,v)`: `m(u)=m(v)`, the feature distance satisfies the configured candidate radius, and same-episode pairs must satisfy `|t(v)-t(u)| > min_time_gap`. The destination can be any state occurrence, including a goal. The bridge's `anchor` is `v`, and its `κ` is the estimated travel time `τ(u,v)`. The graph does not attach copied actions or a simulated landing state to this edge.
 
-For a prior bridge, the added switch cost is
-
-\[
-\lambda_b = c\left(\Lambda_0 + \Lambda_1(d_b/r)^2\right),
-\qquad w_b = cL + \lambda_b.
-\]
-
-Temporal edges never receive a confidence penalty. This is essential: recorded deterministic transitions are treated as certain, while uncertainty is charged at the cross-trajectory switch.
-
-For data calibration, actions are standardized per action dimension. A candidate pair `(u,v)` contributes evidence when its L-step action-window RMS distance is at most `action_tol`. It is a success when its observed L-step endpoint distance is at most `land_tol × d_step` and the endpoint modes agree. Bridge state distances are partitioned into quantile bins. For each bin `k`,
+The added switch charge is `cΛ₀`, so
 
 \[
-\ell_k = F^{-1}_{\operatorname{Beta}(\alpha_0+n_k^+,\,\beta_0+n_k^-)}(\delta/K),
-\qquad \lambda_b = -\log \ell_{k(b)}.
+w(u,v)=c\bigl(\tau(u,v)+\Lambda_0\bigr),\qquad
+C_G(u)=c\min_{\pi:u\leadsto\mathcal G}\left[
+T_{\rm data}(\pi)+\sum_{b\in B(\pi)}(\tau_b+\Lambda_0)
+\right].
 \]
 
-Here `K` is the number of nonempty distance bins. The bound is on the bin's mean landing-success probability, not an individual bridge. Applying it to a particular bridge relies on the additional assumption that action-matched evidence represents bridges in that distance bin. Edges whose added cost exceeds `lambda_cap_steps` are dropped.
+`tau_model="geometric"` uses the heuristic
+\[
+\tau(u,v)=\max\left(1,\left\lceil\rho\,d(\phi(u),\phi(v))/d_{\rm step}\right\rceil\right).
+\]
+`tau_model="learned"` uses the upper `q` quantile of a frame-gap classifier. The classifier estimates a distribution over `Δ=1,…,H` and `far`; a pair is rejected if `F_{uv}(H)<q`. The stored `κ` is `τ`, and the same `c(τ+Λ₀)` cost is used. Geometric time is a heuristic; learned time generalizes within-trajectory frame gaps to close cross-trajectory pairs (assumption A1″).
 
-For a deterministic simulator, `sim_verified` replays bridges on current shortest paths. A successful replay receives zero added cost; a failure is removed. Unused, unverified bridges are dropped when the verification budget ends. This validates the bridge landing tube, but not the local temporal tracking assumption after landing.
+For a held-out near pair with observed gap `Δ`, upper-bound coverage is the event `Δ ≤ τ_q`, equivalently `F(Δ−1) < q`. Conformal calibration uses the episode-disjoint calibration split to select `q′` from these pre-gap CDF scores; test coverage is then measured directly as `mean(Δ ≤ τ_{q′})`. The far class is excluded from this coverage calculation.
 
-## Cost-to-go and critic targets
+Prior, data-calibrated, and simulator-verified open-loop costs remain available for comparison. They are legacy diagnostics/ablations; `landing_steps` is unused by the time policy. Beta lower-confidence penalties remain appropriate where real Bernoulli attempts are collected, such as the online BOOST interface, but do not define the v0.3 offline bridge cost.
 
-For each state occurrence `u`, the graph cost is
+## Graph solution and critic targets
+
+Reverse multi-source Dijkstra computes the exact shortest-path cost on the finite graph. Unreachable vertices have infinite cost. For a valid horizon-`h` chunk with no success inside the chunk, the target is
 
 \[
-C_G(u) = \min_{\pi:u\leadsto\mathcal{G}}
-\left[c\,T(\pi)+\sum_{b\in B(\pi)}\lambda_b\right],
+y_i=h+\min\left(C_G(\texttt{assign\_next}[i+h-1])/c,
+ c_{\max}^{\rm steps}\right).
 \]
 
-where `T(π)` is the sum of replayed environment steps, `B(π)` is the set of bridges on the path, and `𝒢` is the set of success-labeled state occurrences. Reverse multi-source Dijkstra computes all costs exactly for the chosen finite graph and edge weights. Unreachable states have infinite graph cost; the target builder clips only at `c_max_steps`.
+Success inside a chunk still gives its first-success step count; an already-successful current state receives zero. The source codes and invalid-chunk behavior are unchanged from schema 0.3. Segment contraction preserves path costs exactly.
 
-For a valid chunk beginning at row `i` with horizon `h`, a success on transition `i+k` yields `k+1` steps. If no success occurs inside the chunk, the endpoint is `assign_next[i+h-1]` and
+## Assumptions and simulator check
 
-\[
-y_i = h + \min\left(C_G(\texttt{assign\_next}[i+h-1])/c,\;c_{\max}^{\mathrm{steps}}\right).
-\]
+- **A1c (local closed-loop reachability):** for each bridge `(u,v)`, some policy reaches the tube around `v` within `τ_b` steps with probability at least `p_b`, where `cΛ₀ ≥ -log p_b`.
+- **A2c (tube tracking):** inside each data-state tube, a policy can reach the next temporal-state tube in one step; a goal tube is within the success region.
 
-An already-successful current state has target zero. Invalid chunks are zero-filled and marked invalid. `TargetSet.source` records `0=chunk success`, `1=finite graph cost`, `2=cap or unreachable`, and `3=invalid`.
+Under these assumptions, following a shortest graph path costs no more than `C_G(u)/c` steps and succeeds with probability at least `exp(-C_G(u))`, giving `V*(u) ≥ exp(-C_G(u))`. For a learned model, A1c relies on frame-gap generalization to bridge candidates; calibration coverage is measured on held-out within-trajectory pairs and does not prove cross-trajectory reachability. The geometric model has no statistical coverage guarantee.
 
-## What the guarantee does and does not say
+`GraphTrackingPolicy` and `experiments/eval_graph_policy.py` test a concrete closed-loop nearest-state policy after graph construction. They report `pi_g_success`, `pessimism_hold`, `time_ratio`, and per-bridge time ratios. This is diagnostic evidence for the assumptions, not a proof that every bridge is realizable. The graph build path must not invoke this policy or any simulator rollout.
 
-The finite-graph Dijkstra result is exact by path reversal. A value lower bound for the real environment needs stronger assumptions:
+## Public path representation
 
-- **A1, bridge landing:** executing bridge `b` from source `u` reaches the landing tube around `v+L` with probability at least `p_b`.
-- **A2, local tracking:** from any state in that tube, a policy can replay the landing state's following temporal segment to its next decision-state tube in the same number of steps.
-
-If every bridge penalty satisfies `λ_b ≥ -log p_b`, following a shortest graph path gives
-
-\[
-V^*(u) \ge \exp(-C_G(u)).
-\]
-
-`sim_verified` checks A1 for the tested bridge resets. It does not prove A2; sampled path replay and `path_exec_rate` measure how well the composed assumption works. Data-calibrated costs support the stated bound only under the distance-bin representativeness assumption and its confidence event. These assumptions are reported separately from the exact shortest-path computation.
-
-## Exact temporal-chain contraction
-
-A state is a decision state when it starts an episode, is a goal, changes mode, starts or ends a bridge, ends a temporal chain, or reaches the configured segment-length limit. Between decision states the only outgoing choice is the recorded temporal successor. Replacing each such chain by one edge with summed duration and summed weight preserves every path cost between decision states, so shortest-path costs on those states are unchanged.
+`extract_path(artifact, u)` follows the stored shortest-path successor chain and returns `PathStep(vertex, kind, tau)` entries. `kind=0` is temporal and `kind=1` is bridge; the final goal entry uses `kind=None, tau=0`. The edge-duration sum plus `Λ₀` for each bridge must equal `C_G(u)/c` for a time-policy graph.

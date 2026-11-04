@@ -1,6 +1,14 @@
 # Benchmark environment and fork notes
 
-Status date: 2026-11-03. The `bench` Pixi environment is Linux x86_64 only. It keeps the benchmark stack separate from the project's NumPy 1/2 core environments.
+Status date: 2026-11-04. The `bench` Pixi environment is Linux x86_64 only. It keeps the benchmark stack separate from the project's NumPy 1/2 core environments.
+
+## v0.3 Scene observation and replay findings (2026-11-04)
+
+The v0.3 `SceneObservationLayout` is checked against the installed OGBench `SceneEnv.compute_observation()` layout. On the first 1,000 Scene train rows, qpos-derived cube, drawer, and window positions agree with the named observation fields to a maximum absolute error of `2.1e-7` (acceptance tolerance `1e-5`). The `ogbench_scene_pos` representation uses 13 dimensions; its within-mode `d_step` is `0.1428919`, and all per-feature `rho_j` values are at most `0.1110`.
+
+The 1,000-row feature-space replay check passes: `q99/d_step=0.0363` and `max/d_step=0.3862`, under the limits `0.1` and `0.5`. Raw observation replay has a max error of `1.8944`, concentrated in the raw cube yaw encoding. At row `525285`, the replay and sidecar quaternion-derived yaw differ by `0` radians while the raw observation yaw pair differs by `1.4763`; this supports the yaw-discontinuity hypothesis and justifies using `cos(4θ), sin(4θ)` for graph distance.
+
+The first 100 deterministic-reset trials initially matched bitwise in only 93%. The sidecar omits MuJoCo's `qacc_warmstart`; explicitly clearing that solver warm-start vector after restoring qpos/qvel makes all 100 repeated 10-step rollouts bitwise identical. This reset behavior is part of the replay verifier, not the graph-building algorithm.
 
 ## Sources and pinned versions
 
@@ -127,16 +135,56 @@ MUJOCO_GL=egl WANDB_MODE=offline pixi run -e bench --manifest-path ../../pixi.to
   --graph_dataset_id="$DATASET_ID" --seed=0
 ```
 
-Graph targets can now be built from the OGBench dataset directly. From the repository root, create the schema-0.3 state graph and its simulator sidecar with:
+Build the v0.3 geometric reference from the OGBench dataset directly. This uses the raw simulator-state sidecar for position features and modes, but graph construction does not step or roll out the simulator:
 
 ```bash
 pixi run -e bench -- python experiments/build_graph.py \
   --ogbench-dataset scene-play-singletask-task1-v0 \
-  --config configs/graph/scene.yaml --h 5 --unit steps \
-  --out outputs/scene-v02
+  --config configs/graph/scene_v03_geometric.yaml --h 5 --unit steps \
+  --out outputs/scene-v03/geometric-r15-rho1-l0 --force
 ```
 
-The command writes `graph.npz`/`.json`, `targets.npz`/`.json`, `targets_source.npy`, `sim_state.npz`, `transitions.npz`/`.json`, and `diagnostics.json`. Simulator replay runs only when `--path-exec` is passed (or the cost policy is `sim_verified`); data-calibrated graph construction remains offline. Training gates return exit code 2 when the graph has too many capped non-success targets or insufficient reachability; use `--force` only to retain a failed pilot for diagnosis.
+For the learned bridge model, train the frame-gap classifier first, then build with `configs/graph/scene.yaml`:
+
+```bash
+pixi run -e bench -- python experiments/train_tau.py \
+  --ogbench-dataset scene-play-singletask-task1-v0 \
+  --config configs/graph/scene.yaml --out outputs/tau/scene --seed 0
+
+pixi run -e bench -- python experiments/build_graph.py \
+  --ogbench-dataset scene-play-singletask-task1-v0 \
+  --config configs/graph/scene.yaml --h 5 --unit steps \
+  --out outputs/scene-v03/learned-q90-r2-l5 --force
+
+MUJOCO_GL=egl pixi run -e bench -- python experiments/eval_graph_policy.py \
+  --graph outputs/scene-v03/learned-q90-r2-l5/graph.npz \
+  --ogbench-dataset scene-play-singletask-task1-v0 \
+  --env scene-singletask-task1-v0 \
+  --out outputs/scene-v03/learned-q90-r2-l5/pi_g.json
+```
+
+The `r_H`, q=0.8 calibration ablation uses a separate checkpoint and config:
+
+```bash
+pixi run -e bench -- python experiments/train_tau.py \
+  --ogbench-dataset scene-play-singletask-task1-v0 \
+  --config configs/graph/scene.yaml --out outputs/tau/scene-rH --seed 0 \
+  --far-exclusion-radius r_H
+
+pixi run -e bench -- python experiments/build_graph.py \
+  --ogbench-dataset scene-play-singletask-task1-v0 \
+  --config configs/graph/scene_v03_learned_rh_q80.yaml --h 5 --unit steps \
+  --out outputs/scene-v03/learned-rh-q80-r2-l5 --force
+
+MUJOCO_GL=egl pixi run -e bench -- python experiments/eval_graph_policy.py \
+  --graph outputs/scene-v03/learned-rh-q80-r2-l5/graph.npz \
+  --ogbench-dataset scene-play-singletask-task1-v0 --starts 500 \
+  --out outputs/scene-v03/learned-rh-q80-r2-l5/pi_g_500.json
+```
+
+The command reproduces the R6-passing q=0.8 calibration model and graph build. The current Scene πG success gate does not pass for this configuration; see [v0.3 results](results_v0.3.md).
+
+The graph build writes `graph.npz`/`.json`, targets, `sim_state.npz`, transitions, and diagnostics. The sidecar is required for named Scene position features and contact/task modes; no simulator action is executed during time-policy graph construction. Run `eval_graph_policy.py` only after the graph has been saved. The legacy `--path-exec` open-loop replay applies only to the legacy bridge policies; time-policy paths use the graph tracker.
 
 For E1, use the same task commands for `lift-mh-low_dim`, `can-mh-low_dim`, and `square-mh-low_dim`; then use `scene-play-singletask-task1-v0` with `--sparse=True` and `cube-double-play-singletask-task2-v0` with `--sparse=False`. The public plot data combines offline steps from 0–1M and online steps from 1–2M. An offline-only run should therefore use `--offline_steps=1000000` and compare evaluation index 10 (1.0M), not the 2.0M endpoint.
 

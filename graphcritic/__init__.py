@@ -1,6 +1,6 @@
 """Reusable graph-cost and critic-target core for Graph Critic experiments."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from graphcritic.config import BridgeConfig, BridgeCostConfig, FeatureConfig, GraphConfig, PessimismConfig, TargetConfig
 from graphcritic.featurize import Featurizer, StateFeaturizer, state_table
@@ -20,6 +20,7 @@ from graphcritic.pipeline import build_artifact, rebuild_from_external
 from graphcritic.sft_weights import sft_weights
 from graphcritic.targets import critic_targets
 from graphcritic.verification import OGBenchVerifier, SimVerifier
+from graphcritic.path import GraphTrackingPolicy, PathStep, extract_path
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -29,12 +30,14 @@ __all__ = [
     "FeatureConfig",
     "Featurizer",
     "GraphArtifact",
+    "GraphTrackingPolicy",
     "GraphConfig",
     "NodeSet",
     "ModeFn",
     "MODE_FNS",
     "OGBenchVerifier",
     "PessimismConfig",
+    "PathStep",
     "SchemaError",
     "SegmentGraph",
     "SimStateSet",
@@ -47,6 +50,7 @@ __all__ = [
     "critic_targets",
     "contract_segments",
     "rebuild_from_external",
+    "extract_path",
     "sft_weights",
     "state_table",
 ]

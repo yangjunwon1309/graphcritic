@@ -456,6 +456,9 @@ class GraphArtifact:
             "succ": self.succ,
             "weights": self.weights,
         }
+        tau_hash = self.meta.get("tau_model_sha256")
+        if tau_hash is not None:
+            arrays["tau_model_sha256"] = np.asarray(str(tau_hash))
         arrays.update({f"feature_{name}": value for name, value in self.feature_stats.items()})
         return arrays
 
@@ -501,10 +504,16 @@ class GraphArtifact:
                 raise SchemaError("state graph temporal edges must have kappa=1")
             if np.any(self.edges.n_pos[temporal_edges] != 1) or np.any(self.edges.n_neg[temporal_edges] != 0):
                 raise SchemaError("state graph temporal edges must record one certain observation")
-            if self.edges.n_edges and np.any(
-                self.edges.kappa[self.edges.kind == 1] != self.config.bridge.landing_steps
-            ):
-                raise SchemaError("state graph bridge kappa must equal bridge.landing_steps")
+            bridge_edges = self.edges.kind == 1
+            if self.config.bridge.cost.policy == "time":
+                if np.any(self.edges.kappa[bridge_edges] > self.config.bridge.cost.tau_max_steps):
+                    raise SchemaError("time-policy bridge kappa exceeds tau_max_steps")
+                if np.any(self.edges.anchor[bridge_edges] != self.edges.dst[bridge_edges]):
+                    raise SchemaError("time-policy bridge anchors must identify their destination state")
+                if np.any(self.edges.n_pos[bridge_edges] != 0) or np.any(self.edges.n_neg[bridge_edges] != 0):
+                    raise SchemaError("time-policy bridges must not contain open-loop evidence counts")
+            elif np.any(self.edges.kappa[bridge_edges] != self.config.bridge.landing_steps):
+                raise SchemaError("open-loop bridge kappa must equal bridge.landing_steps")
             if trans is not None:
                 from graphcritic.featurize import state_table
 
@@ -562,7 +571,14 @@ class GraphArtifact:
             if not np.all(matches):
                 raise SchemaError("succ must point along an edge in the graph")
 
-        p = self.nodes.rep_feat.shape[1]
+        feature_meta = self.meta.get("feature")
+        p = (
+            int(feature_meta["stats_dim"])
+            if isinstance(feature_meta, Mapping) and "stats_dim" in feature_meta
+            else int(feature_meta["input_dim"])
+            if isinstance(feature_meta, Mapping) and "input_dim" in feature_meta
+            else self.nodes.rep_feat.shape[1]
+        )
         if set(self.feature_stats) != {"mean", "std"}:
             raise SchemaError("feature_stats must contain exactly mean and std")
         for name, values in self.feature_stats.items():
@@ -578,6 +594,12 @@ class GraphArtifact:
             raise SchemaError("meta.dataset_id must be a non-empty string")
         if not isinstance(self.meta["source"], str) or not isinstance(self.meta["core_version"], str):
             raise SchemaError("meta.source and meta.core_version must be strings")
+        tau_hash = self.meta.get("tau_model_sha256")
+        if tau_hash is not None and (
+            not isinstance(tau_hash, str) or len(tau_hash) != 64
+            or any(character not in "0123456789abcdef" for character in tau_hash)
+        ):
+            raise SchemaError("meta.tau_model_sha256 must be a lowercase SHA-256 hex digest")
         n_rows = self.meta["n_rows"]
         if isinstance(n_rows, bool) or not isinstance(n_rows, Integral) or n_rows < 0:
             raise SchemaError("meta.n_rows must be a non-negative integer")

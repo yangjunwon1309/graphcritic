@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "graphcritic"
-version = "0.2.0"
-description = "Graph-based critic targets and costs"
+version = "0.3.0"
+description = "Graph-based critic targets with closed-loop travel-time bridges"
 requires-python = ">=3.10"
 dependencies = ["numpy", "scipy"]
 

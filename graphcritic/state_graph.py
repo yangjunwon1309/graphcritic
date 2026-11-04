@@ -16,6 +16,7 @@ from graphcritic.config import GraphConfig
 from graphcritic.featurize import state_table
 from graphcritic.modes import resolve_state_modes, state_episode_time
 from graphcritic.segments import contract_segments
+from graphcritic.tau_model import FrameGapModel
 from graphcritic.types import EdgeSet, NodeSet, SchemaError, SimStateSet, TransitionSet
 
 
@@ -312,6 +313,245 @@ def _bridge_candidates(
     return src, dst, dist, anchor, meta
 
 
+def _bridge_time_candidates(
+    trans: TransitionSet,
+    states: NDArray[np.float32],
+    phi: NDArray[np.float32],
+    modes: NDArray[np.int64],
+    successes: NDArray[np.bool_],
+    cfg: GraphConfig,
+    d_step: float,
+    dataset_id: str | None = None,
+) -> tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.float32], NDArray[np.int64], NDArray[np.int64], dict[str, Any]]:
+    """Create direct state-to-state bridges with estimated travel times."""
+    bridge_cfg, cost_cfg = cfg.bridge, cfg.bridge.cost
+    episode, times = state_episode_time(trans)
+    source_ids = np.flatnonzero(
+        (~successes[: trans.n_rows]) & (trans.t % bridge_cfg.source_stride == 0)
+    ).astype(np.int64)
+    candidate_radius = (
+        cost_cfg.candidate_radius * d_step
+        if bridge_cfg.radius_unit == "step" else cost_cfg.candidate_radius
+    )
+    radius = bridge_cfg.radius * d_step if bridge_cfg.radius_unit == "step" else bridge_cfg.radius
+    if cost_cfg.tau_model == "learned" and not cost_cfg.tau_ckpt:
+        raise SchemaError("bridge.cost.tau_ckpt is required for the learned time policy")
+    tau_model = FrameGapModel.load(cost_cfg.tau_ckpt) if cost_cfg.tau_model == "learned" else None
+    if tau_model is not None and tau_model.input_dim != states.shape[1]:
+        raise SchemaError(
+            f"tau checkpoint expects {tau_model.input_dim} observation values, "
+            f"but the graph has {states.shape[1]}"
+        )
+    if tau_model is not None:
+        model_meta = tau_model.metadata
+        feature_meta = model_meta.get("feature")
+        if isinstance(feature_meta, dict) and feature_meta.get("name") != cfg.feature.name:
+            raise SchemaError("tau checkpoint feature representation does not match graph features")
+        if dataset_id is not None and model_meta.get("dataset_id") not in (None, dataset_id):
+            raise SchemaError("tau checkpoint dataset_id does not match graph transitions")
+        if "d_step" in model_meta and not np.isclose(
+            float(model_meta["d_step"]), d_step, rtol=1e-4, atol=1e-6
+        ):
+            raise SchemaError("tau checkpoint d_step does not match the graph feature metric")
+        configured_radius = (
+            cfg.bridge.radius * d_step
+            if cfg.bridge.radius_unit == "step" else cfg.bridge.radius
+        )
+        if "bridge_radius" in model_meta and not np.isclose(
+            float(model_meta["bridge_radius"]), configured_radius, rtol=1e-4, atol=1e-6
+        ):
+            raise SchemaError("tau checkpoint far-label radius does not match bridge.radius")
+    # Same-episode states within the exclusion window can occupy the nearest
+    # neighbors. Over-query enough rows to leave a useful candidate set after
+    # that temporal filter, then cap the classifier input at candidate_k.
+    exclusion_buffer = 2 * bridge_cfg.min_time_gap + 1
+    search_k = (
+        cost_cfg.candidate_k + exclusion_buffer
+        if tau_model is not None
+        else max(bridge_cfg.k + 16, bridge_cfg.k + exclusion_buffer)
+    )
+    search_radius = candidate_radius if tau_model is not None else radius
+    selected_sources: list[NDArray[np.int64]] = []
+    selected_destinations: list[NDArray[np.int64]] = []
+    selected_distances: list[NDArray[np.float32]] = []
+    selected_times: list[NDArray[np.int64]] = []
+    f_h_parts: list[NDArray[np.float32]] = []
+    candidate_count = same_episode_filtered = radius_filtered = far_filtered = 0
+    backend_used: set[str] = set()
+    mode_values = np.unique(modes[source_ids]) if source_ids.size else []
+
+    for mode in mode_values:
+        if bridge_cfg.same_mode:
+            reference_ids = np.flatnonzero(modes == mode).astype(np.int64)
+            mode_sources = source_ids[modes[source_ids] == mode]
+        else:
+            reference_ids = np.arange(states.shape[0], dtype=np.int64)
+            mode_sources = source_ids
+        if reference_ids.size == 0 or mode_sources.size == 0:
+            continue
+        index, backend = _build_knn_index(phi[reference_ids], bridge_cfg.knn_backend)
+        backend_used.add(backend)
+        query_batch_size = 512 if backend == "jax_gpu" else 8192
+        # Keep pair-feature batches bounded for the 3-layer 512-wide classifier.
+        source_batch_size = 1024 if tau_model is not None else query_batch_size
+        for start in range(0, mode_sources.size, source_batch_size):
+            sources = mode_sources[start : start + source_batch_size]
+            distances, local_ids = _query_neighbors(
+                index, phi[sources], search_k, backend, reference_ids.size
+            )
+            candidates = reference_ids[np.maximum(local_ids, 0)]
+            valid = (local_ids >= 0) & np.isfinite(distances) & (distances <= search_radius)
+            valid &= candidates != sources[:, None]
+            same_episode = episode[candidates] == episode[sources, None]
+            far_enough = np.abs(times[candidates] - times[sources, None]) > bridge_cfg.min_time_gap
+            valid &= (~same_episode) | far_enough
+            if bridge_cfg.same_mode:
+                valid &= modes[candidates] == modes[sources, None]
+            if tau_model is not None and valid.shape[1] > cost_cfg.candidate_k:
+                nearest_order = np.argsort(
+                    np.where(valid, distances, np.inf), axis=1, kind="stable"
+                )[:, : cost_cfg.candidate_k]
+                nearest_valid = np.zeros_like(valid)
+                np.put_along_axis(nearest_valid, nearest_order, True, axis=1)
+                valid &= nearest_valid
+            same_episode_filtered += int(np.count_nonzero((local_ids >= 0) & ~valid))
+            candidate_count += int(np.count_nonzero(valid))
+            if tau_model is None:
+                valid &= distances <= radius
+                radius_filtered += int(np.count_nonzero((local_ids >= 0) & ~valid))
+                within_radius = valid.copy()
+                chosen_tau = np.full(distances.shape, cost_cfg.tau_max_steps + 1, dtype=np.int64)
+                chosen_tau[valid] = np.maximum(
+                    1,
+                    np.ceil(
+                        cost_cfg.rho * distances[valid] / max(d_step, 1e-12)
+                    ).astype(np.int64),
+                )
+                valid &= chosen_tau <= cost_cfg.tau_max_steps
+                far_filtered += int(np.count_nonzero(within_radius & ~valid))
+                destinations = candidates
+                final_distances = distances
+                final_tau = chosen_tau
+                final_f_h = np.full(chosen_tau.shape, np.nan, dtype=np.float32)
+            else:
+                flat_valid = np.flatnonzero(valid.reshape(-1))
+                chosen_tau = np.full(valid.size, cost_cfg.tau_max_steps + 1, dtype=np.int64)
+                all_f_h = np.zeros(valid.size, dtype=np.float32)
+                if flat_valid.size:
+                    source_grid = np.broadcast_to(sources[:, None], candidates.shape).reshape(-1)
+                    candidate_flat = candidates.reshape(-1)
+                    tau_values = np.empty(flat_valid.size, dtype=np.int64)
+                    f_h_values = np.empty(flat_valid.size, dtype=np.float32)
+                    pair_batch = 8192
+                    for pair_start in range(0, flat_valid.size, pair_batch):
+                        pair_end = min(pair_start + pair_batch, flat_valid.size)
+                        ids = flat_valid[pair_start:pair_end]
+                        probabilities = tau_model.predict_proba_pairs(
+                            states[source_grid[ids]], states[candidate_flat[ids]], backend="auto"
+                        )
+                        tau_chunk, f_h_chunk = tau_model.predict_tau(
+                            probabilities, cost_cfg.tau_quantile
+                        )
+                        tau_values[pair_start:pair_end] = tau_chunk
+                        f_h_values[pair_start:pair_end] = f_h_chunk
+                    chosen_tau[flat_valid] = tau_values
+                    all_f_h[flat_valid] = f_h_values
+                chosen_tau = chosen_tau.reshape(valid.shape)
+                final_f_h = all_f_h.reshape(valid.shape)
+                far_valid = chosen_tau <= min(cost_cfg.tau_max_steps, tau_model.horizon)
+                far_filtered += int(np.count_nonzero(valid & ~far_valid))
+                valid &= far_valid
+                destinations = candidates
+                final_distances = distances
+                final_tau = chosen_tau
+
+            if not np.any(valid):
+                continue
+            # Per source, retain the shortest predicted travel times. Distance
+            # and state ID provide deterministic tie breaks.
+            order = np.lexsort((candidates, distances, final_tau), axis=1)
+            chosen = order[:, : bridge_cfg.k]
+            keep = np.take_along_axis(valid, chosen, axis=1)
+            src_grid = np.broadcast_to(sources[:, None], candidates.shape)
+            rows = np.take_along_axis(src_grid, chosen, axis=1)[keep]
+            cols = np.take_along_axis(destinations, chosen, axis=1)[keep]
+            dists = np.take_along_axis(final_distances, chosen, axis=1)[keep]
+            taus = np.take_along_axis(final_tau, chosen, axis=1)[keep]
+            f_h_selected = np.take_along_axis(final_f_h, chosen, axis=1)[keep]
+            selected_sources.append(rows.astype(np.int64, copy=False))
+            selected_destinations.append(cols.astype(np.int64, copy=False))
+            selected_distances.append(dists.astype(np.float32, copy=False))
+            selected_times.append(taus.astype(np.int64, copy=False))
+            f_h_parts.append(f_h_selected.astype(np.float32, copy=False))
+
+    if selected_sources:
+        src = np.concatenate(selected_sources)
+        dst = np.concatenate(selected_destinations)
+        dist = np.concatenate(selected_distances)
+        tau = np.concatenate(selected_times)
+        f_h = np.concatenate(f_h_parts)
+        order = np.lexsort((dst, dist, tau, src))
+        src, dst, dist, tau, f_h = src[order], dst[order], dist[order], tau[order], f_h[order]
+        unique = np.r_[True, (src[1:] != src[:-1]) | (dst[1:] != dst[:-1])]
+        src, dst, dist, tau, f_h = src[unique], dst[unique], dist[unique], tau[unique], f_h[unique]
+    else:
+        src = dst = tau = np.empty(0, dtype=np.int64)
+        dist = np.empty(0, dtype=np.float32)
+        f_h = np.empty(0, dtype=np.float32)
+
+    finite_f_h = f_h[np.isfinite(f_h)]
+    tau_values, tau_counts = np.unique(tau, return_counts=True)
+    goal_bridge_modes, goal_bridge_counts = np.unique(
+        modes[dst[successes[dst]]], return_counts=True
+    ) if dst.size and np.any(successes[dst]) else (np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64))
+    meta: dict[str, Any] = {
+        "bridge_radius_abs": float(search_radius),
+        "bridge_candidates": int(candidate_count),
+        "bridge_anchor_count": int(states.shape[0]),
+        "bridge_source_count": int(source_ids.size),
+        "bridge_n_bins": 0,
+        "knn_backend": sorted(backend_used),
+        "bridge_tau_model": cost_cfg.tau_model,
+        "bridge_tau_quantile": float(cost_cfg.tau_quantile),
+        "bridge_tau_horizon": int(tau_model.horizon) if tau_model is not None else None,
+        "bridge_tau_split_seed": (
+            int(tau_model.metadata["split_seed"])
+            if tau_model is not None and "split_seed" in tau_model.metadata else None
+        ),
+        "bridge_tau_far_exclusion_radius": (
+            tau_model.metadata.get("far_exclusion_radius") if tau_model is not None else None
+        ),
+        "bridge_tau_calibrated_quantile": (
+            tau_model.calibrated_quantile(cost_cfg.tau_quantile)
+            if tau_model is not None else None
+        ),
+        "bridge_tau_candidate_count": int(src.size),
+        "bridge_goal_edge_count": int(np.count_nonzero(successes[dst])) if dst.size else 0,
+        "bridge_goal_mode_edge_counts": {
+            str(int(mode)): int(count)
+            for mode, count in zip(goal_bridge_modes, goal_bridge_counts, strict=True)
+        },
+        "bridge_tau_p50": float(np.percentile(tau, 50)) if tau.size else 0.0,
+        "bridge_tau_p90": float(np.percentile(tau, 90)) if tau.size else 0.0,
+        "bridge_tau_max": int(np.max(tau)) if tau.size else 0,
+        "bridge_tau_histogram": {
+            str(int(value)): int(count)
+            for value, count in zip(tau_values, tau_counts, strict=True)
+        },
+        "bridge_f_h_p50": float(np.percentile(finite_f_h, 50)) if finite_f_h.size else None,
+        "bridge_f_h_p10": float(np.percentile(finite_f_h, 10)) if finite_f_h.size else None,
+        "bridge_f_h_p90": float(np.percentile(finite_f_h, 90)) if finite_f_h.size else None,
+        "bridge_tau_dropped_far": int(far_filtered),
+        "bridge_candidate_radius_filtered": int(radius_filtered),
+        "bridge_candidate_time_mode_filtered": int(same_episode_filtered),
+    }
+    # In the v0.3 time graph, anchor records the candidate endpoint itself.
+    anchor = dst.copy()
+    if tau_model is not None:
+        meta["tau_model_sha256"] = tau_model.checkpoint_sha256
+    return src, dst, dist, anchor, tau, meta
+
+
 def _calibration_counts(
     trans: TransitionSet,
     phi: NDArray[np.float32],
@@ -363,7 +603,8 @@ def _calibration_counts(
         same_mode = np.zeros(end - start, dtype=np.bool_)
         same_mode[usable] = modes[landing_source[usable]] == modes[dst[start:end][usable]]
         evidence = usable & (action_dist <= cost_cfg.action_tol)
-        success = (landing_dist <= cost_cfg.land_tol * d_step) & same_mode
+        radius = cfg.bridge.radius * d_step if cfg.bridge.radius_unit == "step" else cfg.bridge.radius
+        success = (landing_dist <= radius) & same_mode
         positive_evidence[start:end] = evidence & success
         negative_evidence[start:end] = evidence & ~success
 
@@ -403,6 +644,7 @@ def build_state_graph(
     phi: NDArray[np.float32],
     *,
     sim_state: SimStateSet | None = None,
+    dataset_id: str | None = None,
 ) -> tuple[NodeSet, EdgeSet, dict[str, Any]]:
     """Build one vertex per recorded state, empirical temporal edges, and bridges."""
     trans.validate()
@@ -416,14 +658,24 @@ def build_state_graph(
     d_step = _step_distance(z, trans, modes)
     nodes = _state_nodes(trans, states, success)
 
-    src_b, dst_b, dist_b, anchor_b, bridge_meta = _bridge_candidates(
-        trans, z, modes, success, cfg, d_step
-    )
-    anchor_ids, landing_ids = _landing_states(trans, modes, success, cfg.bridge.landing_steps)
-    source_landing = np.full(states.shape[0], -1, dtype=np.int64)
-    source_landing[anchor_ids] = landing_ids
     cost_meta: dict[str, Any] = {"bridge_cost_policy": cfg.bridge.cost.policy}
-    if cfg.bridge.cost.policy == "data_calibrated":
+    if cfg.bridge.cost.policy == "time":
+        src_b, dst_b, dist_b, anchor_b, kappa_b, bridge_meta = _bridge_time_candidates(
+            trans, states, z, modes, success, cfg, d_step, dataset_id
+        )
+        n_pos_b = np.zeros(src_b.size, dtype=np.int64)
+        n_neg_b = np.zeros(src_b.size, dtype=np.int64)
+    else:
+        src_b, dst_b, dist_b, anchor_b, bridge_meta = _bridge_candidates(
+            trans, z, modes, success, cfg, d_step
+        )
+        kappa_b = np.full(src_b.size, cfg.bridge.landing_steps, dtype=np.int64)
+        anchor_ids, landing_ids = _landing_states(trans, modes, success, cfg.bridge.landing_steps)
+        source_landing = np.full(states.shape[0], -1, dtype=np.int64)
+        source_landing[anchor_ids] = landing_ids
+    if cfg.bridge.cost.policy == "time":
+        cost_meta["bridge_pruned_over_lambda_cap"] = 0
+    elif cfg.bridge.cost.policy == "data_calibrated":
         n_pos_b, n_neg_b, calibration_meta = _calibration_counts(
             trans, z, modes, src_b, anchor_b, dst_b, dist_b, source_landing, cfg, d_step
         )
@@ -473,7 +725,7 @@ def build_state_graph(
     edges = EdgeSet(
         src=src,
         dst=dst,
-        kappa=np.concatenate((np.ones(trans.n_rows, dtype=np.int64), np.full(src_b.size, cfg.bridge.landing_steps, dtype=np.int64))),
+        kappa=np.concatenate((np.ones(trans.n_rows, dtype=np.int64), kappa_b)),
         n_pos=np.concatenate((np.ones(trans.n_rows, dtype=np.int64), n_pos_b)),
         n_neg=np.concatenate((np.zeros(trans.n_rows, dtype=np.int64), n_neg_b)),
         kind=np.concatenate((np.zeros(trans.n_rows, dtype=np.int8), np.ones(src_b.size, dtype=np.int8))),

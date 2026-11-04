@@ -70,12 +70,19 @@ def build_artifact(
     trans.validate()
     cfg.validate()
     started = time.perf_counter()
-    stdz = StateFeaturizer.fit(trans, cfg.feature)
+    stdz = StateFeaturizer.fit(trans, cfg.feature, sim_state=sim_state)
     states, _, _, _ = state_table(trans)
-    phi = stdz.transform(states)
+    feature_aux = None
+    if sim_state is not None:
+        feature_aux = {"qpos": sim_state.qpos, "qvel": sim_state.qvel}
+        if sim_state.button_states is not None:
+            feature_aux["button_states"] = sim_state.button_states
+    phi = stdz.transform(states, aux=feature_aux)
     build_meta: dict[str, Any] = {"feature": stdz.meta()}
     if cfg.graph_kind == "state":
-        nodes, edges, state_meta = build_state_graph(trans, cfg, phi, sim_state=sim_state)
+        nodes, edges, state_meta = build_state_graph(
+            trans, cfg, phi, sim_state=sim_state, dataset_id=dataset_id
+        )
         build_meta.update(state_meta)
         d_step = float(state_meta["d_step"])
         modes = resolve_state_modes(trans, cfg.mode_fn, sim_state=sim_state, min_dwell=cfg.min_dwell)
@@ -98,7 +105,10 @@ def build_artifact(
         build_meta.update({"graph_kind": "node", "d_step": d_step})
     weights = edge_weights(edges, cfg, d_step=d_step, meta=build_meta)
     cost, succ = solve(nodes, edges, weights)
-    if verifier is not None and sim_state is not None and cfg.graph_kind == "state":
+    if (
+        verifier is not None and sim_state is not None and cfg.graph_kind == "state"
+        and cfg.bridge.cost.policy != "time"
+    ):
         build_meta.update(evaluate_paths(
             trans, nodes, edges, weights, cost, succ, sim_state, verifier
         ))
@@ -133,14 +143,16 @@ def rebuild_from_external(
     dataset_id: str,
     source: str,
     extra_meta: dict[str, Any] | None = None,
+    sim_state: SimStateSet | None = None,
 ) -> GraphArtifact:
     """Assemble a GraphArtifact around externally constructed nodes/edges."""
     trans.validate()
     cfg.validate()
     nodes.validate(trans)
     edges.validate(nodes.n_nodes)
-    stdz = StateFeaturizer.fit(trans, cfg.feature)
-    weights = edge_weights(edges, cfg, d_step=(extra_meta or {}).get("d_step"), meta=extra_meta)
+    stdz = StateFeaturizer.fit(trans, cfg.feature, sim_state=sim_state)
+    assembled_meta = {"feature": stdz.meta(), **(extra_meta or {})}
+    weights = edge_weights(edges, cfg, d_step=assembled_meta.get("d_step"), meta=assembled_meta)
     cost, succ = solve(nodes, edges, weights)
     artifact = GraphArtifact(
         config=cfg,
@@ -151,7 +163,7 @@ def rebuild_from_external(
         cost=cost,
         succ=succ,
         meta=_artifact_meta(
-            trans, cfg, dataset_id=dataset_id, source=source, extra_meta=extra_meta
+            trans, cfg, dataset_id=dataset_id, source=source, extra_meta=assembled_meta
         ),
     )
     artifact.validate(trans)

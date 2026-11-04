@@ -70,7 +70,11 @@ def _rollout_mode_and_feature(
     if "observation" not in result:
         raise SchemaError("simulator rollout result must contain 'observation'")
     obs = np.asarray(result["observation"], dtype=np.float32).reshape(1, -1)
-    phi = featurizer.transform(obs)[0]
+    feature_aux = {
+        key: np.asarray(result[key]).reshape(1, -1)
+        for key in ("qpos", "qvel", "button_states") if key in result
+    }
+    phi = featurizer.transform(obs, aux=feature_aux)[0]
     if cfg.mode_fn == "none":
         mode = 0
     else:
@@ -145,8 +149,16 @@ def verify_bridge_edges(
             result = verifier.rollout(_state_payload(sim_state, source), trans.action[action_rows])
             landed_phi, landed_mode = _rollout_mode_and_feature(result, featurizer, cfg)
             expected = int(edges.dst[edge_id])
+            expected_aux = {
+                "qpos": sim_state.qpos[expected : expected + 1],
+                "qvel": sim_state.qvel[expected : expected + 1],
+            }
+            if sim_state.button_states is not None:
+                expected_aux["button_states"] = sim_state.button_states[expected : expected + 1]
             success = (
-                np.linalg.norm(landed_phi - featurizer.transform(nodes.rep_feat[expected : expected + 1])[0])
+                np.linalg.norm(landed_phi - featurizer.transform(
+                    nodes.rep_feat[expected : expected + 1], aux=expected_aux
+                )[0])
                 <= cfg.bridge.cost.land_tol * d_step
                 and landed_mode == int(modes[expected])
             )
@@ -304,6 +316,12 @@ class OGBenchVerifier:
                 self.unwrapped._cur_button_states = np.asarray(button_states, dtype=np.int64).copy()
             import mujoco
             mujoco.mj_forward(self.unwrapped.model, self.unwrapped.data)
+        # The offline sidecar does not store MuJoCo's constraint-solver
+        # warm-start vector. Reset it explicitly so repeated restores from the
+        # same qpos/qvel have bitwise-identical first steps.
+        data = getattr(self.unwrapped, "data", None)
+        if data is not None and hasattr(data, "qacc_warmstart"):
+            data.qacc_warmstart[:] = 0
         getter = getattr(self.unwrapped, "_get_obs", None)
         if callable(getter):
             return np.asarray(getter(), dtype=np.float32)

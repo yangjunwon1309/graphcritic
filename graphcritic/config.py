@@ -21,19 +21,27 @@ def _positive_int(name: str, value: int, *, allow_zero: bool = False) -> None:
 
 @dataclass(frozen=True)
 class FeatureConfig:
-    name: Literal["identity", "select", "tdr"] = "identity"
+    name: Literal[
+        "identity", "select", "tdr", "ogbench_scene_pos", "robomimic_pos"
+    ] = "identity"
     standardize: bool = True
     dims: tuple[int, ...] | None = None
     weights: tuple[float, ...] | None = None
     tdr_ckpt: str | None = None
 
     def __post_init__(self) -> None:
-        if self.name not in {"identity", "select", "tdr"}:
-            raise SchemaError("feature.name must be 'identity', 'select', or 'tdr'")
+        if self.name not in {
+            "identity", "select", "tdr", "ogbench_scene_pos", "robomimic_pos"
+        }:
+            raise SchemaError("unknown feature.name")
         if not isinstance(self.standardize, bool):
             raise SchemaError("feature.standardize must be boolean")
         if self.name == "select" and not self.dims:
             raise SchemaError("feature.dims must be provided and non-empty for name='select'")
+        if self.name in {"ogbench_scene_pos", "robomimic_pos"} and self.dims is not None:
+            raise SchemaError(f"feature.dims is not supported for name={self.name!r}")
+        if self.name in {"ogbench_scene_pos", "robomimic_pos"} and self.weights is not None:
+            raise SchemaError("position features use fixed inverse-square-root group weights")
         if self.dims is not None:
             dims = tuple(self.dims)
             if not dims or any(isinstance(i, bool) or not isinstance(i, Integral) or i < 0 for i in dims):
@@ -88,8 +96,15 @@ class PessimismConfig:
 
 @dataclass(frozen=True)
 class BridgeCostConfig:
-    policy: Literal["prior", "data_calibrated", "sim_verified"] = "data_calibrated"
-    lambda0_steps: float = 10.0
+    policy: Literal["time", "prior", "data_calibrated", "sim_verified"] = "time"
+    tau_model: Literal["learned", "geometric"] = "learned"
+    tau_ckpt: str | None = None
+    tau_quantile: float = 0.9
+    candidate_k: int = 32
+    candidate_radius: float = 8.0
+    rho: float = 1.5
+    tau_max_steps: int = 48
+    lambda0_steps: float = 5.0
     lambda1_steps: float = 10.0
     n_bins: int = 5
     action_tol: float = 0.5
@@ -101,8 +116,20 @@ class BridgeCostConfig:
     min_evidence: int = 50
 
     def __post_init__(self) -> None:
-        if self.policy not in {"prior", "data_calibrated", "sim_verified"}:
-            raise SchemaError("bridge.cost.policy must be prior, data_calibrated, or sim_verified")
+        if self.policy not in {"time", "prior", "data_calibrated", "sim_verified"}:
+            raise SchemaError("bridge.cost.policy must be time, prior, data_calibrated, or sim_verified")
+        if self.tau_model not in {"learned", "geometric"}:
+            raise SchemaError("bridge.cost.tau_model must be learned or geometric")
+        if self.tau_ckpt is not None and (not isinstance(self.tau_ckpt, str) or not self.tau_ckpt):
+            raise SchemaError("bridge.cost.tau_ckpt must be a non-empty path when provided")
+        if not isinstance(self.tau_quantile, (int, float)) or not 0 < self.tau_quantile < 1:
+            raise SchemaError("bridge.cost.tau_quantile must lie strictly between zero and one")
+        if not isinstance(self.candidate_radius, (int, float)) or not math.isfinite(self.candidate_radius) or self.candidate_radius <= 0:
+            raise SchemaError("bridge.cost.candidate_radius must be finite and positive")
+        if not isinstance(self.rho, (int, float)) or not math.isfinite(self.rho) or self.rho <= 0:
+            raise SchemaError("bridge.cost.rho must be finite and positive")
+        _positive_int("bridge.cost.candidate_k", self.candidate_k)
+        _positive_int("bridge.cost.tau_max_steps", self.tau_max_steps)
         for name in ("lambda0_steps", "lambda1_steps", "action_tol", "land_tol", "lambda_cap_steps"):
             value = getattr(self, name)
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:

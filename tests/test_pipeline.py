@@ -19,13 +19,13 @@ from graphcritic.config import TargetConfig
 
 def test_pipeline_artifact_hash_and_external_hop_rebuild_are_deterministic():
     trans, info = make_chain(L=10, n_episodes=4, p_forward=1.0, seed=7)
-    cfg = GraphConfig(radius=0.25, compress=False, weight_policy="time")
+    cfg = GraphConfig(graph_kind="node", radius=0.25, compress=False, weight_policy="time")
     one = build_artifact(trans, cfg, dataset_id="chain", source="test")
     two = build_artifact(trans, cfg, dataset_id="chain", source="test")
     assert one.content_hash == two.content_hash
     np.testing.assert_array_equal(one.cost, two.cost)
 
-    hop_cfg = GraphConfig(radius=0.25, compress=False, weight_policy="hop")
+    hop_cfg = GraphConfig(graph_kind="node", radius=0.25, compress=False, weight_policy="hop")
     stdz = Standardizer.fit(trans, hop_cfg.feature)
     nodes = build_nodes(trans, hop_cfg, stdz)
     edges = build_edges(trans, nodes, hop_cfg)
@@ -38,7 +38,7 @@ def test_pipeline_artifact_hash_and_external_hop_rebuild_are_deterministic():
 
 def test_report_uses_next_success_episodes_and_target_unit_statistics():
     trans, _ = make_chain(L=6, n_episodes=2, p_forward=1.0, seed=1)
-    cfg = GraphConfig(radius=0.25, compress=False, weight_policy="time")
+    cfg = GraphConfig(graph_kind="node", radius=0.25, compress=False, weight_policy="time")
     artifact = build_artifact(trans, cfg, dataset_id="chain", source="test")
     targets = critic_targets(trans, artifact, TargetConfig(h=2, unit="nats"))
     summary = report(trans, artifact, targets)
@@ -54,7 +54,7 @@ def test_report_uses_next_success_episodes_and_target_unit_statistics():
 
 def test_build_graph_toy_cli_writes_pairs_targets_diagnostics_and_stable_hash(tmp_path, capsys):
     cfg_path = tmp_path / "graph.json"
-    GraphConfig(radius=0.25, compress=False, weight_policy="time").to_yaml(cfg_path)
+    GraphConfig(graph_kind="node", radius=0.25, compress=False, weight_policy="time").to_yaml(cfg_path)
     hashes = []
     for output in (tmp_path / "run-a", tmp_path / "run-b"):
         assert main([

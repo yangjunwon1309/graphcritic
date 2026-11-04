@@ -1,0 +1,12 @@
+{
+  "gamma": 0.99,
+  "graph_kind": "node",
+  "radius": 0.85,
+  "radius_unit": "abs",
+  "feature": {"name": "identity", "standardize": true},
+  "mode_fn": "none",
+  "compress": true,
+  "weight_policy": "lcb",
+  "pessimism": {"mode": "union", "delta": 0.05, "prior_data": [1.0, 1.0], "prior_bridge": [1.0, 1.0]},
+  "c_max_steps": 1001
+}

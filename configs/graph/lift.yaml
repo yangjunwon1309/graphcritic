@@ -1,0 +1,10 @@
+{
+  "gamma": 0.99,
+  "graph_kind": "state",
+  "feature": {"name": "identity", "standardize": true},
+  "mode_fn": "robomimic_grasp",
+  "min_dwell": 3,
+  "bridge": {"k": 8, "radius": 2.0, "radius_unit": "step", "landing_steps": 5, "min_time_gap": 20, "source_stride": 1, "same_mode": true, "knn_backend": "auto", "cost": {"policy": "data_calibrated", "n_bins": 5, "action_tol": 0.5, "land_tol": 1.0, "delta": 0.05, "prior": [1.0, 1.0], "lambda_cap_steps": 200.0, "min_evidence": 50}},
+  "c_max_steps": 1001,
+  "segment_max_len": 1000
+}

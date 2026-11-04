@@ -20,6 +20,7 @@ def _pack_episodes(episodes: list[list[Coord]], goal: Coord) -> TransitionSet:
     success_parts: list[np.ndarray] = []
     success_cur_parts: list[np.ndarray] = []
     terminal_parts: list[np.ndarray] = []
+    action_parts: list[np.ndarray] = []
     row_offset = 0
     for episode_id, states in enumerate(episodes):
         if len(states) < 2:
@@ -29,6 +30,7 @@ def _pack_episodes(episodes: list[list[Coord]], goal: Coord) -> TransitionSet:
         n = current.shape[0]
         feat_parts.append(current)
         next_parts.append(nxt)
+        action_parts.append(nxt - current)
         episode_parts.append(np.full(n, episode_id, dtype=np.int64))
         time_parts.append(np.arange(n, dtype=np.int64))
         success_parts.append(np.all(nxt == np.asarray(goal, dtype=np.float32), axis=1))
@@ -51,6 +53,7 @@ def _pack_episodes(episodes: list[list[Coord]], goal: Coord) -> TransitionSet:
         success_cur=np.concatenate(success_cur_parts),
         terminal=np.concatenate(terminal_parts),
         row_idx=np.arange(row_offset, dtype=np.int64),
+        action=np.concatenate(action_parts, axis=0),
     )
 
 

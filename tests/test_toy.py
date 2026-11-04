@@ -10,6 +10,7 @@ from graphcritic.weights import step_cost
 
 def _artifact(trans, *, radius=0.25, compress=False, policy="time"):
     config = GraphConfig(
+        graph_kind="node",
         gamma=0.97,
         radius=radius,
         compress=compress,

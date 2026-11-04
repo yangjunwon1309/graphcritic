@@ -62,6 +62,7 @@ def make_graph(
         trans = make_transitions()
     return GraphArtifact(
         config=GraphConfig(
+            graph_kind="node",
             gamma=0.99,
             radius=0.5,
             feature=FeatureConfig(name="identity", standardize=True),
@@ -200,7 +201,7 @@ def test_graph_invariants_and_hash_staleness():
 
     with pytest.raises(SchemaError, match="strictly positive"):
         GraphArtifact(
-            config=GraphConfig(radius=0.5), feature_stats={"mean": [0.0], "std": [1.0]},
+            config=GraphConfig(graph_kind="node", radius=0.5), feature_stats={"mean": [0.0], "std": [1.0]},
             nodes=make_nodes(), edges=make_edges(), weights=[1.0, 0.0, 1.0],
             cost=[2.0, 1.0, 0.0, np.inf], succ=[1, 2, -1, -1],
             meta={"dataset_id": "x", "source": "test", "core_version": "0.1", "n_rows": 3, "c_max_steps": 4},
@@ -271,7 +272,7 @@ def test_graph_config_dict_and_yaml_round_trip(tmp_path):
     config = GraphConfig(
         gamma=0.97,
         radius=0.2,
-        feature=FeatureConfig(name="state", standardize=True),
+        feature=FeatureConfig(name="identity", standardize=True),
         pessimism=PessimismConfig(mode="fixed", delta=0.1, lam=4.0, prior_data=(2, 1)),
         c_max_steps=200,
     )

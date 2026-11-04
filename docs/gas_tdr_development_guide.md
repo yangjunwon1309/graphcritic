@@ -1,6 +1,6 @@
 # GAS-style Temporal Distance Representation: development guide
 
-**Status:** implementation plan; no TDR code is implemented by this document.  
+**Status:** historical plan, superseded for graph structure by `docs/math.md` and the v0.2 redesign specification. The identity/select/TDR featurizer hook now exists; training a GAS-style TDR remains separate future work.
 **Scope:** explain the current `h=5` target and graph stitching, then specify the next implementation stages for a GAS-style temporal distance representation (TDR) in GraphCritic.
 
 ## 1. Current `h=5` target and the cap
@@ -67,15 +67,17 @@ Thus a capped target means **“the remaining graph estimate is at least the con
 
 In `outputs/graphs/scene-play-singletask-task1-v0/radius-0.85/diagnostics.json`, `valid_frac=0.996` and `frac_at_cmax=0.9969819`. The latter is calculated over valid targets only: about 99.698% of valid `h=5` rows are at the maximum target 1006. It is **not** a percentage of nodes or all graph states. This severe target saturation remains a separate issue from whether TDR improves node geometry; it should be reported in every TDR comparison.
 
-## 2. How current graph stitching and direction work
+## 2. How the v0.1 node graph stitched states (historical)
+
+This section describes the radius-merged v0.1 node graph. The v0.2 redesign uses occurrence-level state vertices and explicit, penalized bridge edges instead; see `docs/math.md` for the active graph definition.
 
 ### 2.1 Radius merges state occurrences into nodes
 
-The current node builder forms a state-occurrence table from all current states plus each segment’s final next state. It standardizes the configured raw state coordinates, then greedily groups occurrences whose distance to a cluster leader is at most `GraphConfig.radius`. With `radius=0.85`, that threshold is in the standardized raw-state Euclidean metric.
+The v0.1 node builder formed a state-occurrence table from all current states plus each segment’s final next state. It standardized configured raw state coordinates, then greedily grouped occurrences whose distance to a cluster leader was at most `GraphConfig.radius`. With `radius=0.85`, that threshold was in the standardized raw-state Euclidean metric.
 
 Goal occurrences and non-goal occurrences are clustered separately. An occurrence marked successful cannot be merged into a non-success node, even if their features are within the radius.
 
-If an occurrence from trajectory A and one from trajectory B fall into the same cluster, both map to the same node ID. That shared node is the current implementation’s cross-trajectory stitching mechanism. **The radius merge itself does not add an edge.**
+If an occurrence from trajectory A and one from trajectory B fell into the same cluster, both mapped to the same node ID. That shared node was the v0.1 cross-trajectory stitching mechanism. The v0.2 graph instead keeps both occurrences and connects them with a bridge edge when its mode, distance, timing, and landing conditions pass.
 
 ### 2.2 Observed transitions assign directed edges
 

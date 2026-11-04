@@ -9,7 +9,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from graphcritic.types import SchemaError, TransitionSet
+from graphcritic.types import SchemaError, SimStateSet, TransitionSet
 
 
 def _episode_fields(terminals: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -57,7 +57,8 @@ def load_ogbench_transitions(
     dataset_dir: str | Path = "~/.ogbench/data",
     dataset_path: str | Path | None = None,
     split: str = "train",
-) -> tuple[TransitionSet, str]:
+    return_sim_state: bool = False,
+) -> tuple[TransitionSet, str] | tuple[TransitionSet, str, SimStateSet]:
     """Load QC's flattened OGBench rows and relabel both state endpoints.
 
     QC removes terminal-only observation rows and shifts the remaining state
@@ -106,8 +107,9 @@ def load_ogbench_transitions(
             next_states: dict[str, np.ndarray] = {
                 "qpos": np.asarray(raw["qpos"][next_mask])
             }
-            if "button_states" in raw.files:
-                next_states["button_states"] = np.asarray(raw["button_states"][next_mask])
+            for key in ("qvel", "button_states"):
+                if key in raw.files:
+                    next_states[key] = np.asarray(raw[key][next_mask])
 
         n_rows = len(data["observations"])
         if raw_row_idx.shape != (n_rows,) or next_states["qpos"].shape[0] != n_rows:
@@ -135,8 +137,26 @@ def load_ogbench_transitions(
             success_cur=current_success,
             terminal=terminals,
             row_idx=raw_row_idx,
+            action=np.asarray(data["actions"], dtype=np.float32),
         )
         dataset_id = f"ogbench:{dataset_name}:{_sha256(selected_path)}"
+        if return_sim_state:
+            if "qpos" not in data or "qvel" not in data or "qvel" not in next_states:
+                raise SchemaError("OGBench sim_state export requires aligned qpos and qvel arrays")
+            terminal_rows = np.flatnonzero(terminals)
+            current_qpos = np.asarray(data["qpos"], dtype=np.float32)
+            current_qvel = np.asarray(data["qvel"], dtype=np.float32)
+            sim_state = SimStateSet(
+                qpos=np.concatenate((current_qpos, next_states["qpos"][terminal_rows]), axis=0),
+                qvel=np.concatenate((current_qvel, next_states["qvel"][terminal_rows]), axis=0),
+                button_states=(
+                    np.concatenate((np.asarray(data["button_states"], dtype=np.int64),
+                                    np.asarray(next_states["button_states"][terminal_rows], dtype=np.int64)), axis=0)
+                    if "button_states" in data and "button_states" in next_states else None
+                ),
+            )
+            sim_state.validate(transitions.n_rows + terminal_rows.size)
+            return transitions, dataset_id, sim_state
         return transitions, dataset_id
     finally:
         if env is not None:

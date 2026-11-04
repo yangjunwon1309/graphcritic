@@ -30,10 +30,11 @@ def _pack_episode(states, *, goal=None):
 
 def test_state_table_and_standardizer_match_terminal_state_schema():
     trans = _pack_episode([0.0, 1.0, 2.0])
-    x, ref, success = state_table(trans)
+    x, ref, success, mode = state_table(trans)
     assert x.shape == (trans.n_rows + 1, 1)
     np.testing.assert_array_equal(ref, [[0, 0], [1, 0], [1, 1]])
     np.testing.assert_array_equal(success, [False, False, False])
+    np.testing.assert_array_equal(mode, [0, 0, 0])
 
     fitted = Standardizer.fit(trans, FeatureConfig(standardize=True))
     np.testing.assert_allclose(fitted.mean, np.mean(x, axis=0))
@@ -46,9 +47,9 @@ def test_state_table_and_standardizer_match_terminal_state_schema():
 
 def test_greedy_radius_clusters_are_bounded_deterministic_and_keep_raw_reps():
     trans = _pack_episode([0.0, 0.09, 0.18, 0.27])
-    cfg = GraphConfig(radius=0.1, feature=FeatureConfig(standardize=True), compress=True)
+    cfg = GraphConfig(graph_kind="node", radius=0.1, feature=FeatureConfig(standardize=True), compress=True)
     standardizer = Standardizer.fit(trans, cfg.feature)
-    x, _, _ = state_table(trans)
+    x, _, _, _ = state_table(trans)
     z = standardizer.transform(x)
 
     nodes = build_nodes(trans, cfg, standardizer)
@@ -78,7 +79,7 @@ def test_success_and_non_success_occurrences_at_same_coordinate_stay_separate():
         terminal=[True, True],
         row_idx=[0, 1],
     )
-    cfg = GraphConfig(radius=2.0, compress=False)
+    cfg = GraphConfig(graph_kind="node", radius=2.0, compress=False)
     nodes = build_nodes(trans, cfg, Standardizer.fit(trans, cfg.feature))
     non_goal_next = nodes.assign_next[0]
     successful_current = nodes.assign_cur[1]
@@ -92,7 +93,7 @@ def test_compressed_and_uncompressed_edge_occurrences():
     # State assignments are [0, 0, 0, 1, 1, 2], so transition changes
     # have source dwell durations 3, 2, and 1.
     trans = _pack_episode([0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 3.0], goal=3.0)
-    cfg = GraphConfig(radius=0.1, compress=True, weight_policy="time")
+    cfg = GraphConfig(graph_kind="node", radius=0.1, compress=True, weight_policy="time")
     stdz = Standardizer.fit(trans, cfg.feature)
     nodes = build_nodes(trans, cfg, stdz)
     edges = build_edges(trans, nodes, cfg)
@@ -104,7 +105,7 @@ def test_compressed_and_uncompressed_edge_occurrences():
     np.testing.assert_array_equal(edges.n_neg, [0, 0, 0])
     np.testing.assert_array_equal(edges.kind, [0, 0, 0])
 
-    uncompressed_cfg = GraphConfig(radius=0.1, compress=False, weight_policy="time")
+    uncompressed_cfg = GraphConfig(graph_kind="node", radius=0.1, compress=False, weight_policy="time")
     uncompressed = build_edges(trans, nodes, uncompressed_cfg)
     np.testing.assert_array_equal(uncompressed.src, edges.src)
     np.testing.assert_array_equal(uncompressed.dst, edges.dst)

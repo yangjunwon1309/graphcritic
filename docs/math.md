@@ -1,102 +1,76 @@
-# Graph Critic formalization
+# Graph Critic v0.2 graph formalization
 
-This note fixes the notation used by the v0.2 row schema and graph-cost construction. It states the exact finite-graph result used by the implementation; statistical calibration and critic approximation guarantees require separate assumptions and are not claimed here.
+This note describes the schema-0.3 implementation of the v0.2 graph redesign. It separates exact properties of the finite graph from assumptions about real simulator behavior and statistical calibration.
 
-## Data and graph notation
+## State occurrences and replay data
 
-Let a flat dataset contain rows `i = 0, ..., N-1`, each representing one environment step
+Each transition row `i` stores `(s_i, a_i, s'_i)`, a segment ID, local time, terminal status, success labels for both endpoints, and discrete modes `m_i` and `m'_i`. The state table contains the `N` current-state occurrences followed by one final next-state occurrence for each terminal row. For a nonterminal row, its next-state occurrence is the next row's current state. `graph_kind="state"` gives each occurrence its own vertex; no geometric clustering occurs.
 
-\[
-(s_i,a_i,s'_i,r_i,d_i),
-\]
+Let `φ(s)` be the configured identity, selected, or TDR feature. The median within-mode one-step feature distance is `d_step`. Bridge radius is absolute or `radius × d_step`.
 
-where `d_i` marks the last row of its QC sampler segment. The schema stores two labels: `z_i^cur` for current state `s_i` and `z_i^next` for next state `s'_i`. `episode_id` names a sampler segment, so rows are contiguous and local times start at zero and increase by one. Sticky robomimic done rows each end a segment while source rows remain in place.
+The graph has two edge types:
 
-The graph builder assigns each current and next state to nodes:
+- A temporal edge follows one recorded transition, has `κ=1`, and cost `c=-log γ`.
+- A bridge from source `u` to anchor `v` replays the anchor's recorded actions for `L` steps and lands at `v+L`. It requires matching modes, an eligible time gap, distance within radius, and a valid same-mode landing segment. It has `κ=L`, stores `dist=d(φ(u),φ(v))`, and records `anchor=v`.
 
-\[
-\nu_i = \texttt{assign\_cur}[i], \qquad
-\nu'_i = \texttt{assign\_next}[i].
-\]
+The bridge points to the landing state, not the anchor. It represents borrowing the anchor's action sequence for an open-loop replay. The source and anchor may be nearby but are distinct occurrences.
 
-For every nonterminal row, `ν'_i = ν_{i+1}`. Current and next occurrences use their corresponding success labels. Goal nodes represent only successful state occurrences; goal and non-goal states are never merged. The finite directed edge set is `E`; edge `e=(u,v)` stores duration upper bound `κ_e ≥ 1`, positive count `n_e^+`, negative count `n_e^-`, and kind (data or bridge).
+## Bridge cost policies
 
-## Edge costs and graph value
-
-For discount `γ ∈ (0,1)`, let `c = -log γ` be the time cost per step. Given Beta prior `(α_0, β_0)`, the posterior lower confidence bound at quantile `q` is
+For a prior bridge, the added switch cost is
 
 \[
-\ell_e(q) = F^{-1}_{\mathrm{Beta}(\alpha_0+n_e^+,\,\beta_0+n_e^-)}(q).
+\lambda_b = c\left(\Lambda_0 + \Lambda_1(d_b/r)^2\right),
+\qquad w_b = cL + \lambda_b.
 \]
 
-For `mode="union"`, the v0.1 quantile is `q = δ / |E|`; for `mode="fixed"`, it is `q = exp(-λ)`. The edge cost is selected by policy:
+Temporal edges never receive a confidence penalty. This is essential: recorded deterministic transitions are treated as certain, while uncertainty is charged at the cross-trajectory switch.
+
+For data calibration, actions are standardized per action dimension. A candidate pair `(u,v)` contributes evidence when its L-step action-window RMS distance is at most `action_tol`. It is a success when its observed L-step endpoint distance is at most `land_tol × d_step` and the endpoint modes agree. Bridge state distances are partitioned into quantile bins. For each bin `k`,
 
 \[
-w_e =
-\begin{cases}
-1, & \text{hop},\\
-c\,\kappa_e, & \text{time},\\
--\log \ell_e(q) + c\,\kappa_e, & \text{lcb}.
-\end{cases}
+\ell_k = F^{-1}_{\operatorname{Beta}(\alpha_0+n_k^+,\,\beta_0+n_k^-)}(\delta/K),
+\qquad \lambda_b = -\log \ell_{k(b)}.
 \]
 
-The cost-to-go from node `u` to the set of goal nodes `G` is
+Here `K` is the number of nonempty distance bins. The bound is on the bin's mean landing-success probability, not an individual bridge. Applying it to a particular bridge relies on the additional assumption that action-matched evidence represents bridges in that distance bin. Edges whose added cost exceeds `lambda_cap_steps` are dropped.
+
+For a deterministic simulator, `sim_verified` replays bridges on current shortest paths. A successful replay receives zero added cost; a failure is removed. Unused, unverified bridges are dropped when the verification budget ends. This validates the bridge landing tube, but not the local temporal tracking assumption after landing.
+
+## Cost-to-go and critic targets
+
+For each state occurrence `u`, the graph cost is
 
 \[
-C_G(u) = \begin{cases}
-0, & u \in G,\\
-\min_{(u,v)\in E}\{w_{(u,v)} + C_G(v)\}, & u \notin G\text{ and a goal is reachable},\\
-\infty, & \text{otherwise}.
-\end{cases}
+C_G(u) = \min_{\pi:u\leadsto\mathcal{G}}
+\left[c\,T(\pi)+\sum_{b\in B(\pi)}\lambda_b\right],
 \]
 
-In an offline-only graph with `β_0=1` and `n_e^-=0`, the Beta quantile has the closed form
+where `T(π)` is the sum of replayed environment steps, `B(π)` is the set of bridges on the path, and `𝒢` is the set of success-labeled state occurrences. Reverse multi-source Dijkstra computes all costs exactly for the chosen finite graph and edge weights. Unreachable states have infinite graph cost; the target builder clips only at `c_max_steps`.
+
+For a valid chunk beginning at row `i` with horizon `h`, a success on transition `i+k` yields `k+1` steps. If no success occurs inside the chunk, the endpoint is `assign_next[i+h-1]` and
 
 \[
--\log \ell_e(q) = \frac{\log(1/q)}{\alpha_0+n_e^+}.
+y_i = h + \min\left(C_G(\texttt{assign\_next}[i+h-1])/c,\;c_{\max}^{\mathrm{steps}}\right).
 \]
 
-The implementation evaluates the general quantile with `scipy.special.betaincinv`. Artifact `cost` is stored in nats; unreachable nodes remain `inf`. Clipping is applied only when forming targets.
+An already-successful current state has target zero. Invalid chunks are zero-filled and marked invalid. `TargetSet.source` records `0=chunk success`, `1=finite graph cost`, `2=cap or unreachable`, and `3=invalid`.
 
-## Chunk targets and validity
+## What the guarantee does and does not say
 
-For a chunk starting at row `i` with horizon `h`, define `valid_i` iff (1) `i+h-1 < N` and (2) none of `i,...,i+h-2` is terminal. This matches QC's `sample_sequence` endpoint-validity mask: a terminal on the final chunk row is allowed, but a terminal before it invalidates the chunk. Let
+The finite-graph Dijkstra result is exact by path reversal. A value lower bound for the real environment needs stronger assumptions:
+
+- **A1, bridge landing:** executing bridge `b` from source `u` reaches the landing tube around `v+L` with probability at least `p_b`.
+- **A2, local tracking:** from any state in that tube, a policy can replay the landing state's following temporal segment to its next decision-state tube in the same number of steps.
+
+If every bridge penalty satisfies `λ_b ≥ -log p_b`, following a shortest graph path gives
 
 \[
-k_i = \min\{j \in \{0,\ldots,h-1\}: z_{i+j}^{next}=1\},
+V^*(u) \ge \exp(-C_G(u)).
 \]
 
-when the set is nonempty. Let `C_max = c · c_max_steps`. The step-unit target is
+`sim_verified` checks A1 for the tested bridge resets. It does not prove A2; sampled path replay and `path_exec_rate` measure how well the composed assumption works. Data-calibrated costs support the stated bound only under the distance-bin representativeness assumption and its confidence event. These assumptions are reported separately from the exact shortest-path computation.
 
-\[
-y_i =
-\begin{cases}
-0, & \neg valid_i,\\
-0, & valid_i\text{ and }z_i^{cur}=1,\\
-k_i+1, & valid_i,\ z_i^{cur}=0,\text{ and }k_i\text{ exists},\\
-h + \min\left(C_G(\nu'_{i+h-1})/c,\;c_{\max}^{\mathrm{steps}}\right),
-& valid_i,\ z_i^{cur}=0,\text{ and no success occurs in the chunk}.
-\end{cases}
-\]
+## Exact temporal-chain contraction
 
-A chunk that starts in an already-successful current state has zero remaining cost. Otherwise, a success on the next state of its `j`th transition costs `j+1` steps.
-
-Invalid targets are zero-filled because multiplying a NaN target by a zero loss mask still yields NaN. For `unit="nats"`, multiply the step target by `c`. A cost critic can be trained with squared error to `y`; the actor consumes `Q=-C_\theta`.
-
-For valid rows, the BOOST-style weighted-SFT weight is defined in nats as
-
-\[
-\omega_i = \operatorname{clip}\left(
-\exp\left[\beta\left(C_G(\nu_i)-y_i^{\mathrm{nats}}\right)\right],
-0,\omega_{\max}\right),
-\]
-
-and is zero for invalid rows. The graph cost and target must be converted to the same unit before evaluating this expression.
-
-## Finite-graph shortest-path result
-
-**Theorem (reverse multi-source Dijkstra).** Let `G=(V,E)` be a finite directed graph with a nonempty goal set `G_goal` and strictly positive finite edge weights. Reverse every edge while preserving its weight, then run multi-source Dijkstra from all goal nodes. The resulting distance for each original node `u` equals `C_G(u)`, the minimum sum of edge weights over all original directed paths from `u` to any goal. Nodes with no such path have infinite cost.
-
-**Proof.** Reversing an original path from `u` to a goal produces a path from that goal to `u` with the same edge-weight sum. Thus paths from the multi-source set to `u` in the reversed graph are in one-to-one, cost-preserving correspondence with original paths from `u` to a goal. Dijkstra returns the minimum path cost for nonnegative weights, so its result is exactly the stated minimum; an unreachable node has no corresponding path and receives infinite distance. ∎
-
-**Corollary (deterministic time-cost graph).** If all edge success penalties are zero and each edge has weight `c κ_e`, then `C_G(u) = c d^*(u)`, where `d^*(u)` is the minimum total duration `Σ κ_e` to a goal. In particular, for unit-duration edges this is `c` times the directed BFS hop distance.
+A state is a decision state when it starts an episode, is a goal, changes mode, starts or ends a bridge, ends a temporal chain, or reaches the configured segment-length limit. Between decision states the only outgoing choice is the recorded temporal successor. Replacing each such chain by one edge with summed duration and summed weight preserves every path cost between decision states, so shortest-path costs on those states are unchanged.

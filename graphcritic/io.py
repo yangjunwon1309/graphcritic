@@ -16,6 +16,7 @@ from graphcritic.types import (
     GraphArtifact,
     NodeSet,
     SchemaError,
+    SimStateSet,
     TargetSet,
     TransitionSet,
     _content_hash,
@@ -47,7 +48,7 @@ def _write_pair(
     npz_path.parent.mkdir(parents=True, exist_ok=True)
     safe_arrays: dict[str, NDArray[Any]] = {}
     for name, value in arrays.items():
-        array = np.ascontiguousarray(value)
+        array = np.array(value, copy=True) if np.asarray(value).ndim == 0 else np.ascontiguousarray(value)
         if array.dtype.hasobject:
             raise SchemaError(f"array {name!r} has object dtype; pickle is not supported")
         safe_arrays[name] = array
@@ -72,7 +73,14 @@ def _read_pair(path: str | Path) -> tuple[dict[str, NDArray[Any]], dict[str, Any
         raise SchemaError(f"unsupported or missing schema_version: {found!r}")
     try:
         with np.load(npz_path, allow_pickle=False) as archive:
-            arrays = {name: np.ascontiguousarray(archive[name]) for name in archive.files}
+            arrays = {
+                name: (
+                    np.array(archive[name], copy=True)
+                    if archive[name].ndim == 0
+                    else np.ascontiguousarray(archive[name])
+                )
+                for name in archive.files
+            }
     except (OSError, ValueError, EOFError) as exc:
         raise SchemaError(f"cannot read safe NPZ arrays at {npz_path}") from exc
     if any(array.dtype.hasobject for array in arrays.values()):
@@ -100,7 +108,7 @@ def _require_hash(metadata: Mapping[str, Any], config: Any, arrays: Mapping[str,
 
 
 def _transition_arrays(trans: TransitionSet) -> dict[str, NDArray[Any]]:
-    return {
+    arrays = {
         "feat": trans.feat,
         "next_feat": trans.next_feat,
         "episode_id": trans.episode_id,
@@ -109,7 +117,12 @@ def _transition_arrays(trans: TransitionSet) -> dict[str, NDArray[Any]]:
         "success_cur": trans.success_cur,
         "terminal": trans.terminal,
         "row_idx": trans.row_idx,
+        "mode": trans.mode,
+        "mode_next": trans.mode_next,
     }
+    if trans.action is not None:
+        arrays["action"] = trans.action
+    return arrays
 
 
 def save_transitions(
@@ -145,10 +158,11 @@ def load_transitions(
 ) -> tuple[TransitionSet, dict[str, Any]]:
     arrays, metadata = _read_pair(path)
     required = {
-        "feat", "next_feat", "episode_id", "t", "success", "success_cur", "terminal", "row_idx"
+        "feat", "next_feat", "episode_id", "t", "success", "success_cur", "terminal",
+        "row_idx", "mode", "mode_next",
     }
-    if set(arrays) != required:
-        raise SchemaError(f"transition arrays must be exactly {sorted(required)}")
+    if not required.issubset(arrays) or set(arrays) - required - {"action"}:
+        raise SchemaError(f"transition arrays must contain {sorted(required)} and optional action")
     _require_hash(metadata, {}, arrays)
     meta = metadata.get("meta")
     if not isinstance(meta, dict) or not isinstance(meta.get("dataset_id"), str):
@@ -161,7 +175,56 @@ def load_transitions(
     return trans, meta
 
 
+def save_sim_state(sim_state: SimStateSet, path: str | Path) -> None:
+    """Save an aligned simulator reset-state sidecar as a safe NPZ."""
+    sim_state.validate()
+    target = Path(path)
+    if target.suffix != ".npz":
+        target = target / "sim_state.npz"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    arrays: dict[str, NDArray[Any]] = {
+        "qpos": sim_state.qpos,
+        "qvel": sim_state.qvel,
+        "schema_version": np.asarray(SCHEMA_VERSION),
+        "state_order": np.asarray("state_table"),
+    }
+    if sim_state.button_states is not None:
+        arrays["button_states"] = sim_state.button_states
+    with target.open("wb") as stream:
+        np.savez_compressed(stream, **arrays)
+
+
+def load_sim_state(path: str | Path, *, n_states: int | None = None) -> SimStateSet:
+    """Load and validate a simulator sidecar without enabling pickle."""
+    target = Path(path)
+    try:
+        with np.load(target, allow_pickle=False) as archive:
+            required = {"qpos", "qvel", "schema_version", "state_order"}
+            if not required.issubset(archive.files) or set(archive.files) - required - {"button_states"}:
+                raise SchemaError("sim_state.npz has unexpected or missing arrays")
+            if str(archive["schema_version"].item()) != SCHEMA_VERSION:
+                raise SchemaError("sim_state.npz schema_version must be 0.3")
+            if str(archive["state_order"].item()) != "state_table":
+                raise SchemaError("sim_state.npz state_order must be 'state_table'")
+            sim_state = SimStateSet(
+                qpos=archive["qpos"],
+                qvel=archive["qvel"],
+                button_states=archive["button_states"] if "button_states" in archive.files else None,
+            )
+    except (OSError, ValueError, EOFError) as exc:
+        if isinstance(exc, SchemaError):
+            raise
+        raise SchemaError(f"cannot read simulator sidecar at {target}") from exc
+    sim_state.validate(n_states)
+    return sim_state
+
+
 def _graph_arrays(artifact: GraphArtifact) -> dict[str, NDArray[Any]]:
+    feature_meta = artifact.meta.get("feature")
+    checkpoint_hash = (
+        feature_meta.get("checkpoint_sha256") or ""
+        if isinstance(feature_meta, Mapping) else ""
+    )
     arrays: dict[str, NDArray[Any]] = {
         "rep_feat": artifact.nodes.rep_feat,
         "rep_ref": artifact.nodes.rep_ref,
@@ -174,9 +237,13 @@ def _graph_arrays(artifact: GraphArtifact) -> dict[str, NDArray[Any]]:
         "n_pos": artifact.edges.n_pos,
         "n_neg": artifact.edges.n_neg,
         "kind": artifact.edges.kind,
+        "dist": artifact.edges.dist,
+        "anchor": artifact.edges.anchor,
         "weights": artifact.weights,
         "cost": artifact.cost,
         "succ": artifact.succ,
+        "dataset_id": np.asarray(artifact.meta["dataset_id"]),
+        "feature_checkpoint_sha256": np.asarray(checkpoint_hash),
     }
     arrays.update({f"feature_{name}": value for name, value in artifact.feature_stats.items()})
     return arrays
@@ -208,7 +275,9 @@ def load_graph(path: str | Path, *, trans: TransitionSet | None = None) -> Graph
     _require_hash(metadata, config, arrays)
     required = {
         "rep_feat", "rep_ref", "assign_cur", "assign_next", "is_goal",
-        "src", "dst", "kappa", "n_pos", "n_neg", "kind", "weights", "cost", "succ",
+        "src", "dst", "kappa", "n_pos", "n_neg", "kind", "dist", "anchor",
+        "weights", "cost", "succ",
+        "dataset_id", "feature_checkpoint_sha256",
         "feature_mean", "feature_std",
     }
     if set(arrays) != required:
@@ -223,6 +292,7 @@ def load_graph(path: str | Path, *, trans: TransitionSet | None = None) -> Graph
     edges = EdgeSet(
         src=arrays["src"], dst=arrays["dst"], kappa=arrays["kappa"],
         n_pos=arrays["n_pos"], n_neg=arrays["n_neg"], kind=arrays["kind"],
+        dist=arrays["dist"], anchor=arrays["anchor"],
     )
     artifact = GraphArtifact(
         schema_version=metadata["schema_version"],
@@ -241,7 +311,7 @@ def load_graph(path: str | Path, *, trans: TransitionSet | None = None) -> Graph
 
 
 def _target_arrays(targets: TargetSet) -> dict[str, NDArray[Any]]:
-    return {"y": targets.y, "valid": targets.valid}
+    return {"y": targets.y, "valid": targets.valid, "source": targets.source}
 
 
 def _target_config(targets: TargetSet) -> dict[str, Any]:
@@ -268,6 +338,10 @@ def save_targets(targets: TargetSet, path: str | Path) -> str:
             "content_hash": content_hash,
         },
     )
+    npz_path, _ = _pair_paths(path)
+    source_path = npz_path.with_name(f"{npz_path.stem}_source.npy")
+    with source_path.open("wb") as stream:
+        np.save(stream, targets.source, allow_pickle=False)
     return content_hash
 
 
@@ -278,8 +352,8 @@ def load_targets(
     expected_dataset_id: str | None = None,
 ) -> TargetSet:
     arrays, metadata = _read_pair(path)
-    if set(arrays) != {"y", "valid"}:
-        raise SchemaError("target arrays must be exactly ['valid', 'y']")
+    if set(arrays) != {"y", "valid", "source"}:
+        raise SchemaError("target arrays must be exactly ['source', 'valid', 'y']")
     config = metadata.get("config")
     if not isinstance(config, dict):
         raise SchemaError("target metadata must include its configuration")
@@ -287,11 +361,21 @@ def load_targets(
     targets = TargetSet(
         y=arrays["y"],
         valid=arrays["valid"],
+        source=arrays["source"],
         h=config.get("h"),
         unit=config.get("unit"),
         graph_hash=config.get("graph_hash"),
         dataset_id=config.get("dataset_id"),
     )
+    source_path = _pair_paths(path)[0].with_name(f"{_pair_paths(path)[0].stem}_source.npy")
+    if source_path.is_file():
+        try:
+            with source_path.open("rb") as stream:
+                sidecar = np.load(stream, allow_pickle=False)
+        except (OSError, ValueError) as exc:
+            raise SchemaError(f"cannot read target-source sidecar at {source_path}") from exc
+        if not np.array_equal(sidecar, targets.source):
+            raise SchemaError("target-source sidecar does not match the hashed NPZ source array")
     if expected_dataset_id is not None and targets.dataset_id != expected_dataset_id:
         raise SchemaError("target dataset_id does not match the expected dataset")
     if graph is not None:

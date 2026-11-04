@@ -224,14 +224,26 @@ def build_nodes(
     trans: TransitionSet,
     cfg: GraphConfig,
     stdz: Standardizer,
+    *,
+    cluster_features: NDArray[np.float32] | None = None,
+    state_modes: NDArray[np.int64] | None = None,
+    radius: float | None = None,
 ) -> NodeSet:
-    """Greedily merge nearby state occurrences without merging goal states."""
+    """Legacy node graph: greedily merge states within each goal/mode class."""
     trans.validate()
     cfg.validate()
-    x, ref, is_success = state_table(trans)
+    x, ref, is_success, stored_modes = state_table(trans)
     if stdz.mean.shape != (trans.feat.shape[1],):
         raise SchemaError("standardizer feature dimension does not match transitions")
-    z = stdz.transform(x)
+    z = stdz.transform(x) if cluster_features is None else np.asarray(cluster_features, dtype=np.float32)
+    if z.ndim != 2 or z.shape[0] != x.shape[0] or z.shape[1] == 0 or not np.all(np.isfinite(z)):
+        raise SchemaError("cluster_features must be a finite (n_states, feature_dim) matrix")
+    modes = stored_modes if state_modes is None else np.asarray(state_modes, dtype=np.int64)
+    if modes.shape != (x.shape[0],):
+        raise SchemaError("state_modes must have one value per state occurrence")
+    cluster_radius = float(cfg.radius if radius is None else radius)
+    if cluster_radius <= 0 or not np.isfinite(cluster_radius):
+        raise SchemaError("effective clustering radius must be finite and positive")
     n_rows = trans.n_rows
     n_states = x.shape[0]
     if n_states == 0:
@@ -248,11 +260,10 @@ def build_nodes(
     representative_parts: list[np.ndarray] = []
     goal_parts: list[np.ndarray] = []
     n_clusters_total = 0
-    for goal_flag in (False, True):
-        members = np.flatnonzero(is_success == goal_flag)
-        if members.size == 0:
-            continue
-        labels, leaders, representatives = _cluster_group(z, members, cfg.radius)
+    group_keys = sorted({(bool(goal), int(mode)) for goal, mode in zip(is_success, modes, strict=True)})
+    for goal_flag, mode_value in group_keys:
+        members = np.flatnonzero((is_success == goal_flag) & (modes == mode_value))
+        labels, leaders, representatives = _cluster_group(z, members, cluster_radius)
         state_to_node[members] = labels + n_clusters_total
         leader_parts.append(leaders)
         representative_parts.append(representatives)

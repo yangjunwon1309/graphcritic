@@ -24,6 +24,7 @@ def critic_targets(
 
     n_rows = trans.n_rows
     valid = np.zeros(n_rows, dtype=np.bool_)
+    source = np.full(n_rows, 3, dtype=np.uint8)
     n_starts = max(0, n_rows - h + 1)
     if n_starts:
         # Match QC sample_sequence: a terminal is allowed at the chunk end,
@@ -48,6 +49,16 @@ def critic_targets(
         # Preserve the explicit current-state success label, including states
         # at a sampler-segment boundary after sticky success rows.
         values[trans.success_cur[:n_starts]] = 0.0
+        chunk_success = has_success | trans.success_cur[:n_starts]
+        graph_used = (
+            ~chunk_success
+            & np.isfinite(artifact.cost[endpoint_nodes])
+            & (artifact.cost[endpoint_nodes] / c < c_max_steps)
+        )
+        clipped = valid[:n_starts] & ~chunk_success & ~graph_used
+        source[:n_starts][valid[:n_starts] & chunk_success] = 0
+        source[:n_starts][graph_used & valid[:n_starts]] = 1
+        source[:n_starts][clipped] = 2
         y_steps = np.zeros(n_rows, dtype=np.float64)
         y_steps[:n_starts] = np.where(valid[:n_starts], values, 0.0)
     else:
@@ -63,6 +74,7 @@ def critic_targets(
         unit=cfg.unit,
         graph_hash=artifact.content_hash,
         dataset_id=str(artifact.meta["dataset_id"]),
+        source=source,
     )
     targets.validate(trans)
     return targets

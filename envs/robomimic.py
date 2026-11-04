@@ -82,6 +82,7 @@ def load_robomimic_transitions(
     reward_parts: list[np.ndarray] = []
     terminal_parts: list[np.ndarray] = []
     cur_success_parts: list[np.ndarray] = []
+    action_parts: list[np.ndarray] = []
     source_episode_parts: list[np.ndarray] = []
 
     with h5py.File(path, "r") as source:
@@ -113,6 +114,7 @@ def load_robomimic_transitions(
             reward_parts.append(rewards)
             terminal_parts.append(terminals)
             cur_success_parts.append(current_success)
+            action_parts.append(actions)
             source_episode_parts.append(np.full(length, source_episode, dtype=np.int64))
 
     if not obs_parts:
@@ -134,6 +136,7 @@ def load_robomimic_transitions(
         success_cur=success_cur,
         terminal=terminals,
         row_idx=np.arange(observations.shape[0], dtype=np.int64),
+        action=np.concatenate(action_parts, axis=0),
     )
     dataset_id = f"robomimic:{env_name}:{_sha256(path)}"
     return transitions, dataset_id

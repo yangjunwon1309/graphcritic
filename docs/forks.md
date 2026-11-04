@@ -43,7 +43,7 @@ The Scene smoke uses QC dataset ID `scene-play-singletask-task1-v0`, backed by t
 ~/.ogbench/data/scene-play-v0-val.npz
 ```
 
-The E1 Cube task uses dataset ID `cube-triple-play-singletask-task2-v0` and files `cube-triple-play-v0.npz` / `cube-triple-play-v0-val.npz`; those large Cube archives have not been downloaded on this machine yet.
+The E1 Cube comparison uses `cube-double-play-singletask-task2-v0`. The triple-cube task2 result is zero for all compared methods at 1M and is not a useful comparison.
 
 ## Data and reward conventions
 
@@ -78,13 +78,13 @@ cd third_party/qc
 MUJOCO_GL=egl WANDB_MODE=offline pixi run -e bench --manifest-path ../../pixi.toml -- python main.py \
   --run_group=reproduce --agent.alpha=100 \
   --env_name=lift-mh-low_dim --sparse=False --horizon_length=1 \
-  --offline_steps=2000000 --online_steps=0
+  --offline_steps=1000000 --online_steps=0
 
 # QC, horizon 5 with best-of-32 actor sampling
 MUJOCO_GL=egl WANDB_MODE=offline pixi run -e bench --manifest-path ../../pixi.toml -- python main.py \
   --run_group=reproduce --agent.actor_type=best-of-n --agent.actor_num_samples=32 \
   --env_name=lift-mh-low_dim --sparse=False --horizon_length=5 \
-  --offline_steps=2000000 --online_steps=0
+  --offline_steps=1000000 --online_steps=0
 
 # Short OGBench loader/training/evaluation smoke
 MUJOCO_GL=egl WANDB_MODE=offline pixi run -e bench --manifest-path ../../pixi.toml -- python main.py \
@@ -93,7 +93,7 @@ MUJOCO_GL=egl WANDB_MODE=offline pixi run -e bench --manifest-path ../../pixi.to
   --offline_steps=1 --online_steps=0 --eval_interval=1 --eval_episodes=1 --video_episodes=0 --seed=0
 ```
 
-The following Scene commands pair FQL (`h=1`) and QC (`h=5`) with their graph-cost variants. Run them from `third_party/qc`; Scene is downloaded automatically by QC. After the train archive exists, set the dataset ID using the exact file bytes. `outputs/scene-h1/targets.npz` and `outputs/scene-h5/targets.npz` stand for schema v0.2 target pairs with the matching horizon and dataset ID.
+The following Scene commands pair FQL (`h=1`) and QC (`h=5`) with their graph-cost variants. Run them from `third_party/qc`; Scene is downloaded automatically by QC. Graph targets use schema v0.3 and must match the dataset, horizon, unit, and flattened row order.
 
 ```bash
 cd third_party/qc
@@ -101,7 +101,7 @@ cd third_party/qc
 # FQL baseline, h=1
 MUJOCO_GL=egl WANDB_MODE=offline pixi run -e bench --manifest-path ../../pixi.toml -- python main.py \
   --run_group=e1-scene --agent.alpha=300 --env_name=scene-play-singletask-task1-v0 \
-  --sparse=True --horizon_length=1 --offline_steps=2000000 --online_steps=0 --seed=0
+  --sparse=True --horizon_length=1 --offline_steps=1000000 --online_steps=0 --seed=0
 
 # The baseline run above downloads the official Scene archive on first use.
 DATASET_ID="ogbench:scene-play-singletask-task1-v0:$(sha256sum ~/.ogbench/data/scene-play-v0.npz | cut -d ' ' -f1)"
@@ -110,28 +110,37 @@ DATASET_ID="ogbench:scene-play-singletask-task1-v0:$(sha256sum ~/.ogbench/data/s
 MUJOCO_GL=egl WANDB_MODE=offline pixi run -e bench --manifest-path ../../pixi.toml -- python main.py \
   --run_group=e1-scene-graph --agent.alpha=300 --agent.critic_mode=graph \
   --env_name=scene-play-singletask-task1-v0 --sparse=True --horizon_length=1 \
-  --offline_steps=2000000 --online_steps=0 --graph_targets=../../outputs/scene-h1/targets.npz \
+  --offline_steps=1000000 --online_steps=0 --graph_targets=../../outputs/scene-h1/targets.npz \
   --graph_dataset_id="$DATASET_ID" --seed=0
 
 # QC baseline, h=5
 MUJOCO_GL=egl WANDB_MODE=offline pixi run -e bench --manifest-path ../../pixi.toml -- python main.py \
   --run_group=e1-scene --agent.actor_type=best-of-n --agent.actor_num_samples=32 \
   --env_name=scene-play-singletask-task1-v0 --sparse=True --horizon_length=5 \
-  --offline_steps=2000000 --online_steps=0 --seed=0
+  --offline_steps=1000000 --online_steps=0 --seed=0
 
 # QC with graph costs, h=5
 MUJOCO_GL=egl WANDB_MODE=offline pixi run -e bench --manifest-path ../../pixi.toml -- python main.py \
   --run_group=e1-scene-graph --agent.actor_type=best-of-n --agent.actor_num_samples=32 \
   --agent.critic_mode=graph --env_name=scene-play-singletask-task1-v0 --sparse=True --horizon_length=5 \
-  --offline_steps=2000000 --online_steps=0 --graph_targets=../../outputs/scene-h5/targets.npz \
+  --offline_steps=1000000 --online_steps=0 --graph_targets=../../outputs/scene-h5/targets.npz \
   --graph_dataset_id="$DATASET_ID" --seed=0
 ```
 
-The baseline commands run now. The graph commands require the matching `targets.npz`/`.json` pairs; target generation is not available yet because `experiments/build_graph.py` and the graph/target core functions remain stubs. Graph mode is offline-only and the runner checks schema version, dataset ID, horizon, units, flattened row count, and QC chunk validity before training.
+Graph targets can now be built from the OGBench dataset directly. From the repository root, create the schema-0.3 state graph and its simulator sidecar with:
 
-For E1, use the same two commands for `lift-mh-low_dim`, `can-mh-low_dim`, and `square-mh-low_dim`; then use `scene-play-singletask-task1-v0` with `--sparse=True` and `cube-triple-play-singletask-task2-v0` with `--sparse=False`. The public individual plot data has 21 evaluation points at 100K-step intervals from 0 to 2M for offline runs, so a comparable full run uses `--offline_steps=2000000` and the default `--eval_interval=100000`, `--eval_episodes=50`.
+```bash
+pixi run -e bench -- python experiments/build_graph.py \
+  --ogbench-dataset scene-play-singletask-task1-v0 \
+  --config configs/graph/scene.yaml --h 5 --unit steps \
+  --out outputs/scene-v02
+```
 
-`main.py` defaults to seed 0. `plot_data/README.md` documents 21 points from 0 to 2M and 95% bootstrap confidence intervals (5,000 resamples), but does not specify the number or IDs of seeds behind the published curves; the pickle files contain aggregate means and confidence bounds, not raw seed runs. Do not treat a single local seed as a full statistical reproduction.
+The command writes `graph.npz`/`.json`, `targets.npz`/`.json`, `targets_source.npy`, `sim_state.npz`, `transitions.npz`/`.json`, and `diagnostics.json`. Simulator replay runs only when `--path-exec` is passed (or the cost policy is `sim_verified`); data-calibrated graph construction remains offline. Training gates return exit code 2 when the graph has too many capped non-success targets or insufficient reachability; use `--force` only to retain a failed pilot for diagnosis.
+
+For E1, use the same task commands for `lift-mh-low_dim`, `can-mh-low_dim`, and `square-mh-low_dim`; then use `scene-play-singletask-task1-v0` with `--sparse=True` and `cube-double-play-singletask-task2-v0` with `--sparse=False`. The public plot data combines offline steps from 0–1M and online steps from 1–2M. An offline-only run should therefore use `--offline_steps=1000000` and compare evaluation index 10 (1.0M), not the 2.0M endpoint.
+
+`main.py` defaults to seed 0. The public plot files aggregate the 0–1M offline segment and 1–2M online segment and provide 95% bootstrap confidence intervals (5,000 resamples), but do not specify the number or IDs of seeds behind the published curves; the pickle files contain aggregate means and confidence bounds, not raw seed runs. Do not treat a single local seed as a full statistical reproduction.
 
 ## Kitchen limitation
 
@@ -145,10 +154,10 @@ The T5 environment and smoke checks completed on 2026-11-01:
 - JAX reports the RTX 3080 as its GPU backend/device. PyTorch is intentionally CPU-only. MuJoCo EGL rendering was exercised and reported `NVIDIA GeForce RTX 3080/PCIe/SSE2` as the renderer.
 - Official OGBench Scene train/validation files downloaded to the paths above and passed HTTP range, size, and NPZ CRC checks. Train is 267,055,508 bytes (SHA256 `66625e0cd9f2fcf92f5988f4d1bedeb2aa8b1e748316e507e89f4a9afb87c341`); validation is 26,795,398 bytes (SHA256 `6700c42a1602fa4a9457414395613d9d8ad6350181662a79751ca02dc0423cb2`). QC loading produced 1,000,000 transitions with observations `(1000000, 40)`, actions `(1000000, 5)`, 1,000 episode terminals, and matching next-observation lengths.
 - The OGBench QC smoke command exited 0 after one offline update and one evaluation episode. Evaluation completed 750 environment steps, returned `-1500`, and had success `0`; this only checks execution, not policy quality.
-- The `scene-singletask-task1-v0` and `cube-triple-singletask-task2-v0` environments both reset and accepted a zero-action step with the expected 40/46 observation features and 5 action dimensions. The QC CLI smoke used Scene; the Cube dataset archives were not downloaded, so no Cube dataset-backed training run was part of this smoke.
+- The `scene-singletask-task1-v0` environment reset and accepted a zero-action step with the expected 40 observation features and 5 action dimensions. No Cube dataset-backed training run was part of this smoke.
 - Official robomimic v1.5 MH HDF5 files passed QC loader checks: Lift (300 demos/31,127 transitions, SHA256 `d8bc0de2ca48d0b834ab36561182182d101f4e84bfcec365291ec7acf12124dd`), Can (300/62,756, SHA256 `c4a34c837913446d295c6ca38f2b31888d69812198478af470ecb84a99e9f7d7`), and Square (300/80,731, SHA256 `da7dee0b6da49feae81dbde8fc6508660788e2131098f72ca44f60528405172d`). Lift reset/step replay matched the initial dataset observation within `1.1e-7`; first environment success matched the first positive reward at row 42. These files retain sticky post-success reward/done flags, so the adapter must represent success at its first transition and normalize episode boundaries to the schema.
 - A QC-FQL Lift smoke completed one offline GPU update and one 300-step evaluation episode; evaluation success and return were both zero, as expected for an untrained one-step smoke.
-- No full E1 runs were performed. Matching published results requires the five tasks, 2M offline updates per run, multiple seeds, and plot comparison; the source does not publish the seed IDs/count. Smoke runs are not reproduction results, and `repro-v0.1` must not be tagged from these checks.
+- No full E1 runs were performed. Matching the offline portions requires the five tasks, 1M offline updates per run, multiple seeds, and comparison at evaluation index 10; the source does not publish the seed IDs/count. Smoke runs are not reproduction results, and `repro-v0.1` must not be tagged from these checks.
 
 ## Upstream references
 

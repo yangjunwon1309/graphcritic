@@ -33,6 +33,7 @@ def _edges(src, dst, kind=None, n_pos=None) -> EdgeSet:
         n_pos=np.ones(n, dtype=np.int64) if n_pos is None else n_pos,
         n_neg=np.zeros(n, dtype=np.int64),
         kind=np.zeros(n, dtype=np.int8) if kind is None else kind,
+        anchor=np.where(np.asarray(np.zeros(n, dtype=np.int8) if kind is None else kind) == 1, 0, -1),
     )
 
 
@@ -62,15 +63,15 @@ def test_edge_weight_policies_and_large_sample_limit():
     edges = _edges([0, 1], [1, 2], n_pos=[10, 10])
     gamma = 0.97
     c = step_cost(gamma)
-    time_cfg = GraphConfig(gamma=gamma, weight_policy="time")
-    hop_cfg = GraphConfig(gamma=gamma, weight_policy="hop")
-    lcb_cfg = GraphConfig(gamma=gamma, weight_policy="lcb")
+    time_cfg = GraphConfig(graph_kind="node", gamma=gamma, weight_policy="time")
+    hop_cfg = GraphConfig(graph_kind="node", gamma=gamma, weight_policy="hop")
+    lcb_cfg = GraphConfig(graph_kind="node", gamma=gamma, weight_policy="lcb")
     np.testing.assert_array_equal(edge_weights(edges, hop_cfg), [1.0, 1.0])
     np.testing.assert_array_equal(edge_weights(edges, time_cfg), [c, c])
     assert np.all(edge_weights(edges, lcb_cfg) > edge_weights(edges, time_cfg))
 
     many = _edges([0], [1], n_pos=[1_000_000_000])
-    ratio = edge_weights(many, GraphConfig(gamma=gamma, weight_policy="lcb"))[0] / c
+    ratio = edge_weights(many, GraphConfig(graph_kind="node", gamma=gamma, weight_policy="lcb"))[0] / c
     assert ratio - 1.0 < 1e-6
 
 
@@ -99,7 +100,7 @@ def test_reverse_dijkstra_chain_duplicates_isolates_and_no_goal():
 
 def _chain_artifact():
     trans, info = make_chain(L=8, n_episodes=3, p_forward=1.0, seed=2)
-    cfg = GraphConfig(radius=0.25, compress=False, weight_policy="time")
+    cfg = GraphConfig(graph_kind="node", radius=0.25, compress=False, weight_policy="time")
     artifact = build_artifact(trans, cfg, dataset_id="chain-test", source="test")
     return trans, info, cfg, artifact
 
@@ -157,7 +158,7 @@ def test_sft_weights_zero_invalid_bounded_and_one_on_shortest_chain():
     with pytest.raises(SchemaError, match="different graph"):
         other = build_artifact(
             trans,
-            GraphConfig(radius=0.2, compress=False, weight_policy="time"),
+            GraphConfig(graph_kind="node", radius=0.2, compress=False, weight_policy="time"),
             dataset_id="chain-test",
             source="test",
         )

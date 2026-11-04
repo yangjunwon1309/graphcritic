@@ -115,40 +115,53 @@ core는 데이터셋을 받아 그래프 artifact와 critic target 배열을 만
 
 ### 4.1 타입
 
-스키마 v0.2는 행 하나를 환경 step `(s_t, a_t, s_{t+1})`로 정의한다. 행 순서는 QC의 평탄 배열과 같고, chunk 값은 저장하지 않고 target 계산 때 만든다. v0.2는 양 끝 상태의 성공 라벨을 분리하고 QC의 sticky terminal 표기를 보존한다. v0.1 전이 파일은 성공 의미와 배열 계약이 달라 v0.2에서 거부한다.
+스키마 v0.3은 행 하나를 환경 step `(s_t, a_t, s_{t+1})`로 정의한다. 행 순서는 QC의 평탄 배열과 같고, chunk 값은 저장하지 않고 target 계산 때 만든다. current/next 성공 라벨에 더해 mode와 행동을 저장하며, 시뮬레이터 reset 상태는 별도 `sim_state.npz`에 보관한다. v0.1/v0.2 아티팩트는 배열 계약이 달라 명확한 버전 오류로 거부한다.
 
 | 타입 | 필드 (dtype, shape) | 의미 |
 | --- | --- | --- |
-| `TransitionSet` | `feat`, `next_feat`: float32 `(N,p)`; `episode_id`, `t`, `row_idx`: int64 `(N,)`; `success_cur`, `success`, `terminal`: bool `(N,)` | 현재/다음 특징, QC sampler segment와 step 번호, 원본 QC 행, 현재 상태 `s_t` 성공, 다음 상태 `s_{t+1}` 성공, sampler segment 종료 표시 |
-| `NodeSet` | `rep_feat`: float32 `(V,p)`; `rep_ref`: int64 `(V,2)`; `assign_cur`, `assign_next`: int64 `(N,)`; `is_goal`: bool `(V,)` | 대표 특징과 출처 `(row, role)` (`0=cur`, `1=next`; BOOST 같은 외부 빌더는 row `-1` 허용), 행별 현재/다음 상태 노드, 성공 노드 |
-| `EdgeSet` | `src`, `dst`, `kappa`, `n_pos`, `n_neg`: int64 `(E,)`; `kind`: int8 `(E,)` | 방향 간선, 지속시간 상계(스텝), 성공/실패 occurrence 수, `0=data`, `1=bridge` (v0.1에서는 미사용) |
+| `TransitionSet` | `feat`, `next_feat`, 선택 `action`: float32; `episode_id`, `t`, `row_idx`, `mode`, `mode_next`: int64; `success_cur`, `success`, `terminal`: bool | 현재/다음 특징과 행동, sampler segment/time, 원본 행, 현재/다음 상태 mode 및 성공 라벨 |
+| `SimStateSet` | `qpos`, `qvel`: float32 `(M,dim)`; 선택 `button_states`: int64 `(M,dim)` | `state_table` 순서에 정렬된 MuJoCo reset sidecar |
+| `NodeSet` | `rep_feat`: float32 `(V,p)`; `rep_ref`: int64 `(V,2)`; `assign_cur`, `assign_next`: int64 `(N,)`; `is_goal`: bool `(V,)` | `graph_kind=state`에서는 모든 상태 발생을 보존하고 identity 배정. `node`에서는 v0.1 대표점/군집 배정 사용 |
+| `EdgeSet` | `src`, `dst`, `kappa`, `n_pos`, `n_neg`, `anchor`: int64; `kind`: int8; `dist`: float32 | `kind=0` 시간 간선은 확실한 데이터 replay, `kind=1`은 명시적 bridge. bridge 거리와 빌려 쓴 행동의 anchor를 기록 |
 | `GraphArtifact` | `schema_version`, `config`, `feature_stats`, `nodes`, `edges`, `weights`, `cost`, `succ`, `meta`, `content_hash` | 그래프 및 계산 설정. `cost`는 nats 단위이며 도달 불가는 `inf`, `succ`는 goal/도달 불가에서 `-1` |
-| `TargetSet` | `y`: float32 `(N,)`; `valid`: bool `(N,)`; `h`, `unit`, `graph_hash`, `dataset_id` | QC sampler와 같은 chunk 시작 행 기준 critic target, 유효성, 단위 및 출처 |
+| `TargetSet` | `y`: float32 `(N,)`; `valid`: bool `(N,)`; `source`: uint8 `(N,)`; `h`, `unit`, `graph_hash`, `dataset_id` | target 값과 유효성, 출처 코드 `0=chunk success`, `1=finite graph`, `2=cap/unreachable`, `3=invalid` |
 
 모든 스키마 생성 시 배열 dtype을 명시적으로 맞추고 `validate()`를 실행한다. 스키마 불일치는 `SchemaError`다. `episode_id`는 원본 시연 ID가 아니라 QC sampler가 연속된 유효 chunk로 취급하는 segment ID다. 같은 segment 행은 연속되고 `t`는 0부터 1씩 증가하며, 각 segment 마지막 행만 `terminal=True`다. QC `dones`가 연속해서 참인 robomimic post-success 행은 각 done 행에서 segment를 나누되 모든 원본 행과 `row_idx`를 보존한다. 이때 `success_cur`를 별도 기록해 segment 경계 뒤의 이미 성공한 상태도 goal로 남긴다. OGBench는 QC loader가 만든 전이 순서를 그대로 쓰고, 원본 terminal 관측 행은 transition으로 포함하지 않는다. 비종료 행 `i`에서는 `assign_next[i] == assign_cur[i+1]` 및 `success[i] == success_cur[i+1]`이어야 한다. `success_cur`는 `s_t`, `success`는 `s_{t+1}`의 성공 여부이며, goal 노드는 current/next 어느 쪽의 성공 상태도 비성공 상태와 병합하지 않는다.
 
-`EdgeSet`은 자기 간선을 허용하지 않으며 `(src,dst,kind)` 키가 유일해야 한다. `kappa >= 1`, occurrence 수는 음수가 아니다. Graph의 weights는 유한하고 양수, cost는 음수가 아니며 goal cost는 0이다. `GraphConfig`는 frozen dataclass이며 `gamma`, `radius`, feature 설정, 압축/일관성 설정, weight policy, pessimism 사전분포와 `c_max_steps`를 담는다. 현재 구현은 `consistency=True`를 지원하지 않는다. `TargetConfig`는 chunk 길이 `h`와 `steps`/`nats` 단위를 담는다.
+`EdgeSet`은 자기 간선을 허용하지 않으며 `(src,dst,kind)` 키가 유일해야 한다. 시간 간선은 `kappa=1`, `dist=0`, `anchor=-1`; bridge는 `kappa=L`이고 유효 anchor가 있어야 한다. `GraphConfig.graph_kind`의 기본은 `state`, v0.1 비교와 BOOST 호환에는 `node`를 쓴다. state graph의 시간 비용은 `c·kappa`이고 비관성은 bridge에만 적용된다. `TargetConfig`는 chunk 길이 `h`와 `steps`/`nats` 단위를 담는다.
 
 ### 4.2 API
 
-- `Standardizer.fit(trans, feature_cfg) -> Standardizer`와 `state_table(trans) -> (X, ref, is_success)`: 표준화 통계를 계산하고 current 상태 및 각 segment의 마지막 next 상태를 나열한다. 대표 특징은 원래 값으로 보관한다.
-- `build_nodes(trans, cfg, stdz) -> NodeSet`: 성공/비성공 상태를 따로 반경 greedy 군집화하고 행별 상태 배정을 만든다.
-- `build_edges(trans, nodes, cfg, edge_filter=None) -> EdgeSet`: 관측된 상태 변화를 집계한다. `compress=True`면 source 체류 시간을 `kappa`에 반영한다.
-- `edge_weights(edges, cfg) -> weights`: `hop`, `time`, `lcb` 정책으로 유한한 양수 비용을 계산한다.
+- `StateFeaturizer.fit(trans, feature_cfg)`와 `state_table(trans) -> (X, ref, success, mode)`: identity/select/TDR 거리 입력을 준비하고 현재 상태 및 terminal next 상태를 나열한다.
+- `build_state_graph(trans, cfg, phi) -> (NodeSet, EdgeSet, meta)`: occurrence별 상태 정점, 확실한 temporal 간선, 거리·mode·landing 조건을 만족한 명시적 bridge를 만든다.
+- kNN `auto`는 낮은 차원에서 cKDTree를 쓰고, 고차원에서는 FAISS가 있으면 우선 사용한다. FAISS가 없고 JAX GPU가 있으면 정확한 GPU top-k를 쓰며 후보 거리를 float64로 다시 계산한다. 둘 다 없으면 cKDTree로 돌아간다.
+- `build_nodes`와 `build_edges`: `graph_kind=node`에서 v0.1 군집 그래프와 비교에 사용한다.
+- `contract_segments(...) -> SegmentGraph`: bridge 출발/착지, mode 변화, goal, episode 경계와 길이 제한 사이의 temporal chain을 정확히 압축한다.
+- `edge_weights(edges, cfg, d_step, meta) -> weights`: state graph는 temporal 비용 `c·kappa`와 bridge-only prior/data-calibrated/sim-verified 비용을 계산한다. node graph는 legacy 정책을 쓴다.
 - `solve(nodes, edges, weights) -> (cost, succ)`: 중복 간선을 최소 비용으로 접고 역방향 다중 출발 Dijkstra로 goal까지 비용과 후계자를 구한다.
 - `build_artifact(trans, cfg, *, dataset_id, source, extra_meta=None) -> GraphArtifact`: 표준화 통계부터 노드, 간선, 비용, 해시, 메타데이터까지 구성하고 검증한다.
 - `rebuild_from_external(trans, nodes, edges, cfg, *, dataset_id, source, extra_meta=None) -> GraphArtifact`: 외부에서 만든 BOOST 스타일 그래프에 가중치와 최단 경로 비용을 붙인다.
 - `critic_targets(trans, artifact, cfg) -> TargetSet`: QC chunk 유효성에 맞는 시작 행별 target을 만들고 artifact의 해시와 dataset ID를 붙인다.
 - `sft_weights(trans, artifact, targets, beta, w_max) -> weights`: 같은 비용 단위에서 BOOST의 cost-domain advantage 가중치를 만든다.
-- `report(trans, artifact, targets=None) -> dict`: 그래프 연결성, 성공 비용 단조성, 순위 상관 및 target 통계를 JSON 호환 값으로 반환한다.
+- `report(trans, artifact, targets=None) -> dict`: 도달성, bridge 사용·switch 수, stitching gain, mode/segment 통계, target provenance를 JSON 호환 값으로 반환한다.
 
 `online.update(artifact, new_trans)`는 아직 구현되지 않았다. artifact에는 기존 전체 전이 집합이 저장되지 않으므로, 증분 갱신 계약을 정하기 전에는 정확한 전체 재계산을 할 수 없다.
 ### 4.3 구현하는 수식
 
-시간 비용 상수는 c = −log γ다. 간선 성공확률 하한 ℓ_e는 Beta 사후분포의 하위 분위수이고, edge별 수준은 δ_E = δ / |E|다(|E|는 그래프 전체 간선 수). 구현은 scipy.special.betaincinv.
+시간 비용 상수는 `c = −log γ`다. v0.2 state graph에서 확실한 temporal replay는 성공확률 불확실성이 없다고 보고 `c·kappa`만 낸다. prior bridge는 거리 기반 prior를 더한다. data-calibrated bridge는 행동 일치 데이터의 거리 bin에서 성공확률 하한을 공유한다.
 
 $$
-\ell_e = F^{-1}_{\mathrm{Beta}(\alpha_0 + n_e^{+},\ \beta_0 + n_e^{-})}(\delta_E), \qquad w_e = -\log \ell_e + c\,\kappa_e
+w_e=\begin{cases}
+c\,\kappa_e, & e\in E_T,\\
+c\,\kappa_e+c\left(\Lambda_0+\Lambda_1(d_e/r)^2\right), & e\in E_B\text{ (prior)},\\
+c\,\kappa_e-\log\ell_{b(e)}, & e\in E_B\text{ (data-calibrated)}.
+\end{cases}
+$$
+
+For bin `b`, `ell_b` is the Beta posterior lower quantile at `delta / n_bins`, using that distance bin's action-matched landing successes and failures. Bins with too few samples warn; bridges over `lambda_cap_steps` are dropped. The lower-confidence statement applies to a distance-bin average under the stated representativeness assumption, not to each bridge individually. The legacy node graph still supports the earlier per-edge LCB formula:
+
+$$
+\ell_e = F^{-1}_{\mathrm{Beta}(\alpha_0 + n_e^{+},\ \beta_0 + n_e^{-})}(\delta_E), \qquad w_e = -\log \ell_e + c\,\kappa_e.
 $$
 
 offline 데이터만 있는 경우(β₀ = 1, 실패 0회)는 닫힌 꼴이다. `mode="union"`은 분위수 `q=δ/|E|`, `mode="fixed"`는 분위수 `q=exp(-λ)`를 쓴다.
@@ -170,6 +183,8 @@ y_i\,[\mathrm{steps}] = \begin{cases} k_i+1, & k_i\text{ exists} \\ h + \min\big
 $$
 
 무효 행은 `valid=False`, `y=0`으로 저장한다. 손실에서 valid mask를 곱해도 NaN이 전파되지 않도록 무효 target에 NaN을 넣지 않는다. `unit="nats"`이면 step target에 `c`를 곱한다. `h=1`은 FQL용 target이다.
+
+`TargetSet.source`는 `0=chunk success`, `1=finite graph cost`, `2=capped/unreachable`, `3=invalid`로 각 target의 출처를 기록한다.
 
 BOOST 가중 SFT용 가중치는 비용 도메인 advantage의 지수다. 이는 (Q/V)^β와 같고, 거리에 대해 스케일 불변이다.
 
@@ -200,13 +215,13 @@ fork 규칙: 각 fork에 graph-critic 브랜치를 만들고, submodule은 특�
 
 ### 5.1 fork 통합 상태
 
-1. 데이터셋: QC runner는 `--graph_targets`에서 schema v0.2 targets.npz/JSON 쌍을 읽고 샘플러 행에 붙인다. `h`, 단위, dataset ID, 행 수, QC chunk 유효성 배열이 모두 일치해야 한다.
+1. 데이터셋: QC runner는 `--graph_targets`에서 schema v0.3 targets.npz/JSON 쌍을 읽고 샘플러 행에 붙인다. `h`, 단위, dataset ID, 행 수, QC chunk 유효성 배열이 모두 일치해야 한다.
 2. 설정: `agent.critic_mode ∈ {td, graph}`와 `agent.graph_target_unit=steps`를 추가했다.
 3. critic 손실: graph 모드는 softplus 비용 예측과 정답 비용의 제곱 오차를 사용하고 TD target network를 사용하지 않는다. Actor의 비용 집계는 ensemble max다.
 4. actor: graph 모드의 Q는 `-max(C_θ)`이며, best-of-N은 최소 비용 action chunk를 선택한다. TD 모드는 QC 원본 집계를 유지한다.
 5. online (main_online.py): graph 모드는 아직 지원하지 않으며 `--online_steps=0`이 필요하다.
 
-graph target runner는 schema v0.2 target 쌍을 읽어 dataset ID, horizon, 행 수, validity를 검증하고 row-aligned 배열을 학습 데이터에 붙인다. graph critic은 현재 `softplus` 비용 예측을 steps target에 회귀한다. 이 경로는 동작 코드가 있으나, T7 명세의 `td_equivalent`/`neg_steps` Q 변환, `normalize_q_loss` 옵션과 관련 진단 로그는 아직 반영되지 않았다. 그래프와 target을 만드는 `experiments/build_graph.py` 및 core pipeline은 구현되어 있다.
+graph target runner는 schema v0.3 target 쌍을 읽어 dataset ID, horizon, 행 수, validity를 검증하고 row-aligned 배열을 학습 데이터에 붙인다. graph critic은 현재 `softplus` 비용 예측을 steps target에 회귀한다. 그래프와 target을 만드는 `experiments/build_graph.py` 및 core pipeline은 구현되어 있다.
 
 ### 5.2 재현 gate
 

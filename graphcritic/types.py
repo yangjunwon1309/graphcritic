@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from graphcritic.config import GraphConfig
 
 
-SCHEMA_VERSION = "0.2"
+SCHEMA_VERSION = "0.3"
 
 
 class SchemaError(ValueError):
@@ -108,6 +108,9 @@ class TransitionSet:
     terminal: NDArray[np.bool_]
     row_idx: NDArray[np.int64]
     success_cur: NDArray[np.bool_] | None = None
+    mode: NDArray[np.int64] | None = None
+    mode_next: NDArray[np.int64] | None = None
+    action: NDArray[np.float32] | None = None
 
     def __post_init__(self) -> None:
         self.feat = _array(self.feat, np.float32, "feat")
@@ -117,6 +120,19 @@ class TransitionSet:
         self.success = _array(self.success, np.bool_, "success")
         self.terminal = _array(self.terminal, np.bool_, "terminal")
         self.row_idx = _array(self.row_idx, np.int64, "row_idx")
+        self.mode = (
+            np.zeros(self.episode_id.shape, dtype=np.int64)
+            if self.mode is None else _array(self.mode, np.int64, "mode")
+        )
+        if self.mode_next is None:
+            self.mode_next = self.mode.copy()
+            if self.mode.size > 1:
+                nonterminal = ~self.terminal
+                self.mode_next[nonterminal] = self.mode[np.flatnonzero(nonterminal) + 1]
+        else:
+            self.mode_next = _array(self.mode_next, np.int64, "mode_next")
+        if self.action is not None:
+            self.action = _array(self.action, np.float32, "action")
         if self.success_cur is None:
             self.success_cur = np.zeros(self.success.shape, dtype=np.bool_)
             if self.success.size > 1:
@@ -141,11 +157,16 @@ class TransitionSet:
         if self.feat.shape[1] == 0 or self.next_feat.shape != self.feat.shape:
             raise SchemaError("feat and next_feat must have the same non-empty feature dimension")
         n_rows = self.feat.shape[0]
-        for name in ("episode_id", "t", "success", "success_cur", "terminal", "row_idx"):
+        for name in ("episode_id", "t", "success", "success_cur", "terminal", "row_idx", "mode", "mode_next"):
             if getattr(self, name).shape != (n_rows,):
                 raise SchemaError(f"{name} must have shape ({n_rows},)")
         if not np.all(np.isfinite(self.feat)) or not np.all(np.isfinite(self.next_feat)):
             raise SchemaError("feat and next_feat must contain only finite values")
+        if self.action is not None and (
+            self.action.ndim != 2 or self.action.shape[0] != n_rows or self.action.shape[1] == 0
+            or not np.all(np.isfinite(self.action))
+        ):
+            raise SchemaError("action must be a finite float32 array with shape (N, action_dim)")
         if np.any(self.t < 0) or np.any(self.row_idx < 0):
             raise SchemaError("t and row_idx must be non-negative")
         if np.unique(self.row_idx).size != n_rows:
@@ -171,6 +192,10 @@ class TransitionSet:
                 "success for s_{t+1} must equal the following row's success_cur on nonterminal rows"
             )
         if nonterminal_rows.size and np.any(
+            self.mode_next[nonterminal_rows] != self.mode[nonterminal_rows + 1]
+        ):
+            raise SchemaError("mode_next[i] must equal mode[i + 1] on nonterminal rows")
+        if nonterminal_rows.size and np.any(
             np.any(self.next_feat[nonterminal_rows] != self.feat[nonterminal_rows + 1], axis=1)
         ):
             warnings.warn(
@@ -178,6 +203,42 @@ class TransitionSet:
                 UserWarning,
                 stacklevel=2,
             )
+
+
+@dataclass
+class SimStateSet:
+    """Simulator sidecar aligned with ``state_table`` state-occurrence order."""
+
+    qpos: NDArray[np.float32]
+    qvel: NDArray[np.float32]
+    button_states: NDArray[np.int64] | None = None
+
+    def __post_init__(self) -> None:
+        self.qpos = _array(self.qpos, np.float32, "sim_state.qpos")
+        self.qvel = _array(self.qvel, np.float32, "sim_state.qvel")
+        if self.button_states is not None:
+            self.button_states = _array(self.button_states, np.int64, "sim_state.button_states")
+        self.validate()
+
+    @property
+    def n_states(self) -> int:
+        return int(self.qpos.shape[0])
+
+    def validate(self, n_states: int | None = None) -> None:
+        if self.qpos.ndim != 2 or self.qvel.ndim != 2 or self.qpos.shape[0] != self.qvel.shape[0]:
+            raise SchemaError("sim_state qpos and qvel must be aligned 2D arrays")
+        if self.qpos.shape[1] == 0 or self.qvel.shape[1] == 0:
+            raise SchemaError("sim_state qpos and qvel dimensions must be non-empty")
+        if self.button_states is not None and (
+            self.button_states.ndim != 2 or self.button_states.shape[0] != self.qpos.shape[0]
+        ):
+            raise SchemaError("sim_state.button_states must have one aligned row per state")
+        for name in ("qpos", "qvel", "button_states"):
+            values = getattr(self, name)
+            if values is not None and not np.all(np.isfinite(values)):
+                raise SchemaError(f"sim_state.{name} must contain only finite values")
+        if n_states is not None and self.n_states != n_states:
+            raise SchemaError(f"sim_state must contain exactly {n_states} state rows")
 
 
 @dataclass
@@ -263,6 +324,8 @@ class EdgeSet:
     n_pos: NDArray[np.int64]
     n_neg: NDArray[np.int64]
     kind: NDArray[np.int8]
+    dist: NDArray[np.float32] | None = None
+    anchor: NDArray[np.int64] | None = None
 
     def __post_init__(self) -> None:
         self.src = _array(self.src, np.int64, "src")
@@ -271,6 +334,14 @@ class EdgeSet:
         self.n_pos = _array(self.n_pos, np.int64, "n_pos")
         self.n_neg = _array(self.n_neg, np.int64, "n_neg")
         self.kind = _array(self.kind, np.int8, "kind")
+        self.dist = (
+            np.zeros(self.src.shape, dtype=np.float32)
+            if self.dist is None else _array(self.dist, np.float32, "dist")
+        )
+        self.anchor = (
+            np.full(self.src.shape, -1, dtype=np.int64)
+            if self.anchor is None else _array(self.anchor, np.int64, "anchor")
+        )
         self.validate()
 
     @property
@@ -279,7 +350,7 @@ class EdgeSet:
 
     def validate(self, n_nodes: int | None = None) -> None:
         n_edges = self.src.size
-        for name in ("dst", "kappa", "n_pos", "n_neg", "kind"):
+        for name in ("dst", "kappa", "n_pos", "n_neg", "kind", "dist", "anchor"):
             if getattr(self, name).shape != (n_edges,):
                 raise SchemaError(f"{name} must have shape ({n_edges},)")
         if np.any(self.src == self.dst):
@@ -290,11 +361,20 @@ class EdgeSet:
             raise SchemaError("edge occurrence counts must be non-negative")
         if np.any(~np.isin(self.kind, (0, 1))):
             raise SchemaError("kind must be 0 (data) or 1 (bridge)")
+        if not np.all(np.isfinite(self.dist)) or np.any(self.dist < 0):
+            raise SchemaError("dist must contain finite non-negative distances")
+        temporal = self.kind == 0
+        bridge = self.kind == 1
+        if np.any(self.dist[temporal] != 0) or np.any(self.anchor[temporal] != -1):
+            raise SchemaError("temporal edges must have dist=0 and anchor=-1")
+        if np.any(self.anchor[bridge] < 0):
+            raise SchemaError("bridge edges must have a non-negative anchor state")
         if n_nodes is not None and (
             np.any(self.src < 0)
             or np.any(self.dst < 0)
             or np.any(self.src >= n_nodes)
             or np.any(self.dst >= n_nodes)
+            or np.any(self.anchor[bridge] >= n_nodes)
         ):
             raise SchemaError("edge endpoint is outside the node table")
         if n_edges > 1:
@@ -351,14 +431,23 @@ class GraphArtifact:
         self.content_hash = calculated_hash
 
     def _arrays_for_hash(self) -> dict[str, NDArray[Any]]:
+        feature_meta = self.meta.get("feature")
+        checkpoint_hash = (
+            feature_meta.get("checkpoint_sha256") or ""
+            if isinstance(feature_meta, Mapping) else ""
+        )
         arrays: dict[str, NDArray[Any]] = {
             "assign_cur": self.nodes.assign_cur,
             "assign_next": self.nodes.assign_next,
             "cost": self.cost,
             "dst": self.edges.dst,
+            "dist": self.edges.dist,
+            "anchor": self.edges.anchor,
             "is_goal": self.nodes.is_goal,
             "kappa": self.edges.kappa,
             "kind": self.edges.kind,
+            "dataset_id": np.asarray(self.meta.get("dataset_id", "")),
+            "feature_checkpoint_sha256": np.asarray(checkpoint_hash),
             "n_neg": self.edges.n_neg,
             "n_pos": self.edges.n_pos,
             "rep_feat": self.nodes.rep_feat,
@@ -388,6 +477,55 @@ class GraphArtifact:
         self.config.validate()
         self.nodes.validate(trans)
         self.edges.validate(self.nodes.n_nodes)
+        if self.config.graph_kind == "state":
+            if "n_states" not in self.meta:
+                raise SchemaError("state graph metadata must include n_states")
+            if self.nodes.n_nodes != self.meta["n_states"]:
+                raise SchemaError("state graph n_states metadata does not match its node table")
+            n_rows = int(self.meta["n_rows"])
+            if self.nodes.n_nodes < n_rows or not np.array_equal(
+                self.nodes.assign_cur, np.arange(n_rows, dtype=np.int64)
+            ):
+                raise SchemaError("state graph nodes must use identity current-state assignments")
+            if not np.array_equal(
+                self.nodes.rep_ref[:n_rows],
+                np.column_stack((np.arange(n_rows, dtype=np.int64), np.zeros(n_rows, dtype=np.int64))),
+            ):
+                raise SchemaError("state graph current state references must follow transition-row order")
+            temporal_edges = self.edges.kind == 0
+            if np.count_nonzero(temporal_edges) != n_rows:
+                raise SchemaError("state graph must contain one temporal edge per transition row")
+            if self.edges.n_edges and np.any(
+                self.edges.kappa[temporal_edges] != 1
+            ):
+                raise SchemaError("state graph temporal edges must have kappa=1")
+            if np.any(self.edges.n_pos[temporal_edges] != 1) or np.any(self.edges.n_neg[temporal_edges] != 0):
+                raise SchemaError("state graph temporal edges must record one certain observation")
+            if self.edges.n_edges and np.any(
+                self.edges.kappa[self.edges.kind == 1] != self.config.bridge.landing_steps
+            ):
+                raise SchemaError("state graph bridge kappa must equal bridge.landing_steps")
+            if trans is not None:
+                from graphcritic.featurize import state_table
+
+                states, refs, goals, _ = state_table(trans)
+                if not np.array_equal(self.nodes.rep_feat, states):
+                    raise SchemaError("state graph vertices must retain every raw state occurrence")
+                if not np.array_equal(self.nodes.rep_ref, refs):
+                    raise SchemaError("state graph references do not match state_table ordering")
+                if not np.array_equal(self.nodes.is_goal, goals):
+                    raise SchemaError("state graph goal nodes disagree with state_table labels")
+                expected_next = np.empty(n_rows, dtype=np.int64)
+                nonterminal_rows = np.flatnonzero(~trans.terminal)
+                terminal_rows = np.flatnonzero(trans.terminal)
+                expected_next[nonterminal_rows] = nonterminal_rows + 1
+                expected_next[terminal_rows] = n_rows + np.arange(terminal_rows.size, dtype=np.int64)
+                if not np.array_equal(self.nodes.assign_next, expected_next):
+                    raise SchemaError("state graph next-state assignments must preserve occurrence order")
+                temporal_pairs = np.column_stack((self.edges.src[temporal_edges], self.edges.dst[temporal_edges]))
+                expected_pairs = np.column_stack((self.nodes.assign_cur, self.nodes.assign_next))
+                if not np.array_equal(temporal_pairs, expected_pairs):
+                    raise SchemaError("state graph temporal edges must match all recorded transitions in row order")
         n_nodes = self.nodes.n_nodes
         if self.weights.shape != (self.edges.n_edges,):
             raise SchemaError("weights must have one value per edge")
@@ -476,22 +614,31 @@ class TargetSet:
     unit: str
     graph_hash: str
     dataset_id: str
+    source: NDArray[np.uint8] | None = None
 
     def __post_init__(self) -> None:
         self.y = _array(self.y, np.float32, "y")
         self.valid = _array(self.valid, np.bool_, "valid")
+        if self.source is None:
+            self.source = np.where(self.valid, 1, 3).astype(np.uint8)
+        else:
+            self.source = _array(self.source, np.uint8, "source")
         if isinstance(self.h, bool) or not isinstance(self.h, Integral):
             raise SchemaError("h must be an integer")
         self.h = int(self.h)
         self.validate()
 
     def validate(self, trans: TransitionSet | None = None) -> None:
-        if self.y.ndim != 1 or self.valid.shape != self.y.shape:
-            raise SchemaError("y and valid must be equally sized one-dimensional arrays")
+        if self.y.ndim != 1 or self.valid.shape != self.y.shape or self.source.shape != self.y.shape:
+            raise SchemaError("y, valid, and source must be equally sized one-dimensional arrays")
         if not np.all(np.isfinite(self.y)) or np.any(self.y < 0):
             raise SchemaError("targets must be finite and non-negative")
         if np.any(self.y[~self.valid] != 0):
             raise SchemaError("invalid targets must be filled with zero")
+        if np.any(~np.isin(self.source, (0, 1, 2, 3))):
+            raise SchemaError("source codes must be 0 (chunk success), 1 (graph), 2 (cap), or 3 (invalid)")
+        if np.any(self.source[~self.valid] != 3) or np.any(self.source[self.valid] == 3):
+            raise SchemaError("source code 3 must correspond exactly to invalid targets")
         if self.h < 1:
             raise SchemaError("h must be at least one")
         if self.unit not in {"steps", "nats"}:

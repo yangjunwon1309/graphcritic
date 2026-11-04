@@ -15,6 +15,7 @@ from scipy.spatial import cKDTree
 from graphcritic.config import GraphConfig
 from graphcritic.featurize import state_table
 from graphcritic.modes import resolve_state_modes, state_episode_time
+from graphcritic.passive_bridges import build_passive_bridges
 from graphcritic.segments import contract_segments
 from graphcritic.tau_model import FrameGapModel
 from graphcritic.types import EdgeSet, NodeSet, SchemaError, SimStateSet, TransitionSet
@@ -659,21 +660,39 @@ def build_state_graph(
     nodes = _state_nodes(trans, states, success)
 
     cost_meta: dict[str, Any] = {"bridge_cost_policy": cfg.bridge.cost.policy}
-    if cfg.bridge.cost.policy == "time":
+    bridge_type_b = np.full(0, -1, dtype=np.int8)
+    manual_bridges = cfg.bridge.strategy in {"passive_r", "passive_rm"}
+    if manual_bridges:
+        (
+            src_b, dst_b, dist_b, anchor_b, kappa_b, bridge_type_b, modes, bridge_meta
+        ) = build_passive_bridges(
+            trans, states, success, cfg, sim_state,
+            use_manipulation=cfg.bridge.strategy == "passive_rm",
+        )
+        n_pos_b = np.zeros(src_b.size, dtype=np.int64)
+        n_neg_b = np.zeros(src_b.size, dtype=np.int64)
+        cost_meta["bridge_cost_policy"] = (
+            "kinematic_plus_learned" if cfg.bridge.strategy == "passive_rm" else "kinematic"
+        )
+    elif cfg.bridge.cost.policy == "time":
         src_b, dst_b, dist_b, anchor_b, kappa_b, bridge_meta = _bridge_time_candidates(
             trans, states, z, modes, success, cfg, d_step, dataset_id
         )
+        bridge_type_b = np.full(src_b.size, -1, dtype=np.int8)
         n_pos_b = np.zeros(src_b.size, dtype=np.int64)
         n_neg_b = np.zeros(src_b.size, dtype=np.int64)
     else:
         src_b, dst_b, dist_b, anchor_b, bridge_meta = _bridge_candidates(
             trans, z, modes, success, cfg, d_step
         )
+        bridge_type_b = np.full(src_b.size, -1, dtype=np.int8)
         kappa_b = np.full(src_b.size, cfg.bridge.landing_steps, dtype=np.int64)
         anchor_ids, landing_ids = _landing_states(trans, modes, success, cfg.bridge.landing_steps)
         source_landing = np.full(states.shape[0], -1, dtype=np.int64)
         source_landing[anchor_ids] = landing_ids
-    if cfg.bridge.cost.policy == "time":
+    if manual_bridges:
+        cost_meta["bridge_pruned_over_lambda_cap"] = 0
+    elif cfg.bridge.cost.policy == "time":
         cost_meta["bridge_pruned_over_lambda_cap"] = 0
     elif cfg.bridge.cost.policy == "data_calibrated":
         n_pos_b, n_neg_b, calibration_meta = _calibration_counts(
@@ -731,6 +750,7 @@ def build_state_graph(
         kind=np.concatenate((np.zeros(trans.n_rows, dtype=np.int8), np.ones(src_b.size, dtype=np.int8))),
         dist=np.concatenate((np.zeros(trans.n_rows, dtype=np.float32), dist_b)),
         anchor=np.concatenate((np.full(trans.n_rows, -1, dtype=np.int64), anchor_b)),
+        bridge_type=np.concatenate((np.full(trans.n_rows, -1, dtype=np.int8), bridge_type_b)),
     )
     edges.validate(nodes.n_nodes)
     segments = contract_segments(

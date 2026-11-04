@@ -128,6 +128,7 @@ def report(
         stitch_diffs.extend((remaining[finite] - graph_steps[finite]).tolist())
     stitch_values = np.asarray(stitch_diffs, dtype=np.float64)
     bridge_mask = artifact.edges.kind == 1
+    bridge_type = np.asarray(artifact.edges.bridge_type, dtype=np.int8)
     d_step = float(artifact.meta.get("d_step", 1.0))
     bridge_dist = artifact.edges.dist[bridge_mask].astype(np.float64) / max(d_step, 1e-12)
     bridge_bins = [dict(item) for item in artifact.meta.get("bridge_bin_evidence", [])]
@@ -153,6 +154,11 @@ def report(
         "n_edges": int(n_edges),
         "n_temporal_edges": int(np.count_nonzero(artifact.edges.kind == 0)),
         "n_bridge_edges": int(np.count_nonzero(bridge_mask)),
+        "bridge_counts": {
+            "R": int(np.count_nonzero(bridge_mask & (bridge_type == 0))),
+            "M": int(np.count_nonzero(bridge_mask & (bridge_type == 1))),
+            "legacy_unclassified": int(np.count_nonzero(bridge_mask & (bridge_type == -1))),
+        },
         "merge_ratio": float(n_states / max(1, n_nodes)),
         "n_goal_nodes": int(np.count_nonzero(artifact.nodes.is_goal)),
         "n_success_episodes": int(len(successful_episodes)),
@@ -197,6 +203,18 @@ def report(
             "knn_backend": artifact.meta.get("knn_backend", []),
             "distance_bin_edges": artifact.meta.get("bridge_bin_edges", []),
             "distance_bins": bridge_bins,
+            "passive_diff_epsilon_units": artifact.meta.get("bridge_passive_diff_epsilon_units"),
+            "nn_passive_cross": artifact.meta.get("nn_passive_cross"),
+            "kinematic_violation": artifact.meta.get("bridge_tau_kinematic_violation"),
+            "passive_violation": artifact.meta.get("bridge_tau_passive_violation"),
+            "tau_by_type": {
+                label: {
+                    "n": int(np.count_nonzero(bridge_mask & (bridge_type == code))),
+                    "p50": q(artifact.edges.kappa[bridge_mask & (bridge_type == code)], 50),
+                    "p95": q(artifact.edges.kappa[bridge_mask & (bridge_type == code)], 95),
+                }
+                for label, code in (("R", 0), ("M", 1))
+            },
         },
         "modes": {
             "count": artifact.meta.get("n_mode_values", 1),

@@ -154,6 +154,11 @@ class BridgeConfig:
     source_stride: int = 1
     same_mode: bool = True
     knn_backend: Literal["auto", "ckdtree", "faiss", "jax_gpu"] = "auto"
+    strategy: Literal["feature", "passive_r", "passive_rm"] = "feature"
+    state_schema: str | None = None
+    passive_jitter_multiplier: float = 1.0
+    passive_max_multiplier: float = 10.0
+    kinematic_settle: int = 2
     cost: BridgeCostConfig = field(default_factory=BridgeCostConfig)
 
     def __post_init__(self) -> None:
@@ -167,6 +172,17 @@ class BridgeConfig:
             raise SchemaError("bridge.radius_unit must be 'abs' or 'step'")
         if self.knn_backend not in {"auto", "ckdtree", "faiss", "jax_gpu"}:
             raise SchemaError("bridge.knn_backend must be auto, ckdtree, faiss, or jax_gpu")
+        if self.strategy not in {"feature", "passive_r", "passive_rm"}:
+            raise SchemaError("bridge.strategy must be feature, passive_r, or passive_rm")
+        if self.strategy in {"passive_r", "passive_rm"} and self.cost.policy != "time":
+            raise SchemaError("passive R/M bridge strategies require bridge.cost.policy='time'")
+        if self.state_schema is not None and (not isinstance(self.state_schema, str) or not self.state_schema):
+            raise SchemaError("bridge.state_schema must be a non-empty name when provided")
+        for name in ("passive_jitter_multiplier", "passive_max_multiplier"):
+            value = getattr(self, name)
+            if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise SchemaError(f"bridge.{name} must be finite and positive")
+        _positive_int("bridge.kinematic_settle", self.kinematic_settle, allow_zero=True)
         if not isinstance(self.same_mode, bool):
             raise SchemaError("bridge.same_mode must be boolean")
         if not isinstance(self.cost, BridgeCostConfig):

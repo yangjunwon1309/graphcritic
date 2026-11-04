@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 
 SCHEMA_VERSION = "0.3"
+GRAPH_SCHEMA_VERSION = "0.4"
 
 
 class SchemaError(ValueError):
@@ -326,6 +327,9 @@ class EdgeSet:
     kind: NDArray[np.int8]
     dist: NDArray[np.float32] | None = None
     anchor: NDArray[np.int64] | None = None
+    # -1 means legacy/unclassified; 0 is a reposition (R) bridge; 1 is a
+    # manipulation (M) bridge. Temporal edges must always use -1.
+    bridge_type: NDArray[np.int8] | None = None
 
     def __post_init__(self) -> None:
         self.src = _array(self.src, np.int64, "src")
@@ -342,6 +346,10 @@ class EdgeSet:
             np.full(self.src.shape, -1, dtype=np.int64)
             if self.anchor is None else _array(self.anchor, np.int64, "anchor")
         )
+        self.bridge_type = (
+            np.full(self.src.shape, -1, dtype=np.int8)
+            if self.bridge_type is None else _array(self.bridge_type, np.int8, "bridge_type")
+        )
         self.validate()
 
     @property
@@ -350,7 +358,7 @@ class EdgeSet:
 
     def validate(self, n_nodes: int | None = None) -> None:
         n_edges = self.src.size
-        for name in ("dst", "kappa", "n_pos", "n_neg", "kind", "dist", "anchor"):
+        for name in ("dst", "kappa", "n_pos", "n_neg", "kind", "dist", "anchor", "bridge_type"):
             if getattr(self, name).shape != (n_edges,):
                 raise SchemaError(f"{name} must have shape ({n_edges},)")
         if np.any(self.src == self.dst):
@@ -365,6 +373,10 @@ class EdgeSet:
             raise SchemaError("dist must contain finite non-negative distances")
         temporal = self.kind == 0
         bridge = self.kind == 1
+        if np.any(self.bridge_type[temporal] != -1):
+            raise SchemaError("temporal edges must have bridge_type=-1")
+        if np.any(~np.isin(self.bridge_type[bridge], (-1, 0, 1))):
+            raise SchemaError("bridge_type must be -1 (legacy), 0 (R), or 1 (M)")
         if np.any(self.dist[temporal] != 0) or np.any(self.anchor[temporal] != -1):
             raise SchemaError("temporal edges must have dist=0 and anchor=-1")
         if np.any(self.anchor[bridge] < 0):
@@ -400,7 +412,7 @@ class GraphArtifact:
     cost: NDArray[np.float64]
     succ: NDArray[np.int64]
     meta: dict[str, Any]
-    schema_version: str = SCHEMA_VERSION
+    schema_version: str = GRAPH_SCHEMA_VERSION
     content_hash: str = ""
 
     def __post_init__(self) -> None:
@@ -456,6 +468,8 @@ class GraphArtifact:
             "succ": self.succ,
             "weights": self.weights,
         }
+        if self.schema_version == GRAPH_SCHEMA_VERSION:
+            arrays["bridge_type"] = self.edges.bridge_type
         tau_hash = self.meta.get("tau_model_sha256")
         if tau_hash is not None:
             arrays["tau_model_sha256"] = np.asarray(str(tau_hash))
@@ -463,7 +477,19 @@ class GraphArtifact:
         return arrays
 
     def compute_hash(self) -> str:
-        return _content_hash(self.schema_version, self.config, self._arrays_for_hash())
+        return _content_hash(self.schema_version, self.hash_config(), self._arrays_for_hash())
+
+    def hash_config(self) -> dict[str, Any]:
+        """Return the canonical config payload for this graph artifact version."""
+        config = self.config.to_dict()
+        if self.schema_version == SCHEMA_VERSION:
+            # v0.3 graph files predate physical-coordinate bridge settings.
+            for key in (
+                "strategy", "state_schema", "passive_jitter_multiplier",
+                "passive_max_multiplier", "kinematic_settle",
+            ):
+                config["bridge"].pop(key, None)
+        return config
 
     def validate(
         self,
@@ -473,7 +499,7 @@ class GraphArtifact:
     ) -> None:
         from graphcritic.config import GraphConfig as GraphConfigType
 
-        if self.schema_version != SCHEMA_VERSION:
+        if self.schema_version not in {SCHEMA_VERSION, GRAPH_SCHEMA_VERSION}:
             raise SchemaError(f"unsupported graph schema_version {self.schema_version!r}")
         if not isinstance(self.config, GraphConfigType):
             raise SchemaError("config must be a GraphConfig")

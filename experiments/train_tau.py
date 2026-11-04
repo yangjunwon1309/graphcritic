@@ -199,9 +199,10 @@ def _r_h(phi: np.ndarray, starts: np.ndarray, horizon: int, seed: int) -> float:
     return float(np.quantile(np.linalg.norm(phi[chosen] - phi[chosen + horizon], axis=1), 0.99))
 
 
-def _init_params(input_dim: int, horizon: int, seed: int) -> dict[str, np.ndarray]:
+def _init_params(input_dim: int, horizon: int, seed: int, pair_delta_indices: np.ndarray | None = None) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(seed)
-    dims = [3 * input_dim, 512, 512, 512, horizon + 1]
+    pair_dim = 2 * input_dim + (input_dim if pair_delta_indices is None else len(pair_delta_indices))
+    dims = [pair_dim, 512, 512, 512, horizon + 1]
     params: dict[str, np.ndarray] = {}
     for layer in range(4):
         fan_in, fan_out = dims[layer], dims[layer + 1]
@@ -214,10 +215,49 @@ def _init_params(input_dim: int, horizon: int, seed: int) -> dict[str, np.ndarra
     return params
 
 
-def _prepare_pairs(u: np.ndarray, v: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+def _prepare_pairs(
+    u: np.ndarray,
+    v: np.ndarray,
+    mean: np.ndarray,
+    std: np.ndarray,
+    pair_delta_indices: np.ndarray | None = None,
+) -> np.ndarray:
     zu = (u.astype(np.float32) - mean) / std
     zv = (v.astype(np.float32) - mean) / std
-    return np.concatenate((zu, zv, zv - zu), axis=1).astype(np.float32, copy=False)
+    indices = np.arange(zu.shape[1], dtype=np.int64) if pair_delta_indices is None else np.asarray(pair_delta_indices, dtype=np.int64)
+    return np.concatenate((zu, zv, (zv - zu)[:, indices]), axis=1).astype(np.float32, copy=False)
+
+
+def _episode_bootstrap_interval(
+    covered: np.ndarray,
+    episode_ids: np.ndarray,
+    *,
+    seed: int,
+    replicates: int = 1000,
+) -> dict[str, float | int | None]:
+    """Cluster bootstrap by source episode to preserve within-episode dependence."""
+    values = np.asarray(covered, dtype=np.float64)
+    groups = np.asarray(episode_ids, dtype=np.int64)
+    if values.ndim != 1 or groups.shape != values.shape or values.size == 0:
+        return {"n_pairs": int(values.size), "n_episodes": int(np.unique(groups).size), "low": None, "high": None, "width": None}
+    unique = np.unique(groups)
+    by_episode = [values[groups == episode] for episode in unique]
+    rng = np.random.default_rng(seed)
+    estimates = np.empty(replicates, dtype=np.float64)
+    for b in range(replicates):
+        sample = rng.integers(0, len(unique), size=len(unique))
+        numerator = sum(float(np.sum(by_episode[i])) for i in sample)
+        denominator = sum(int(by_episode[i].size) for i in sample)
+        estimates[b] = numerator / max(denominator, 1)
+    low, high = np.percentile(estimates, [2.5, 97.5])
+    return {
+        "n_pairs": int(values.size),
+        "n_episodes": int(unique.size),
+        "low": float(low),
+        "high": float(high),
+        "width": float(high - low),
+        "replicates": int(replicates),
+    }
 
 
 def _calibrate_quantile(probabilities: np.ndarray, labels: np.ndarray, nominal: float) -> tuple[float, float, float]:
@@ -274,6 +314,7 @@ def _jax_train(
     eval_pairs: tuple[np.ndarray, np.ndarray, np.ndarray],
     eval_every: int,
     patience: int,
+    pair_delta_indices: np.ndarray | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     try:
         import jax
@@ -281,7 +322,7 @@ def _jax_train(
         import optax
     except ImportError as exc:  # pragma: no cover - bench-only workflow
         raise RuntimeError("train_tau requires JAX and Optax in the bench environment") from exc
-    params_np = _init_params(raw_states.shape[1], horizon, seed)
+    params_np = _init_params(raw_states.shape[1], horizon, seed, pair_delta_indices)
     params = jax.tree_util.tree_map(jnp.asarray, params_np)
     optimizer = optax.adam(3e-4)
     opt_state = optimizer.init(params)
@@ -305,7 +346,7 @@ def _jax_train(
         return optax.apply_updates(p, updates), state, loss
 
     eval_u, eval_v, eval_y = eval_pairs
-    eval_x = jnp.asarray(_prepare_pairs(raw_states[eval_u], raw_states[eval_v], mean, std))
+    eval_x = jnp.asarray(_prepare_pairs(raw_states[eval_u], raw_states[eval_v], mean, std, pair_delta_indices))
     eval_y_jax = jnp.asarray(eval_y, dtype=jnp.int32)
     best_params = params
     best_loss = float("inf")
@@ -315,7 +356,7 @@ def _jax_train(
     device = str(jax.default_backend())
     for step in range(1, steps + 1):
         u, v, labels = sampler.sample("train", batch_size)
-        x = jnp.asarray(_prepare_pairs(raw_states[u], raw_states[v], mean, std))
+        x = jnp.asarray(_prepare_pairs(raw_states[u], raw_states[v], mean, std, pair_delta_indices))
         params, opt_state, loss = train_step(
             params, opt_state, x, jnp.asarray(labels, dtype=jnp.int32)
         )
@@ -376,6 +417,8 @@ def main() -> int:
     parser.add_argument("--calibration-pairs", type=int, default=20_000)
     parser.add_argument("--test-pairs", type=int, default=20_000)
     parser.add_argument("--far-exclusion-radius", choices=("r", "r_H"), default="r")
+    parser.add_argument("--state-schema", choices=("none", "ogbench_scene", "robomimic"), default="none",
+                        help="Train on the physical [r,o,e] StateSchema representation")
     parser.add_argument("--quantiles", type=float, nargs="+", default=(0.8, 0.9))
     args = parser.parse_args()
     if min(args.horizon, args.steps, args.batch_size, args.eval_every,
@@ -407,6 +450,24 @@ def main() -> int:
         (trans.feat, trans.next_feat[np.flatnonzero(trans.terminal)]), axis=0
     )
     all_state_features = featurizer.transform(state_values, aux=feature_aux)
+    state_schema_name = args.state_schema
+    if state_schema_name == "none" and cfg.bridge.strategy == "passive_rm":
+        state_schema_name = cfg.bridge.state_schema or {
+            "ogbench_scene_pos": "ogbench_scene", "robomimic_pos": "robomimic"
+        }.get(cfg.feature.name, "none")
+    pair_delta_indices = None
+    model_states = state_values
+    if state_schema_name != "none":
+        from graphcritic.state_schema import get_state_schema
+
+        if state_schema_name == "ogbench_scene" and sim_state is None:
+            raise SchemaError("ogbench_scene StateSchema training requires qpos/button sidecar data")
+        schema = get_state_schema(state_schema_name)
+        if sim_state is not None:
+            sim_state.validate(state_values.shape[0])
+        coords = schema.coordinates(state_values, feature_aux)
+        model_states = np.concatenate((coords.r, coords.o, coords.e), axis=1).astype(np.float32)
+        pair_delta_indices = np.arange(coords.r.shape[1], model_states.shape[1], dtype=np.int64)
     modes = resolve_state_modes(trans, cfg.mode_fn, sim_state=sim_state, min_dwell=cfg.min_dwell)
     mode_move = modes[: trans.n_rows - 1] == modes[1 : trans.n_rows]
     allowed_starts = np.flatnonzero(
@@ -434,21 +495,28 @@ def main() -> int:
     far_threshold = radius if args.far_exclusion_radius == "r" else r_h
     sampler.distance_threshold = far_threshold
     train_rows = sampler.split_rows["train"]
-    train_obs = states[train_rows]
+    train_obs = model_states[train_rows]
     obs_mean = np.mean(train_obs.astype(np.float64), axis=0).astype(np.float32)
     obs_std = np.maximum(np.std(train_obs.astype(np.float64), axis=0), 1e-6).astype(np.float32)
 
     eval_u, eval_v, eval_y = sampler.sample("calibration", args.calibration_pairs)
     params, train_meta = _jax_train(
-        sampler, states, obs_mean, obs_std, horizon=args.horizon, steps=args.steps,
+        sampler, model_states, obs_mean, obs_std, horizon=args.horizon, steps=args.steps,
         batch_size=args.batch_size, seed=args.seed, eval_pairs=(eval_u, eval_v, eval_y),
         eval_every=args.eval_every, patience=args.patience,
+        pair_delta_indices=pair_delta_indices,
     )
     model_meta: dict[str, Any] = {
         "model": "frame_gap_mlp_v1",
         "horizon": int(args.horizon),
-        "input": "standardized_xu_xv_xv_minus_xu",
-        "observation_dim": int(states.shape[1]),
+        "input": "standardized_r_o_e_u_v_delta_o_e" if pair_delta_indices is not None else "standardized_xu_xv_xv_minus_xu",
+        "observation_dim": int(model_states.shape[1]),
+        "state_schema": state_schema_name if state_schema_name != "none" else None,
+        "pair_delta_indices": None if pair_delta_indices is None else pair_delta_indices.tolist(),
+        "pair_input_layout": (
+            "[r_u,o_u,e_u,r_v,o_v,e_v,delta_o,delta_e]"
+            if pair_delta_indices is not None else "[x_u,x_v,delta_x]"
+        ),
         "dataset_id": dataset_id,
         "split_seed": int(args.seed),
         "episode_split_counts": {
@@ -469,7 +537,7 @@ def main() -> int:
     }
     model = FrameGapModel(params, obs_mean, obs_std, args.horizon, model_meta)
     cal_u, cal_v, cal_y = sampler.sample_near("calibration", args.calibration_pairs)
-    cal_prob = _predict(model, cal_u, cal_v, states)
+    cal_prob = _predict(model, cal_u, cal_v, model_states)
     calibration_metrics = {}
     for q in args.quantiles:
         qprime, coverage, target = _calibrate_quantile(cal_prob, cal_y, float(q))
@@ -481,27 +549,37 @@ def main() -> int:
         model_meta["calibrated_quantiles"][f"{q:.6g}"] = qprime
 
     test_u, test_v, test_y = sampler.sample("test", args.test_pairs)
-    test_prob = _predict(model, test_u, test_v, states)
+    test_prob = _predict(model, test_u, test_v, model_states)
     median_tau, _ = model.predict_tau(test_prob, 0.5)
     near_mask = test_y < args.horizon
     with np.errstate(invalid="ignore"):
         rho_value = float(spearmanr(median_tau[near_mask], test_y[near_mask] + 1).statistic)
         rho_spearman = rho_value if np.isfinite(rho_value) else None
     q_metrics = {}
+    near_episodes = trans.episode_id[test_u[near_mask]]
     for q in args.quantiles:
         qprime = model.calibrated_quantile(float(q))
         tau_q, f_h = model.predict_tau(test_prob[near_mask], float(q))
-        coverage = float(np.mean((tau_q <= args.horizon) & ((test_y[near_mask] + 1) <= tau_q)))
-        q_metrics[f"{q:.6g}"] = {"q_prime": qprime, "test_coverage": coverage}
+        covered = (tau_q <= args.horizon) & ((test_y[near_mask] + 1) <= tau_q)
+        coverage = float(np.mean(covered))
+        interval = _episode_bootstrap_interval(
+            covered, near_episodes, seed=args.seed + int(round(float(q) * 1000))
+        )
+        q_metrics[f"{q:.6g}"] = {
+            "q_prime": qprime,
+            "test_coverage": coverage,
+            "episode_bootstrap_95": interval,
+            "bootstrap_gate": bool(interval["low"] is not None and interval["low"] <= q <= interval["high"]),
+        }
     cross_u, cross_v = sampler._sample_cross_far("test", args.test_pairs, threshold=radius)
-    cross_prob = _predict(model, cross_u, cross_v, states)
+    cross_prob = _predict(model, cross_u, cross_v, model_states)
     f_h_cross = np.sum(cross_prob[:, : args.horizon], axis=1)
     auc = _roc_auc(test_prob[near_mask, : args.horizon].sum(axis=1), f_h_cross)
 
     conflict_u, conflict_v = sampler._sample_cross_far("test", args.test_pairs, threshold=radius)
     conflict_dist = np.linalg.norm(phi[conflict_u] - phi[conflict_v], axis=1)
     conflict_mask = conflict_dist <= r_h
-    conflict_prob = _predict(model, conflict_u[conflict_mask], conflict_v[conflict_mask], states)
+    conflict_prob = _predict(model, conflict_u[conflict_mask], conflict_v[conflict_mask], model_states)
     conflict_near_rate = (
         float(np.mean(conflict_prob[:, : args.horizon].sum(axis=1) > 0.5))
         if conflict_prob.shape[0] else None

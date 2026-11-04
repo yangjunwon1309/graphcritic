@@ -108,11 +108,25 @@ def _robomimic_grasp(feat: NDArray[np.float32], aux: Mapping[str, NDArray]) -> N
     return (closed & near).astype(np.int64)
 
 
+def _scene_v04_mode(feat: NDArray[np.float32], aux: Mapping[str, NDArray]) -> NDArray[np.int64]:
+    from graphcritic.state_schema import get_state_schema
+
+    return get_state_schema("ogbench_scene").mode(feat, aux)
+
+
+def _robomimic_v04_mode(feat: NDArray[np.float32], aux: Mapping[str, NDArray]) -> NDArray[np.int64]:
+    from graphcritic.state_schema import get_state_schema
+
+    return get_state_schema("robomimic").mode(feat, aux)
+
+
 MODE_FNS: dict[str, ModeFn] = {
     "none": lambda feat, aux: np.zeros(feat.shape[0], dtype=np.int64),
     "ogbench_scene": _scene_mode,
     "ogbench_cube": _cube_mode,
     "robomimic_grasp": _robomimic_grasp,
+    "ogbench_scene_v04": _scene_v04_mode,
+    "robomimic_v04": _robomimic_v04_mode,
 }
 
 

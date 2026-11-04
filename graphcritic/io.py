@@ -11,6 +11,7 @@ from numpy.typing import NDArray
 
 from graphcritic.config import GraphConfig
 from graphcritic.types import (
+    GRAPH_SCHEMA_VERSION,
     SCHEMA_VERSION,
     EdgeSet,
     GraphArtifact,
@@ -68,7 +69,7 @@ def _read_pair(path: str | Path) -> tuple[dict[str, NDArray[Any]], dict[str, Any
         metadata = json.loads(json_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SchemaError(f"cannot read artifact metadata at {json_path}") from exc
-    if not isinstance(metadata, dict) or metadata.get("schema_version") != SCHEMA_VERSION:
+    if not isinstance(metadata, dict) or metadata.get("schema_version") not in {SCHEMA_VERSION, GRAPH_SCHEMA_VERSION}:
         found = metadata.get("schema_version") if isinstance(metadata, dict) else None
         raise SchemaError(f"unsupported or missing schema_version: {found!r}")
     try:
@@ -157,6 +158,8 @@ def load_transitions(
     expected_dataset_id: str | None = None,
 ) -> tuple[TransitionSet, dict[str, Any]]:
     arrays, metadata = _read_pair(path)
+    if metadata.get("schema_version") != SCHEMA_VERSION:
+        raise SchemaError("transition artifact schema_version must be 0.3")
     required = {
         "feat", "next_feat", "episode_id", "t", "success", "success_cur", "terminal",
         "row_idx", "mode", "mode_next",
@@ -245,6 +248,8 @@ def _graph_arrays(artifact: GraphArtifact) -> dict[str, NDArray[Any]]:
         "dataset_id": np.asarray(artifact.meta["dataset_id"]),
         "feature_checkpoint_sha256": np.asarray(checkpoint_hash),
     }
+    if artifact.schema_version == GRAPH_SCHEMA_VERSION:
+        arrays["bridge_type"] = artifact.edges.bridge_type
     tau_hash = artifact.meta.get("tau_model_sha256")
     if tau_hash is not None:
         arrays["tau_model_sha256"] = np.asarray(str(tau_hash))
@@ -263,7 +268,7 @@ def save_graph(artifact: GraphArtifact, path: str | Path) -> str:
         _graph_arrays(artifact),
         {
             "schema_version": artifact.schema_version,
-            "config": artifact.config.to_dict(),
+            "config": artifact.hash_config(),
             "meta": artifact.meta,
             "content_hash": content_hash,
         },
@@ -273,9 +278,16 @@ def save_graph(artifact: GraphArtifact, path: str | Path) -> str:
 
 def load_graph(path: str | Path, *, trans: TransitionSet | None = None) -> GraphArtifact:
     arrays, metadata = _read_pair(path)
+    schema_version = metadata.get("schema_version")
+    if schema_version not in {SCHEMA_VERSION, GRAPH_SCHEMA_VERSION}:
+        raise SchemaError("graph artifact schema_version must be 0.3 or 0.4")
+    if schema_version == GRAPH_SCHEMA_VERSION and "bridge_type" not in arrays:
+        raise SchemaError("graph schema 0.4 requires the bridge_type edge array")
+    if schema_version == SCHEMA_VERSION and "bridge_type" in arrays:
+        raise SchemaError("graph schema 0.3 cannot contain bridge_type")
     config_value = metadata.get("config")
     config = GraphConfig.from_dict(config_value)
-    _require_hash(metadata, config, arrays)
+    _require_hash(metadata, config_value, arrays)
     required = {
         "rep_feat", "rep_ref", "assign_cur", "assign_next", "is_goal",
         "src", "dst", "kappa", "n_pos", "n_neg", "kind", "dist", "anchor",
@@ -283,7 +295,7 @@ def load_graph(path: str | Path, *, trans: TransitionSet | None = None) -> Graph
         "dataset_id", "feature_checkpoint_sha256",
         "feature_mean", "feature_std",
     }
-    optional = {"tau_model_sha256"}
+    optional = {"tau_model_sha256", "bridge_type"}
     if not required.issubset(arrays) or set(arrays) - required - optional:
         raise SchemaError(f"graph arrays must be exactly {sorted(required)}")
     if "tau_model_sha256" in arrays:
@@ -301,6 +313,7 @@ def load_graph(path: str | Path, *, trans: TransitionSet | None = None) -> Graph
         src=arrays["src"], dst=arrays["dst"], kappa=arrays["kappa"],
         n_pos=arrays["n_pos"], n_neg=arrays["n_neg"], kind=arrays["kind"],
         dist=arrays["dist"], anchor=arrays["anchor"],
+        bridge_type=arrays.get("bridge_type"),
     )
     artifact = GraphArtifact(
         schema_version=metadata["schema_version"],

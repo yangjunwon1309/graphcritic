@@ -13,6 +13,7 @@ from graphcritic.featurize import Featurizer
 from graphcritic.modes import MODE_FNS
 from graphcritic.solve import solve
 from graphcritic.types import EdgeSet, NodeSet, SchemaError, SimStateSet, TransitionSet
+from graphcritic.state_schema import get_state_schema
 from graphcritic.weights import step_cost
 
 
@@ -120,6 +121,7 @@ def verify_bridge_edges(
             src=edges.src[alive], dst=edges.dst[alive], kappa=edges.kappa[alive],
             n_pos=n_pos[alive], n_neg=n_neg[alive], kind=edges.kind[alive],
             dist=edges.dist[alive], anchor=edges.anchor[alive],
+            bridge_type=edges.bridge_type[alive],
         )
         active_ids = np.flatnonzero(alive)
         local_weights = c * current.kappa.astype(np.float64)
@@ -179,6 +181,7 @@ def verify_bridge_edges(
         src=edges.src[alive], dst=edges.dst[alive], kappa=edges.kappa[alive],
         n_pos=n_pos[alive], n_neg=n_neg[alive], kind=edges.kind[alive],
         dist=edges.dist[alive], anchor=edges.anchor[alive],
+        bridge_type=edges.bridge_type[alive],
     )
     return final_edges, {
         "sim_verification_iterations": int(iterations),
@@ -346,7 +349,35 @@ class OGBenchVerifier:
         }
         if hasattr(self.unwrapped, "_cur_button_states"):
             state["button_states"] = np.asarray(self.unwrapped._cur_button_states, dtype=np.int64).copy()
+        # Physical units for the v0.4 pose-servo controller. These are read
+        # directly from MuJoCo's current state, not reconstructed from a
+        # potentially scaled observation vector.
+        try:
+            info = self.unwrapped.compute_ob_info()
+            state["eef_position"] = np.asarray(info["proprio/effector_pos"], dtype=np.float32).copy()
+            state["eef_yaw"] = np.asarray(info["proprio/effector_yaw"], dtype=np.float32).copy()
+            state["gripper_opening"] = np.asarray(info["proprio/gripper_opening"], dtype=np.float32).copy()
+            state["gripper_contact"] = np.asarray(info["proprio/gripper_contact"], dtype=np.float32).copy()
+        except (AttributeError, KeyError):
+            pass
         return state
+
+    def sim_readout(self, observation: NDArray) -> Mapping[str, NDArray]:
+        """Return the physical Scene coordinates required by ServoTrackingPolicy."""
+        state = dict(self.current_state())
+        obs = np.asarray(observation, dtype=np.float32).reshape(1, -1)
+        aux = {key: np.asarray(state[key]).reshape(1, -1) for key in ("qpos", "qvel", "button_states", "eef_position", "eef_yaw", "gripper_opening", "gripper_contact") if key in state}
+        coordinates = get_state_schema("ogbench_scene").coordinates(obs, aux)
+        return {
+            **state,
+            "observation": obs[0].copy(),
+            "r": coordinates.r[0].copy(),
+            "o": coordinates.o[0].copy(),
+            "e": coordinates.e[0].copy(),
+            "q_p": coordinates.q_p[0].copy(),
+            "mode": coordinates.mode[0].copy(),
+            "q_a": coordinates.q_a[0].copy(),
+        }
 
     def rollout(self, state: Mapping[str, NDArray], actions: NDArray) -> Mapping[str, Any]:
         observation = self.reset_to(state)

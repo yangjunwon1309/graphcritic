@@ -40,6 +40,16 @@ class FrameGapModel:
     def input_dim(self) -> int:
         return int(self.obs_mean.size)
 
+    @property
+    def pair_delta_indices(self) -> NDArray[np.int64]:
+        raw = self.metadata.get("pair_delta_indices")
+        if raw is None:
+            return np.arange(self.input_dim, dtype=np.int64)
+        indices = np.asarray(raw, dtype=np.int64)
+        if indices.ndim != 1 or np.any(indices < 0) or np.any(indices >= self.input_dim):
+            raise SchemaError("tau pair_delta_indices are outside the state input")
+        return indices
+
     def prepare_pairs(self, obs_u: NDArray, obs_v: NDArray) -> NDArray[np.float32]:
         u = np.asarray(obs_u, dtype=np.float32)
         v = np.asarray(obs_v, dtype=np.float32)
@@ -53,11 +63,14 @@ class FrameGapModel:
             raise SchemaError("tau model inputs must be finite")
         zu = (u - self.obs_mean) / self.obs_std
         zv = (v - self.obs_mean) / self.obs_std
-        return np.ascontiguousarray(np.concatenate((zu, zv, zv - zu), axis=1), dtype=np.float32)
+        delta_indices = self.pair_delta_indices
+        return np.ascontiguousarray(
+            np.concatenate((zu, zv, (zv - zu)[:, delta_indices]), axis=1), dtype=np.float32
+        )
 
     def logits_numpy(self, pair_features: NDArray) -> NDArray[np.float32]:
         x = np.asarray(pair_features, dtype=np.float32)
-        if x.ndim != 2 or x.shape[1] != 3 * self.input_dim:
+        if x.ndim != 2 or x.shape[1] != self.params["w0"].shape[0]:
             raise SchemaError("tau pair feature matrix has the wrong dimension")
         for layer in range(3):
             x = x @ self.params[f"w{layer}"] + self.params[f"b{layer}"]
@@ -184,13 +197,21 @@ class FrameGapModel:
         mean, std = arrays.pop("obs_mean"), arrays.pop("obs_std")
         if mean.ndim != 1 or std.shape != mean.shape or np.any(std <= 0):
             raise SchemaError("frame-gap observation statistics are invalid")
-        if arrays["w0"].shape[0] != 3 * mean.size or arrays["w3"].shape[1] != horizon + 1:
+        raw_delta_indices = metadata.get("pair_delta_indices")
+        if raw_delta_indices is None:
+            pair_dim = 3 * mean.size
+        else:
+            indices = np.asarray(raw_delta_indices, dtype=np.int64)
+            if indices.ndim != 1 or np.any(indices < 0) or np.any(indices >= mean.size):
+                raise SchemaError("frame-gap pair_delta_indices are invalid")
+            pair_dim = 2 * mean.size + indices.size
+        if arrays["w0"].shape[0] != pair_dim or arrays["w3"].shape[1] != horizon + 1:
             raise SchemaError("frame-gap checkpoint dimensions do not match metadata")
         if any(not np.all(np.isfinite(value)) for value in arrays.values()):
             raise SchemaError("frame-gap checkpoint arrays must be finite")
         hidden = int(arrays["w0"].shape[1])
         expected_shapes = {
-            "w0": (3 * mean.size, hidden), "b0": (hidden,),
+            "w0": (pair_dim, hidden), "b0": (hidden,),
             "w1": (hidden, hidden), "b1": (hidden,),
             "w2": (hidden, hidden), "b2": (hidden,),
             "w3": (hidden, horizon + 1), "b3": (horizon + 1,),

@@ -209,6 +209,12 @@ def main(argv: list[str] | None = None) -> int:
                 gate_reasons.append("no finite shortest path uses a bridge")
             if stitch_gain <= 0:
                 gate_reasons.append("no successful-episode state gains more than one step from stitching")
+        if cfg.bridge.strategy == "passive_rm":
+            kin_violation = float(artifact.meta.get("bridge_tau_kinematic_violation", 1.0))
+            if kin_violation > 0.05:
+                gate_reasons.append(
+                    f"M-bridge kinematic violation {kin_violation:.4f} exceeds 0.0500"
+                )
         path_rate = (
             diagnostics.get("graph", {}).get("path_exec_switch_le_3")
             if "graph" in diagnostics else diagnostics.get("path_exec_switch_le_3")

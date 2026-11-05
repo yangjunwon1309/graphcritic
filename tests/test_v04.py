@@ -248,14 +248,14 @@ def _servo_fixture():
 def test_servo_tracks_r_bridge_to_landing_then_resumes_temporal_path():
     policy = _servo_fixture()
     policy.reset(0)
-    action = policy.act({"q_a": np.zeros(5), "q_p": np.zeros(6), "mode": np.asarray(0)})
+    action = policy.act({"q_a": np.zeros(5), "q_p": np.zeros(6), "mode": np.asarray(0), "free": True})
     assert action[0] == 0.5
     assert policy.status()["stage"] == "temporal"
     assert policy.pointer == 1
-    action = policy.act({"q_a": np.asarray([0.025, 0, 0, 0, 0]), "q_p": np.zeros(6), "mode": np.asarray(0)})
+    action = policy.act({"q_a": np.asarray([0.025, 0, 0, 0, 0]), "q_p": np.zeros(6), "mode": np.asarray(0), "free": True})
     assert action[0] == 0.5
     assert policy.status()["stage"] == "bridge"
-    policy.act({"q_a": np.asarray([0.05, 0, 0, 0, 0]), "q_p": np.zeros(6), "mode": np.asarray(0)})
+    policy.act({"q_a": np.asarray([0.05, 0, 0, 0, 0]), "q_p": np.zeros(6), "mode": np.asarray(0), "free": True})
     record = policy.status()["bridge_landing"][0]
     assert record["landed"]
     assert record["bridge_type"] == 0
@@ -270,7 +270,7 @@ def test_servo_lookahead_does_not_skip_to_same_pose_after_passive_world_changes(
         PathStep(2, 0, 1), PathStep(4, None, 0),
     ]
     policy.q_p[2, 0] = 0.1  # same active pose, but a different object world
-    action = policy.act({"q_a": np.zeros(5), "q_p": np.zeros(6), "mode": np.asarray(0)})
+    action = policy.act({"q_a": np.zeros(5), "q_p": np.zeros(6), "mode": np.asarray(0), "free": True})
     assert policy.status()["selected_vertex"] == 0
     assert policy.status()["target_vertex"] == 1
     assert action[0] == 0.5

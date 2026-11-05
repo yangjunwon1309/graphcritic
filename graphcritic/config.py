@@ -112,6 +112,7 @@ class BridgeCostConfig:
     delta: float = 0.05
     prior: tuple[float, float] = (1.0, 1.0)
     lambda_cap_steps: float = 200.0
+    bridge_success_rho: float | None = None
     sim_budget: int = 2_000_000
     min_evidence: int = 50
 
@@ -134,6 +135,12 @@ class BridgeCostConfig:
             value = getattr(self, name)
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 raise SchemaError(f"bridge.cost.{name} must be finite and non-negative")
+        if self.bridge_success_rho is not None and (
+            not isinstance(self.bridge_success_rho, (int, float))
+            or not math.isfinite(self.bridge_success_rho)
+            or not 0 < self.bridge_success_rho <= 1
+        ):
+            raise SchemaError("bridge.cost.bridge_success_rho must lie in (0, 1]")
         if not 0 < self.delta < 1:
             raise SchemaError("bridge.cost.delta must be between zero and one")
         _positive_int("bridge.cost.n_bins", self.n_bins)
@@ -146,6 +153,7 @@ class BridgeCostConfig:
 
 @dataclass(frozen=True)
 class BridgeConfig:
+    enabled: bool = True
     k: int = 8
     radius: float = 2.0
     radius_unit: Literal["abs", "step"] = "step"
@@ -154,11 +162,16 @@ class BridgeConfig:
     source_stride: int = 1
     same_mode: bool = True
     knn_backend: Literal["auto", "ckdtree", "faiss", "jax_gpu"] = "auto"
-    strategy: Literal["feature", "passive_r", "passive_rm"] = "feature"
+    strategy: Literal["feature", "passive_r", "passive_r_real", "passive_r_strict", "passive_rm", "passive_rm_real"] = "feature"
     state_schema: str | None = None
     passive_jitter_multiplier: float = 1.0
     passive_max_multiplier: float = 10.0
     kinematic_settle: int = 2
+    real_speed_quantile: float = 0.95
+    real_settle_steps: int = 2
+    free_distance: float = 0.05
+    r_tau_max_steps: int | None = None
+    include_m_bridges: bool = False
     cost: BridgeCostConfig = field(default_factory=BridgeCostConfig)
 
     def __post_init__(self) -> None:
@@ -166,15 +179,17 @@ class BridgeConfig:
         _positive_int("bridge.landing_steps", self.landing_steps)
         _positive_int("bridge.min_time_gap", self.min_time_gap, allow_zero=True)
         _positive_int("bridge.source_stride", self.source_stride)
+        if not isinstance(self.enabled, bool):
+            raise SchemaError("bridge.enabled must be boolean")
         if not isinstance(self.radius, (int, float)) or not math.isfinite(self.radius) or self.radius <= 0:
             raise SchemaError("bridge.radius must be finite and positive")
         if self.radius_unit not in {"abs", "step"}:
             raise SchemaError("bridge.radius_unit must be 'abs' or 'step'")
         if self.knn_backend not in {"auto", "ckdtree", "faiss", "jax_gpu"}:
             raise SchemaError("bridge.knn_backend must be auto, ckdtree, faiss, or jax_gpu")
-        if self.strategy not in {"feature", "passive_r", "passive_rm"}:
-            raise SchemaError("bridge.strategy must be feature, passive_r, or passive_rm")
-        if self.strategy in {"passive_r", "passive_rm"} and self.cost.policy != "time":
+        if self.strategy not in {"feature", "passive_r", "passive_r_real", "passive_r_strict", "passive_rm", "passive_rm_real"}:
+            raise SchemaError("bridge.strategy must be feature, passive_r, passive_r_real, passive_r_strict, passive_rm, or passive_rm_real")
+        if self.strategy in {"passive_r", "passive_r_real", "passive_r_strict", "passive_rm", "passive_rm_real"} and self.cost.policy != "time":
             raise SchemaError("passive R/M bridge strategies require bridge.cost.policy='time'")
         if self.state_schema is not None and (not isinstance(self.state_schema, str) or not self.state_schema):
             raise SchemaError("bridge.state_schema must be a non-empty name when provided")
@@ -183,6 +198,21 @@ class BridgeConfig:
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise SchemaError(f"bridge.{name} must be finite and positive")
         _positive_int("bridge.kinematic_settle", self.kinematic_settle, allow_zero=True)
+        _positive_int("bridge.real_settle_steps", self.real_settle_steps, allow_zero=True)
+        if not isinstance(self.real_speed_quantile, (int, float)) or not 0 < self.real_speed_quantile < 1:
+            raise SchemaError("bridge.real_speed_quantile must lie strictly between zero and one")
+        if not isinstance(self.free_distance, (int, float)) or not math.isfinite(self.free_distance) or self.free_distance <= 0:
+            raise SchemaError("bridge.free_distance must be finite and positive")
+        if self.r_tau_max_steps is not None:
+            _positive_int("bridge.r_tau_max_steps", self.r_tau_max_steps)
+        if not isinstance(self.include_m_bridges, bool):
+            raise SchemaError("bridge.include_m_bridges must be boolean")
+        if self.include_m_bridges and self.strategy != "passive_r_strict":
+            raise SchemaError("bridge.include_m_bridges requires strategy='passive_r_strict'")
+        if self.include_m_bridges and (
+            self.cost.tau_model != "learned" or not self.cost.tau_ckpt
+        ):
+            raise SchemaError("bridge.include_m_bridges requires a learned tau checkpoint")
         if not isinstance(self.same_mode, bool):
             raise SchemaError("bridge.same_mode must be boolean")
         if not isinstance(self.cost, BridgeCostConfig):

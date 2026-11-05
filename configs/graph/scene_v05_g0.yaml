@@ -1,0 +1,25 @@
+gamma: 0.99
+graph_kind: state
+feature:
+  name: ogbench_scene_pos
+  standardize: true
+mode_fn: ogbench_scene_v04
+min_dwell: 3
+bridge:
+  enabled: false
+  k: 8
+  radius: 1.0
+  radius_unit: abs
+  min_time_gap: 20
+  source_stride: 1
+  same_mode: true
+  knn_backend: ckdtree
+  strategy: feature
+  state_schema: ogbench_scene
+  cost:
+    policy: time
+    tau_model: geometric
+    lambda0_steps: 0.0
+    lambda1_steps: 0.0
+c_max_steps: 1001
+segment_max_len: 1000

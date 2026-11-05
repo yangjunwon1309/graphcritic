@@ -1,0 +1,33 @@
+gamma: 0.99
+graph_kind: state
+feature:
+  name: ogbench_scene_pos
+  standardize: true
+mode_fn: ogbench_scene_v04
+min_dwell: 3
+bridge:
+  enabled: true
+  k: 8
+  radius: 1.0
+  radius_unit: abs
+  min_time_gap: 20
+  source_stride: 1
+  same_mode: true
+  knn_backend: ckdtree
+  strategy: passive_r_strict
+  state_schema: ogbench_scene
+  passive_jitter_multiplier: 1.0
+  passive_max_multiplier: 10.0
+  kinematic_settle: 2
+  real_speed_quantile: 0.95
+  real_settle_steps: 2
+  free_distance: 0.05
+  cost:
+    policy: time
+    tau_model: geometric
+    tau_max_steps: 10
+    bridge_success_rho: 1.0
+    lambda0_steps: 0.0
+    lambda1_steps: 0.0
+c_max_steps: 1001
+segment_max_len: 1000

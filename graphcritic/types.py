@@ -18,7 +18,8 @@ if TYPE_CHECKING:
 
 
 SCHEMA_VERSION = "0.3"
-GRAPH_SCHEMA_VERSION = "0.4"
+LEGACY_GRAPH_SCHEMA_VERSION = "0.4"
+GRAPH_SCHEMA_VERSION = "0.5"
 
 
 class SchemaError(ValueError):
@@ -419,7 +420,17 @@ class GraphArtifact:
         from graphcritic.config import GraphConfig as GraphConfigType
 
         if isinstance(self.config, Mapping):
+            raw_config = self.config
+            bridge_config = raw_config.get("bridge", {})
+            self._hash_include_m_disabled_field = (
+                self.schema_version == GRAPH_SCHEMA_VERSION
+                and isinstance(bridge_config, Mapping)
+                and "include_m_bridges" in bridge_config
+            )
             self.config = GraphConfigType.from_dict(self.config)
+        else:
+            # Newly assembled artifacts serialize the current complete config.
+            self._hash_include_m_disabled_field = True
         if not isinstance(self.config, GraphConfigType):
             raise SchemaError("config must be a GraphConfig")
         if not isinstance(self.feature_stats, Mapping):
@@ -468,7 +479,7 @@ class GraphArtifact:
             "succ": self.succ,
             "weights": self.weights,
         }
-        if self.schema_version == GRAPH_SCHEMA_VERSION:
+        if self.schema_version in {LEGACY_GRAPH_SCHEMA_VERSION, GRAPH_SCHEMA_VERSION}:
             arrays["bridge_type"] = self.edges.bridge_type
         tau_hash = self.meta.get("tau_model_sha256")
         if tau_hash is not None:
@@ -482,8 +493,20 @@ class GraphArtifact:
     def hash_config(self) -> dict[str, Any]:
         """Return the canonical config payload for this graph artifact version."""
         config = self.config.to_dict()
+        if self.schema_version in {SCHEMA_VERSION, LEGACY_GRAPH_SCHEMA_VERSION}:
+            # Older graph hashes predate v0.5 bridge calibration fields.
+            for key in (
+                "enabled", "real_speed_quantile", "real_settle_steps", "free_distance",
+                "include_m_bridges",
+            ):
+                config["bridge"].pop(key, None)
+            config["bridge"]["cost"].pop("bridge_success_rho", None)
+        elif not getattr(self, "_hash_include_m_disabled_field", True):
+            # A v0.5 graph written before the optional M-bridge switch existed
+            # hashes the default false value as absent.
+            config["bridge"].pop("include_m_bridges", None)
         if self.schema_version == SCHEMA_VERSION:
-            # v0.3 graph files predate physical-coordinate bridge settings.
+            # v0.3 graph files also predate physical-coordinate bridge settings.
             for key in (
                 "strategy", "state_schema", "passive_jitter_multiplier",
                 "passive_max_multiplier", "kinematic_settle",
@@ -499,7 +522,7 @@ class GraphArtifact:
     ) -> None:
         from graphcritic.config import GraphConfig as GraphConfigType
 
-        if self.schema_version not in {SCHEMA_VERSION, GRAPH_SCHEMA_VERSION}:
+        if self.schema_version not in {SCHEMA_VERSION, LEGACY_GRAPH_SCHEMA_VERSION, GRAPH_SCHEMA_VERSION}:
             raise SchemaError(f"unsupported graph schema_version {self.schema_version!r}")
         if not isinstance(self.config, GraphConfigType):
             raise SchemaError("config must be a GraphConfig")

@@ -1,4 +1,4 @@
-"""Closed-loop physical pose tracking for graph paths (v0.4)."""
+"""Hybrid replay/pose witness controller for graph paths (v0.5)."""
 
 from __future__ import annotations
 
@@ -8,9 +8,28 @@ import numpy as np
 from numpy.typing import NDArray
 
 from graphcritic.path import PathStep, _extract_path_with_table, _successor_edge_table
+from graphcritic.physical_time import free_space_mask
 from graphcritic.state_schema import StateCoordinates, StateSchema, passive_difference
 from graphcritic.types import GraphArtifact, SchemaError, TransitionSet
 from graphcritic.weights import step_cost
+
+
+def contact_replay_correction(
+    recorded_action: NDArray,
+    current_to_vertex_error: NDArray,
+    action_limits: NDArray,
+    gain: float,
+) -> NDArray[np.float32]:
+    """Replay contact actions with pose correction to the current path vertex."""
+    action = np.asarray(recorded_action, dtype=np.float64).copy()
+    error = np.asarray(current_to_vertex_error, dtype=np.float64)
+    limits = np.asarray(action_limits, dtype=np.float64)
+    if action.ndim != 1 or error.shape != action.shape or limits.shape != action.shape:
+        raise SchemaError("contact correction action, error, and limits must be aligned vectors")
+    if action.size < 4 or np.any(limits <= 0) or not np.isfinite(gain) or gain < 0:
+        raise SchemaError("contact correction requires pose dimensions and a non-negative finite gain")
+    action[:4] += float(gain) * error[:4] / limits[:4]
+    return np.clip(action, -1.0, 1.0).astype(np.float32)
 
 
 class ServoTrackingPolicy:
@@ -29,15 +48,21 @@ class ServoTrackingPolicy:
         epsilon_a: NDArray | None = None,
         epsilon_p: NDArray | None = None,
         feedback_gain: float = 1.0,
+        response_gain: NDArray | None = None,
+        contact_gain: float = 0.3,
+        free_distance: float = 0.05,
+        tracking_tube: NDArray | None = None,
     ) -> None:
         artifact.validate(trans)
         if artifact.config.graph_kind != "state":
             raise SchemaError("ServoTrackingPolicy requires an occurrence-level state graph")
         if mode not in {"servo", "ff+servo", "replay"}:
             raise SchemaError("servo mode must be servo, ff+servo, or replay")
-        if mode in {"ff+servo", "replay"} and trans.action is None:
-            raise SchemaError("ff+servo/replay modes require recorded actions")
-        if window < 0 or settle < 0 or not np.isfinite(feedback_gain) or feedback_gain < 0:
+        if trans.action is None:
+            raise SchemaError("the v0.5 witness requires recorded actions for gripper/contact control")
+        if (window < 0 or settle < 0 or not np.isfinite(feedback_gain) or feedback_gain < 0
+                or not np.isfinite(contact_gain) or contact_gain < 0
+                or not np.isfinite(free_distance) or free_distance <= 0):
             raise SchemaError("servo window and settle must be non-negative")
         n = artifact.nodes.n_nodes
         for name in ("r", "o", "e", "q_p", "mode", "q_a"):
@@ -59,6 +84,13 @@ class ServoTrackingPolicy:
         self.q_p = np.asarray(coordinates.q_p, dtype=np.float64)
         self.modes = np.asarray(coordinates.mode, dtype=np.int64)
         self.action_limits = np.asarray(schema.action_limits, dtype=np.float64)
+        self.free_distance = float(free_distance)
+        self.contact_gain = float(contact_gain)
+        if response_gain is None:
+            response_gain = np.ones(qa.shape[1], dtype=np.float64)
+        self.response_gain = np.asarray(response_gain, dtype=np.float64)
+        if self.response_gain.shape != (qa.shape[1],) or np.any(~np.isfinite(self.response_gain)) or np.any(self.response_gain <= 0):
+            raise SchemaError("response_gain must be a positive finite vector matching q_a")
         if epsilon_a is None:
             rows = np.flatnonzero(~trans.terminal)
             rows = rows[trans.episode_id[rows] == trans.episode_id[rows + 1]]
@@ -81,6 +113,14 @@ class ServoTrackingPolicy:
         self.epsilon_p = np.asarray(epsilon_p, dtype=np.float64)
         if self.epsilon_p.shape != (self.q_p.shape[1],) or np.any(self.epsilon_p <= 0):
             raise SchemaError("epsilon_p must be a positive vector matching q_p")
+        if tracking_tube is None:
+            if qa.shape[1] == 5:
+                tracking_tube = np.asarray([0.01, 0.01, 0.01, np.deg2rad(5.0), 0.1])
+            else:
+                tracking_tube = self.epsilon_a.copy()
+        self.tracking_tube = np.asarray(tracking_tube, dtype=np.float64)
+        if self.tracking_tube.shape != (qa.shape[1],) or np.any(~np.isfinite(self.tracking_tube)) or np.any(self.tracking_tube <= 0):
+            raise SchemaError("tracking_tube must be a positive finite vector matching q_a")
         self.action_row = np.asarray(artifact.nodes.rep_ref[:, 0], dtype=np.int64)
         self._successor_kind, self._successor_tau = _successor_edge_table(artifact)
         self._successor_edge = np.full(n, -1, dtype=np.int64)
@@ -105,6 +145,9 @@ class ServoTrackingPolicy:
         self.failure_detail: str | None = None
         self.step_count = 0
         self._active_bad = 0
+        self._active_best_tube_error = float("inf")
+        self._active_stale_steps = 0
+        self._passive_bad = 0
         self._mode_bad = 0
         self._live_mode = 0
         self._candidate_mode: int | None = None
@@ -128,6 +171,9 @@ class ServoTrackingPolicy:
         self.failure_detail = None
         self.step_count = 0
         self._active_bad = self._mode_bad = 0
+        self._active_best_tube_error = float("inf")
+        self._active_stale_steps = 0
+        self._passive_bad = 0
         self._live_mode = int(self.modes[start_vertex])
         self._candidate_mode = None
         self._candidate_mode_count = 0
@@ -179,7 +225,7 @@ class ServoTrackingPolicy:
             raise SchemaError("path successor edge is missing")
         return edge_index
 
-    def _readout(self, sim_readout: Mapping[str, NDArray]) -> tuple[NDArray, NDArray, int]:
+    def _readout(self, sim_readout: Mapping[str, NDArray]) -> tuple[NDArray, NDArray, int, bool, bool]:
         required = {"q_a", "q_p", "mode"}
         missing = required - sim_readout.keys()
         if missing:
@@ -187,6 +233,7 @@ class ServoTrackingPolicy:
         qa = np.asarray(sim_readout["q_a"], dtype=np.float64).reshape(-1)
         qp = np.asarray(sim_readout["q_p"], dtype=np.float64).reshape(-1)
         observed_mode = int(np.asarray(sim_readout["mode"]).item())
+        contact = bool(np.any(np.asarray(sim_readout.get("gripper_contact", 0.0)) > 0.0))
         if observed_mode == self._live_mode:
             self._candidate_mode = None
             self._candidate_mode_count = 0
@@ -216,11 +263,23 @@ class ServoTrackingPolicy:
                 self.schema.passive(obs, aux, np.asarray([observed_mode])),
                 dtype=np.float64,
             ).reshape(-1)
+            if "free" in sim_readout:
+                is_free = bool(np.asarray(sim_readout["free"]).item())
+            elif "qpos" in aux:
+                current_coordinates = self.schema.coordinates(obs, aux)
+                is_free = bool(free_space_mask(
+                    obs, aux["qpos"], current_coordinates, distance=self.free_distance
+                )[0])
+            else:
+                is_free = False
+        else:
+            is_free = bool(np.asarray(sim_readout.get("free", False)).item())
+        is_free = is_free and not contact
         if qa.shape != self.action_limits.shape or qp.shape != self.epsilon_p.shape:
             raise SchemaError("sim_readout q_a/q_p has an incompatible shape")
         if not np.all(np.isfinite(qa)) or not np.all(np.isfinite(qp)):
             raise SchemaError("sim_readout coordinates must be finite")
-        return qa, qp, mode
+        return qa, qp, mode, is_free, contact
 
     def _choose_temporal_target(
         self, current: NDArray, current_passive: NDArray, current_mode: int
@@ -285,7 +344,7 @@ class ServoTrackingPolicy:
             raise SchemaError("call reset(start_vertex) before requesting an action")
         if self.failure_reason is not None:
             return np.zeros(self.action_limits.shape, dtype=np.float32)
-        current, passive, mode = self._readout(sim_readout)
+        current, passive, mode, is_free, contact = self._readout(sim_readout)
         self.step_count += 1
         if self.step_count > self.max_steps:
             self._set_failure("timeout", "graph-cost-derived episode timeout")
@@ -306,8 +365,9 @@ class ServoTrackingPolicy:
                 passive_error = np.max(np.abs(passive_difference(
                     self.schema, self.q_p[self.path[self.pointer].vertex], passive
                 )) / self.epsilon_p)
-                if passive_error > 3.0:
-                    self._set_failure("passive_drift", "R bridge passive coordinates drifted beyond 3 epsilon_p")
+                self._passive_bad = self._passive_bad + 1 if passive_error > 3.0 else 0
+                if self._passive_bad >= 5:
+                    self._set_failure("passive_drift", "R bridge passive coordinates exceeded 3 epsilon_p for 5 steps")
             else:
                 record["passive_drift_epsilon"] = float(np.max(np.abs(passive_difference(
                     self.schema, self.q_p[self.path[self.pointer].vertex], passive
@@ -320,7 +380,8 @@ class ServoTrackingPolicy:
                 self._mode_bad = 0
             error = self._action_delta(current, self.q_a[target])
             self.follow_error = float(np.max(np.abs(error) / self.epsilon_a))
-            if np.all(np.abs(error) <= self.epsilon_a):
+            landed = np.max(np.abs(error) / self.tracking_tube) <= 1.0
+            if landed:
                 record["landed"] = True
                 record["landed_step"] = self.step_count
                 record["elapsed"] = elapsed
@@ -329,6 +390,8 @@ class ServoTrackingPolicy:
                 self.bridge_started = -1
                 self.stage = "temporal"
                 self._active_bad = 0
+                self._active_best_tube_error = float("inf")
+                self._active_stale_steps = 0
             elif elapsed > bridge_tau + 10:
                 self._set_failure("timeout", "bridge landing exceeded tau+10 steps")
         else:
@@ -336,26 +399,40 @@ class ServoTrackingPolicy:
             self._choose_temporal_target(current, passive, mode)
             error = self._action_delta(current, self.q_a[self.target_vertex])
             self.follow_error = float(np.max(np.abs(error) / self.epsilon_a))
-            self._active_bad = self._active_bad + 1 if self.follow_error > 3.0 else 0
-            if self._active_bad >= 10:
-                self._set_failure("active_tracking", "tracking error exceeded 3 epsilon_a for 10 steps")
+            tube_error = float(np.max(np.abs(error) / self.tracking_tube))
+            if tube_error < self._active_best_tube_error - 1e-6:
+                self._active_best_tube_error = tube_error
+                self._active_stale_steps = 0
+            else:
+                self._active_stale_steps += 1
+            self._active_bad = self._active_bad + 1 if tube_error > 3.0 else 0
+            if tube_error > 3.0 and self._active_stale_steps >= 15:
+                self._set_failure("active_tracking", "tracking error exceeded 3 physical tubes without reducing for 15 steps")
             passive_error = np.max(np.abs(passive_difference(
                 self.schema, self.q_p[self.selected_vertex], passive
             )) / self.epsilon_p)
-            if passive_error > 3.0:
-                self._set_failure("passive_drift", "passive coordinates drifted beyond 3 epsilon_p")
+            self._passive_bad = self._passive_bad + 1 if passive_error > 3.0 else 0
+            if self._passive_bad >= 5:
+                self._set_failure("passive_drift", "passive coordinates exceeded 3 epsilon_p for 5 steps")
 
         if self.failure_reason is not None:
             return np.zeros(self.action_limits.shape, dtype=np.float32)
-        feedback = np.clip(error / self.action_limits, -1.0, 1.0)
+        row = int(self.action_row[self.selected_vertex])
+        recorded = np.asarray(self.trans.action[row], dtype=np.float64)
         if self.mode == "replay":
-            row = int(self.action_row[self.selected_vertex])
-            action = np.asarray(self.trans.action[row], dtype=np.float64)
-        elif self.mode == "ff+servo":
-            row = int(self.action_row[self.selected_vertex])
-            action = np.asarray(self.trans.action[row], dtype=np.float64) + self.feedback_gain * feedback
+            action = recorded
+        elif is_bridge or is_free:
+            action = recorded.copy()
+            action[:4] = np.clip(
+                self.feedback_gain * self.response_gain[:4] * error[:4] / self.action_limits[:4],
+                -1.0,
+                1.0,
+            )
         else:
-            action = self.feedback_gain * feedback
+            contact_error = self._action_delta(current, self.q_a[self.selected_vertex])
+            action = contact_replay_correction(
+                recorded, contact_error, self.action_limits, self.contact_gain
+            )
         return np.clip(action, -1.0, 1.0).astype(np.float32)
 
     def status(self) -> dict[str, Any]:
@@ -365,6 +442,9 @@ class ServoTrackingPolicy:
             "selected_vertex": int(self.selected_vertex),
             "target_vertex": int(self.target_vertex),
             "follow_error_epsilon": float(self.follow_error),
+            "response_gain": self.response_gain.tolist(),
+            "contact_gain": self.contact_gain,
+            "tracking_tube": self.tracking_tube.tolist(),
             "bridge_landing": [dict(item) for item in self.bridge_records],
             "failure_reason": self.failure_reason,
             "failure_detail": self.failure_detail,

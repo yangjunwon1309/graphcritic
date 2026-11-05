@@ -379,6 +379,7 @@ def estimate_passive_tolerance(
     multiplier: float = 1.0,
     far_from_contact: float = 0.10,
     contact_mask: NDArray | None = None,
+    free_mask: NDArray | None = None,
 ) -> dict[str, NDArray | dict[str, float]]:
     """Estimate eps_p = max(3*q99 physical jitter, per-coordinate floors)."""
     q = np.asarray(q_p, dtype=np.float64)
@@ -394,21 +395,26 @@ def estimate_passive_tolerance(
         delta[rows + 1] = passive_difference(schema, q[rows], q[rows + 1])
         # The controller must be at least 10 cm from every passive object and
         # the mode must not encode a grasp/contact transition.
-        if isinstance(schema, OGBenchSceneStateSchema):
-            n_buttons = 2
-            grasp_id = md // (4 ** n_buttons * 4)
-            is_grasp_mode = grasp_id > 0
+        if free_mask is not None:
+            free = np.asarray(free_mask, dtype=np.bool_)
+            if free.shape != (q.shape[0],):
+                raise SchemaError("free_mask must have one aligned boolean per state")
         else:
-            is_grasp_mode = md > 0
-        if isinstance(schema, OGBenchSceneStateSchema) and q.shape[1] >= 6 and (q.shape[1] - 2) % 4 == 0:
-            cube_values = q[:, : q.shape[1] - 2].reshape(q.shape[0], -1, 4)
-            cube_xyz = cube_values[:, :, :3]
-            distance = np.linalg.norm(qa[:, None, :3] - cube_xyz, axis=2).min(axis=1)
-        elif q.shape[1] >= 3:
-            distance = np.linalg.norm(qa[:, :3] - q[:, :3], axis=1)
-        else:
-            distance = np.full(q.shape[0], np.inf)
-        free = (~is_grasp_mode) & (distance > far_from_contact)
+            if isinstance(schema, OGBenchSceneStateSchema):
+                n_buttons = 2
+                grasp_id = md // (4 ** n_buttons * 4)
+                is_grasp_mode = grasp_id > 0
+            else:
+                is_grasp_mode = md > 0
+            if isinstance(schema, OGBenchSceneStateSchema) and q.shape[1] >= 6 and (q.shape[1] - 2) % 4 == 0:
+                cube_values = q[:, : q.shape[1] - 2].reshape(q.shape[0], -1, 4)
+                cube_xyz = cube_values[:, :, :3]
+                distance = np.linalg.norm(qa[:, None, :3] - cube_xyz, axis=2).min(axis=1)
+            elif q.shape[1] >= 3:
+                distance = np.linalg.norm(qa[:, :3] - q[:, :3], axis=1)
+            else:
+                distance = np.full(q.shape[0], np.inf)
+            free = (~is_grasp_mode) & (distance > far_from_contact)
         if contact_mask is not None:
             contact = np.asarray(contact_mask, dtype=np.bool_)
             if contact.shape != (q.shape[0],):

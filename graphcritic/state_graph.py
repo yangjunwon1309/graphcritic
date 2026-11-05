@@ -661,18 +661,34 @@ def build_state_graph(
 
     cost_meta: dict[str, Any] = {"bridge_cost_policy": cfg.bridge.cost.policy}
     bridge_type_b = np.full(0, -1, dtype=np.int8)
-    manual_bridges = cfg.bridge.strategy in {"passive_r", "passive_rm"}
-    if manual_bridges:
+    manual_bridges = cfg.bridge.strategy in {
+        "passive_r", "passive_r_real", "passive_r_strict", "passive_rm", "passive_rm_real"
+    }
+    if not cfg.bridge.enabled:
+        src_b = dst_b = anchor_b = kappa_b = np.empty(0, dtype=np.int64)
+        dist_b = np.empty(0, dtype=np.float32)
+        bridge_type_b = np.empty(0, dtype=np.int8)
+        n_pos_b = n_neg_b = np.empty(0, dtype=np.int64)
+        bridge_meta = {"bridge_enabled": False, "bridge_type_counts": {"R": 0, "M": 0}}
+        cost_meta["bridge_cost_policy"] = "disabled"
+    elif manual_bridges:
         (
             src_b, dst_b, dist_b, anchor_b, kappa_b, bridge_type_b, modes, bridge_meta
         ) = build_passive_bridges(
             trans, states, success, cfg, sim_state,
-            use_manipulation=cfg.bridge.strategy == "passive_rm",
+            use_manipulation=(
+                cfg.bridge.strategy in {"passive_rm", "passive_rm_real"}
+                or cfg.bridge.include_m_bridges
+            ),
         )
         n_pos_b = np.zeros(src_b.size, dtype=np.int64)
         n_neg_b = np.zeros(src_b.size, dtype=np.int64)
         cost_meta["bridge_cost_policy"] = (
-            "kinematic_plus_learned" if cfg.bridge.strategy == "passive_rm" else "kinematic"
+            "strict_realized_plus_learned_m" if cfg.bridge.include_m_bridges
+            else "realized_plus_learned" if cfg.bridge.strategy == "passive_rm_real"
+            else "kinematic_plus_learned" if cfg.bridge.strategy == "passive_rm"
+            else "realized_time" if cfg.bridge.strategy in {"passive_r_real", "passive_r_strict"}
+            else "kinematic"
         )
     elif cfg.bridge.cost.policy == "time":
         src_b, dst_b, dist_b, anchor_b, kappa_b, bridge_meta = _bridge_time_candidates(
@@ -690,7 +706,9 @@ def build_state_graph(
         anchor_ids, landing_ids = _landing_states(trans, modes, success, cfg.bridge.landing_steps)
         source_landing = np.full(states.shape[0], -1, dtype=np.int64)
         source_landing[anchor_ids] = landing_ids
-    if manual_bridges:
+    if not cfg.bridge.enabled:
+        cost_meta["bridge_pruned_over_lambda_cap"] = 0
+    elif manual_bridges:
         cost_meta["bridge_pruned_over_lambda_cap"] = 0
     elif cfg.bridge.cost.policy == "time":
         cost_meta["bridge_pruned_over_lambda_cap"] = 0

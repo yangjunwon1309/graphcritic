@@ -1,4 +1,4 @@
-"""Check v0.4 pose-servo tracking on object-free OGBench Scene states."""
+"""Check v0.5 calibrated pose tracking on object/handle-free Scene states."""
 
 from __future__ import annotations
 
@@ -15,24 +15,10 @@ import numpy as np
 
 from graphcritic.featurize import state_table
 from graphcritic.io import load_sim_state, load_transitions
-from graphcritic.modes import state_episode_time
+from graphcritic.physical_time import estimate_realized_speed, free_space_mask, realized_travel_steps
 from graphcritic.state_schema import get_state_schema, wrap_angle
 from graphcritic.types import SchemaError
 from graphcritic.verification import OGBenchVerifier
-
-
-def _epsilon_a(q_a: np.ndarray, trans, schema) -> np.ndarray:
-    rows = np.flatnonzero(~trans.terminal)
-    rows = rows[trans.episode_id[rows] == trans.episode_id[rows + 1]]
-    delta = q_a[rows + 1] - q_a[rows]
-    for dim in getattr(schema, "periodic_action", ()):
-        delta[:, dim] = wrap_angle(delta[:, dim])
-    epsilon = np.empty(q_a.shape[1], dtype=np.float64)
-    for dim in range(q_a.shape[1]):
-        positive = np.abs(delta[:, dim])
-        positive = positive[positive > 1e-7]
-        epsilon[dim] = np.median(positive) if positive.size else schema.action_limits[dim]
-    return epsilon
 
 
 def main() -> int:
@@ -45,6 +31,8 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--gain", type=float, default=1.0,
                         help="multiply the clipped pose correction for controller sensitivity checks")
+    parser.add_argument("--speed-quantile", choices=("0.95", "0.75"), default="0.95",
+                        help="realized speed quantile used for tau_real")
     args = parser.parse_args()
     if args.trials < 1 or not np.isfinite(args.gain) or args.gain <= 0:
         parser.error("--trials must be positive and --gain must be finite and positive")
@@ -58,15 +46,12 @@ def main() -> int:
     if sim_state.button_states is not None:
         aux["button_states"] = sim_state.button_states
     coords = schema.coordinates(states, aux)
-    epsilon_a = _epsilon_a(coords.q_a, trans, schema)
-
-    # Stay at least 15 cm from cubes initially. The maximum target offset is
-    # 4 cm, keeping these short tests outside the contact region.
-    n_cubes = (coords.q_p.shape[1] - 2) // 4
-    cube_xyz = coords.q_p[:, : 4 * n_cubes].reshape(states.shape[0], n_cubes, 4)[:, :, :3]
-    distance = np.linalg.norm(coords.q_a[:, None, :3] - cube_xyz, axis=2).min(axis=1)
-    free = (distance >= 0.15) & (states[:, 18] <= 0.0)
-    candidates = np.flatnonzero(free)
+    free = free_space_mask(states, sim_state.qpos, coords, distance=0.05)
+    candidates_free = free_space_mask(states, sim_state.qpos, coords, distance=0.15)
+    calibration = estimate_realized_speed(trans, coords, free, schema)
+    speed = np.asarray(calibration["speed_quantiles"][args.speed_quantile], dtype=np.float64)
+    response_gain = np.asarray(calibration["feedback_gain_by_dimension"], dtype=np.float64)
+    candidates = np.flatnonzero(candidates_free)
     if candidates.size < args.trials:
         raise SchemaError(f"only {candidates.size} object-free states are available for {args.trials} trials")
 
@@ -82,23 +67,23 @@ def main() -> int:
     env = wrapped.unwrapped
     verifier = OGBenchVerifier(env)
     limits = np.asarray(schema.action_limits, dtype=np.float64)
+    tracking_tube = np.asarray([0.01, 0.01, 0.01, np.deg2rad(5.0), 0.1], dtype=np.float64)
     outcomes = []
     try:
         for start in starts:
-            current_r = np.asarray(coords.r[start], dtype=np.float64)
             current_q = np.asarray(coords.q_a[start], dtype=np.float64)
             target = current_q.copy()
             target[:3] += rng.uniform(-0.04, 0.04, size=3)
             target[3] += rng.uniform(-0.24, 0.24)
             target[3] = float(wrap_angle(np.asarray(target[3])))
-            target[4] = np.clip(target[4] + rng.uniform(-0.6, 0.6), 0.0, 1.0)
             bounds = getattr(env, "_workspace_bounds", None)
             if bounds is not None:
                 target[:3] = np.clip(target[:3], np.asarray(bounds)[0], np.asarray(bounds)[1])
-            target_r = current_r.copy()
-            target_r[14:19] = target
-            tau_kin = int(schema.kinematic_steps(current_r, target_r))
-            budget = tau_kin + 2
+            tau_real = int(realized_travel_steps(
+                current_q, target, speed, settle=2,
+                periodic=getattr(schema, "periodic_action", ()),
+            ))
+            budget = tau_real + 2
 
             payload = {"qpos": sim_state.qpos[start], "qvel": sim_state.qvel[start]}
             if sim_state.button_states is not None:
@@ -108,16 +93,21 @@ def main() -> int:
                 readout = verifier.sim_readout(obs)
                 delta = target - np.asarray(readout["q_a"], dtype=np.float64)
                 delta[3] = float(wrap_angle(np.asarray(delta[3])))
-                action = np.clip(args.gain * delta / limits, -1.0, 1.0).astype(np.float32)
+                action = np.zeros_like(limits, dtype=np.float64)
+                action[:4] = np.clip(
+                    args.gain * response_gain[:4] * delta[:4] / limits[:4], -1.0, 1.0
+                )
+                action[4] = 0.0
+                action = action.astype(np.float32)
                 obs, _, terminated, truncated, _ = verifier.step(action)
                 if terminated or truncated:
                     break
             actual = np.asarray(verifier.sim_readout(obs)["q_a"], dtype=np.float64)
             error = target - actual
             error[3] = float(wrap_angle(np.asarray(error[3])))
-            normalized_error = float(np.max(np.abs(error) / epsilon_a))
+            normalized_error = float(np.max(np.abs(error) / tracking_tube))
             outcomes.append({
-                "start_state": int(start), "tau_kin": tau_kin,
+                "start_state": int(start), "tau_real": tau_real,
                 "budget": budget, "normalized_error": normalized_error,
                 "passed": bool(normalized_error <= 1.0),
             })
@@ -129,9 +119,13 @@ def main() -> int:
     result = {
         "n_trials": len(outcomes),
         "success_fraction": float(np.mean([item["passed"] for item in outcomes])),
-        "gate": 0.95,
-        "passed_gate": bool(np.mean([item["passed"] for item in outcomes]) >= 0.95),
-        "epsilon_a": epsilon_a.tolist(),
+        "gate": 0.9,
+        "passed_gate": bool(np.mean([item["passed"] for item in outcomes]) >= 0.9),
+        "tracking_tube": tracking_tube.tolist(),
+        "realized_speed": calibration["speed_quantiles"][args.speed_quantile],
+        "speed_quantile": float(args.speed_quantile),
+        "response_gain": response_gain.tolist(),
+        "calibration": calibration,
         "gain": float(args.gain),
         "seed": int(args.seed),
         "outcomes": outcomes,

@@ -74,6 +74,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gate-reachable", type=float, default=0.5)
     parser.add_argument("--gate-failed-reachable", type=float, default=0.3)
     parser.add_argument("--gate-path-exec", type=float, default=0.7)
+    parser.add_argument("--gate-profile", choices=("legacy", "v05"), default="legacy",
+                        help="legacy v0.4 gates or v0.5 necessary-only graph gates")
     return parser.parse_args(argv)
 
 
@@ -195,11 +197,30 @@ def main(argv: list[str] | None = None) -> int:
         bridge_use = float(graph_diagnostics["bridge_use_frac"])
         stitch_gain = float(graph_diagnostics["stitch_gain"]["frac_gt_1_step"])
         gate_reasons = []
-        if cap_frac > args.gate_cap_frac:
-            gate_reasons.append(f"valid non-success cap fraction {cap_frac:.4f} exceeds {args.gate_cap_frac:.4f}")
-        if reachable < args.gate_reachable:
-            gate_reasons.append(f"reachable fraction {reachable:.4f} is below {args.gate_reachable:.4f}")
-        if cfg.graph_kind == "state" and cfg.bridge.cost.policy == "time":
+        if args.gate_profile == "v05":
+            if cap_frac > 0.8:
+                gate_reasons.append(f"valid non-success cap fraction {cap_frac:.4f} exceeds 0.8000")
+            if failed_reachable <= 0.1:
+                gate_reasons.append(
+                    f"failed-episode reachable fraction {failed_reachable:.4f} "
+                    "must be greater than 0.1000"
+                )
+            if cfg.bridge.strategy in {"passive_r_real", "passive_r_strict", "passive_rm_real"}:
+                tau_check = artifact.meta.get("bridge_r_tau_real", {})
+                if int(tau_check.get("kinematic_violation_count", 0)) != 0:
+                    gate_reasons.append("at least one retained R bridge has tau_real < tau_kin")
+            if cfg.bridge.strategy in {"passive_rm", "passive_rm_real"} or cfg.bridge.include_m_bridges:
+                kin_violation = float(artifact.meta.get("bridge_tau_kinematic_violation", 1.0))
+                if kin_violation > 0.05:
+                    gate_reasons.append(
+                        f"M-bridge kinematic violation {kin_violation:.4f} exceeds 0.0500"
+                    )
+        else:
+            if cap_frac > args.gate_cap_frac:
+                gate_reasons.append(f"valid non-success cap fraction {cap_frac:.4f} exceeds {args.gate_cap_frac:.4f}")
+            if reachable < args.gate_reachable:
+                gate_reasons.append(f"reachable fraction {reachable:.4f} is below {args.gate_reachable:.4f}")
+        if args.gate_profile == "legacy" and cfg.graph_kind == "state" and cfg.bridge.enabled and cfg.bridge.cost.policy == "time":
             if failed_reachable < args.gate_failed_reachable:
                 gate_reasons.append(
                     f"failed-episode reachable fraction {failed_reachable:.4f} "
@@ -209,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
                 gate_reasons.append("no finite shortest path uses a bridge")
             if stitch_gain <= 0:
                 gate_reasons.append("no successful-episode state gains more than one step from stitching")
-        if cfg.bridge.strategy == "passive_rm":
+        if args.gate_profile == "legacy" and cfg.bridge.strategy == "passive_rm":
             kin_violation = float(artifact.meta.get("bridge_tau_kinematic_violation", 1.0))
             if kin_violation > 0.05:
                 gate_reasons.append(

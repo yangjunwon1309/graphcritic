@@ -20,6 +20,7 @@ from graphcritic.io import load_graph, load_sim_state, load_targets, load_transi
 from graphcritic.diagnostics import report as graph_report
 from graphcritic.path import GraphTrackingPolicy, extract_path
 from graphcritic.modes import smooth_mode_changes, state_episode_time
+from graphcritic.physical_time import estimate_realized_speed, free_space_mask
 from graphcritic.servo import ServoTrackingPolicy
 from graphcritic.state_schema import estimate_passive_tolerance, get_state_schema
 from graphcritic.types import SchemaError
@@ -73,12 +74,18 @@ def main() -> int:
     parser.add_argument("--env", help="OGBench Gymnasium environment ID (derived from --ogbench-dataset when omitted)")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--targets", type=Path, help="Optional targets pair used for the graph-only cap gate")
+    parser.add_argument("--free-space-result", type=Path,
+                        help="JSON from eval_servo_free_space.py, used by the v0.5 witness gate")
+    parser.add_argument("--bridge-landing-result", type=Path,
+                        help="JSON from eval_strict_bridges.py, used by the R_strict connection gate")
     parser.add_argument("--starts", type=int, default=500)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--window", type=int, default=10)
     parser.add_argument("--controller", choices=("replay", "servo", "ff+servo"), default="replay")
     parser.add_argument("--feedback-gain", choices=(0.5, 1.0, 1.5, 2.0, 3.0), type=float, default=1.0,
                         help="pose feedback gain for servo; additive gain for ff+servo")
+    parser.add_argument("--contact-gain", choices=(0.3, 0.5), type=float, default=0.3,
+                        help="recorded-action correction gain for contact segments")
     parser.add_argument(
         "--bridge-tube-dstep", type=float, default=1.0,
         help="bridge arrival tube radius as a multiple of graph d_step (default: 1)",
@@ -120,6 +127,7 @@ def main() -> int:
         aux["button_states"] = sim_state.button_states
     policy = None
     servo_policy = None
+    witness_calibration = None
     if args.controller == "replay":
         state_features = featurizer.transform(states, aux=aux)
         policy = GraphTrackingPolicy(
@@ -141,6 +149,14 @@ def main() -> int:
         coordinates = replace(
             coordinates, mode=smooth_modes,
         )
+        free = free_space_mask(
+            states, sim_state.qpos, coordinates,
+            distance=artifact.config.bridge.free_distance,
+        )
+        witness_calibration = estimate_realized_speed(trans, coordinates, free, schema)
+        response_gain = np.asarray(
+            witness_calibration["feedback_gain_by_dimension"], dtype=np.float64
+        )
         epsilon_p = artifact.meta.get("bridge_passive_epsilon")
         if epsilon_p is None:
             contact = states[:, 18] > 0 if schema_name == "ogbench_scene" and states.shape[1] > 18 else None
@@ -152,6 +168,8 @@ def main() -> int:
             artifact, trans, schema, coordinates,
             mode=args.controller, window=args.window,
             epsilon_p=np.asarray(epsilon_p), feedback_gain=args.feedback_gain,
+            response_gain=response_gain, contact_gain=args.contact_gain,
+            free_distance=artifact.config.bridge.free_distance,
         )
     starts = _choose_starts(trans, artifact, count, args.seed)
 
@@ -416,6 +434,100 @@ def main() -> int:
                 "success_cost_time_spearman": rank},
         "passed": not graph_gate_reasons and not sim_gate_reasons,
     } if servo_policy is not None else None
+    v05_gates = None
+    if servo_policy is not None:
+        graph_reasons = []
+        if cap_fraction is None or float(cap_fraction) > 0.8:
+            graph_reasons.append("valid non-success cap fraction exceeds 0.8 or is unavailable")
+        if graph_diagnostics["reachable_frac_failed_eps"] <= 0.1:
+            graph_reasons.append("failed-episode reachable fraction must be greater than 0.1")
+        if artifact.config.bridge.strategy in {"passive_r_real", "passive_r_strict", "passive_rm_real"}:
+            tau_report = artifact.meta.get("bridge_r_tau_real", {})
+            if tau_report.get("n", 0) and tau_report.get("kinematic_violation_count", 0) != 0:
+                graph_reasons.append("retained R bridge has tau_real below tau_kin")
+            elif tau_report.get("n", 0) == 0 and np.any(artifact.edges.kind == 1):
+                graph_reasons.append("tau_real versus tau_kin audit is unavailable")
+        if has_m_bridges and (kin_violation is None or float(kin_violation) > 0.05):
+            graph_reasons.append("M-bridge kinematic violation exceeds 0.05 or is unavailable")
+        graph_stage_passed = not graph_reasons
+
+        free_space_result = None
+        free_space_read_error = None
+        if args.free_space_result is not None:
+            try:
+                free_space_result = json.loads(args.free_space_result.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                free_space_read_error = f"cannot read free-space result: {exc}"
+        witness_reasons = []
+        if free_space_read_error is not None:
+            witness_reasons.append(free_space_read_error)
+        free_fraction = None if free_space_result is None else float(free_space_result.get("success_fraction", 0.0))
+        if free_fraction is None or free_fraction < 0.9:
+            witness_reasons.append("free-space arrival within tau_real+2 is below 0.9 or unavailable")
+        if zero_rate is None or zero_rate < 0.614:
+            witness_reasons.append("zero-bridge success is below replay baseline 0.614 or unavailable")
+        witness_stage_passed = graph_stage_passed and not witness_reasons
+
+        accuracy_reasons = []
+        r_landing_rate = bridge_landing_by_type.get("R", {}).get("landing_rate")
+        strict_single_r_records = [
+            record
+            for item in outcomes if int(item["planned_bridges"]) == 1
+            for record in item.get("bridge_landing", [])
+            if int(record.get("bridge_type", -1)) == 0
+        ]
+        strict_single_r_landing_rate = (
+            float(np.mean([bool(record.get("landed")) for record in strict_single_r_records]))
+            if strict_single_r_records else None
+        )
+        direct_bridge_result = None
+        if args.bridge_landing_result is not None:
+            try:
+                direct_bridge_result = json.loads(
+                    args.bridge_landing_result.read_text(encoding="utf-8")
+                )
+                strict_single_r_landing_rate = float(direct_bridge_result["landing_rate"])
+            except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                accuracy_reasons.append(f"cannot read direct R_strict landing result: {exc}")
+        if relative_retention is None or relative_retention < 0.5:
+            accuracy_reasons.append("bridge retention for 1-3 bridges is below 0.5 or unavailable")
+        if artifact.config.bridge.strategy == "passive_r_strict" and (
+            strict_single_r_landing_rate is None or strict_single_r_landing_rate < 0.8
+        ):
+            accuracy_reasons.append("R_strict one-bridge-path landing is below 0.8 or unavailable")
+        if rank is None or rank < 0.6:
+            accuracy_reasons.append("cost versus actual-time Spearman is below 0.6 or unavailable")
+        accuracy_evaluated = witness_stage_passed
+        v05_gates = {
+            "graph_necessary_conditions": {
+                "passed": graph_stage_passed,
+                "reasons": graph_reasons,
+                "valid_non_success_cap_fraction": cap_fraction,
+                "reachable_frac_failed_eps": graph_diagnostics["reachable_frac_failed_eps"],
+                "tau_real_kinematic_violation_count": artifact.meta.get("bridge_r_tau_real", {}).get("kinematic_violation_count"),
+                "M_kinematic_violation": kin_violation,
+            },
+            "witness_normal": {
+                "passed": witness_stage_passed,
+                "reasons": witness_reasons,
+                "free_space_arrival_fraction": free_fraction,
+                "zero_bridge_success": zero_rate,
+                "replay_baseline": 0.614,
+            },
+            "connection_accuracy": {
+                "evaluated": accuracy_evaluated,
+                "passed": accuracy_evaluated and not accuracy_reasons,
+                "reasons": accuracy_reasons if accuracy_evaluated else ["not evaluated because graph or witness-normal stage failed"],
+                "bridge_retention_1_to_3": relative_retention,
+                "R_bridge_landing_rate": r_landing_rate,
+                "R_strict_single_bridge_path_landing_rate": strict_single_r_landing_rate,
+                "R_strict_direct_landing_trials": (
+                    None if direct_bridge_result is None else direct_bridge_result.get("trials")
+                ),
+                "cost_time_spearman": rank,
+            },
+            "passed": graph_stage_passed and witness_stage_passed and not accuracy_reasons,
+        }
     if servo_policy is not None:
         bridge_targets_reached = sum(
             bool(record.get("landed"))
@@ -441,6 +553,8 @@ def main() -> int:
         "bridge_targets_reached": bridge_targets_reached,
         "bridge_targets_unreached": bridge_targets_unreached,
         "controller": args.controller,
+        "contact_gain": float(args.contact_gain),
+        "witness_calibration": witness_calibration,
         "zero_bridge_success": zero_rate,
         "zero_bridge_starts": int(zero_bridge["n"]),
         "bridge_success_1_to_3": bridged_rate,
@@ -455,6 +569,7 @@ def main() -> int:
         "bridge_landing_by_type": bridge_landing_by_type,
         "graph_diagnostics": graph_diagnostics,
         "v04_gates": v04_gates,
+        "v05_gates": v05_gates,
         "outcomes": outcomes,
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)

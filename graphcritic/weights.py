@@ -26,11 +26,14 @@ def edge_weights(
             if policy == "time":
                 # v0.4 R/M bridges already carry a physical time estimate;
                 # their cost is exactly c*tau and has no additive prior.
-                lambda_bridge = (
-                    np.zeros(np.count_nonzero(bridge), dtype=np.float64)
-                    if cfg.bridge.strategy in {"passive_r", "passive_rm"}
-                    else c * cfg.bridge.cost.lambda0_steps
-                )
+                if cfg.bridge.strategy == "passive_r_strict":
+                    lambda_bridge = c * cfg.bridge.cost.lambda0_steps
+                elif cfg.bridge.strategy in {
+                    "passive_r", "passive_r_real", "passive_rm", "passive_rm_real"
+                }:
+                    lambda_bridge = np.zeros(np.count_nonzero(bridge), dtype=np.float64)
+                else:
+                    lambda_bridge = c * cfg.bridge.cost.lambda0_steps
             elif policy == "prior":
                 radius = (
                     cfg.bridge.radius * float(d_step)

@@ -12,6 +12,7 @@ from numpy.typing import NDArray
 from graphcritic.config import GraphConfig
 from graphcritic.types import (
     GRAPH_SCHEMA_VERSION,
+    LEGACY_GRAPH_SCHEMA_VERSION,
     SCHEMA_VERSION,
     EdgeSet,
     GraphArtifact,
@@ -69,7 +70,7 @@ def _read_pair(path: str | Path) -> tuple[dict[str, NDArray[Any]], dict[str, Any
         metadata = json.loads(json_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SchemaError(f"cannot read artifact metadata at {json_path}") from exc
-    if not isinstance(metadata, dict) or metadata.get("schema_version") not in {SCHEMA_VERSION, GRAPH_SCHEMA_VERSION}:
+    if not isinstance(metadata, dict) or metadata.get("schema_version") not in {SCHEMA_VERSION, LEGACY_GRAPH_SCHEMA_VERSION, GRAPH_SCHEMA_VERSION}:
         found = metadata.get("schema_version") if isinstance(metadata, dict) else None
         raise SchemaError(f"unsupported or missing schema_version: {found!r}")
     try:
@@ -248,7 +249,7 @@ def _graph_arrays(artifact: GraphArtifact) -> dict[str, NDArray[Any]]:
         "dataset_id": np.asarray(artifact.meta["dataset_id"]),
         "feature_checkpoint_sha256": np.asarray(checkpoint_hash),
     }
-    if artifact.schema_version == GRAPH_SCHEMA_VERSION:
+    if artifact.schema_version in {LEGACY_GRAPH_SCHEMA_VERSION, GRAPH_SCHEMA_VERSION}:
         arrays["bridge_type"] = artifact.edges.bridge_type
     tau_hash = artifact.meta.get("tau_model_sha256")
     if tau_hash is not None:
@@ -279,10 +280,10 @@ def save_graph(artifact: GraphArtifact, path: str | Path) -> str:
 def load_graph(path: str | Path, *, trans: TransitionSet | None = None) -> GraphArtifact:
     arrays, metadata = _read_pair(path)
     schema_version = metadata.get("schema_version")
-    if schema_version not in {SCHEMA_VERSION, GRAPH_SCHEMA_VERSION}:
-        raise SchemaError("graph artifact schema_version must be 0.3 or 0.4")
-    if schema_version == GRAPH_SCHEMA_VERSION and "bridge_type" not in arrays:
-        raise SchemaError("graph schema 0.4 requires the bridge_type edge array")
+    if schema_version not in {SCHEMA_VERSION, LEGACY_GRAPH_SCHEMA_VERSION, GRAPH_SCHEMA_VERSION}:
+        raise SchemaError("graph artifact schema_version must be 0.3, 0.4, or 0.5")
+    if schema_version in {LEGACY_GRAPH_SCHEMA_VERSION, GRAPH_SCHEMA_VERSION} and "bridge_type" not in arrays:
+        raise SchemaError(f"graph schema {schema_version} requires the bridge_type edge array")
     if schema_version == SCHEMA_VERSION and "bridge_type" in arrays:
         raise SchemaError("graph schema 0.3 cannot contain bridge_type")
     config_value = metadata.get("config")
@@ -317,7 +318,9 @@ def load_graph(path: str | Path, *, trans: TransitionSet | None = None) -> Graph
     )
     artifact = GraphArtifact(
         schema_version=metadata["schema_version"],
-        config=config,
+        # Preserve whether the v0.5 optional M-bridge field was present in the
+        # persisted config so GraphArtifact can verify legacy/new hash payloads.
+        config=config_value,
         feature_stats={"mean": arrays["feature_mean"], "std": arrays["feature_std"]},
         nodes=nodes,
         edges=edges,

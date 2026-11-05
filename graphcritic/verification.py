@@ -14,6 +14,7 @@ from graphcritic.modes import MODE_FNS
 from graphcritic.solve import solve
 from graphcritic.types import EdgeSet, NodeSet, SchemaError, SimStateSet, TransitionSet
 from graphcritic.state_schema import get_state_schema
+from graphcritic.physical_time import free_space_mask
 from graphcritic.weights import step_cost
 
 
@@ -368,6 +369,9 @@ class OGBenchVerifier:
         obs = np.asarray(observation, dtype=np.float32).reshape(1, -1)
         aux = {key: np.asarray(state[key]).reshape(1, -1) for key in ("qpos", "qvel", "button_states", "eef_position", "eef_yaw", "gripper_opening", "gripper_contact") if key in state}
         coordinates = get_state_schema("ogbench_scene").coordinates(obs, aux)
+        is_free = free_space_mask(
+            obs, aux["qpos"], coordinates, distance=0.05,
+        )
         return {
             **state,
             "observation": obs[0].copy(),
@@ -377,6 +381,7 @@ class OGBenchVerifier:
             "q_p": coordinates.q_p[0].copy(),
             "mode": coordinates.mode[0].copy(),
             "q_a": coordinates.q_a[0].copy(),
+            "free": np.asarray(is_free[0]),
         }
 
     def rollout(self, state: Mapping[str, NDArray], actions: NDArray) -> Mapping[str, Any]:

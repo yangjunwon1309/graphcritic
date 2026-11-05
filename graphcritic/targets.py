@@ -24,6 +24,7 @@ def critic_targets(
 
     n_rows = trans.n_rows
     valid = np.zeros(n_rows, dtype=np.bool_)
+    loss_mask = np.zeros(n_rows, dtype=np.bool_)
     source = np.full(n_rows, 3, dtype=np.uint8)
     n_starts = max(0, n_rows - h + 1)
     if n_starts:
@@ -41,24 +42,77 @@ def critic_targets(
         has_success = np.any(success_window, axis=1)
         first_success = np.argmax(success_window, axis=1)
         endpoint_rows = starts + h - 1
+        start_nodes = artifact.nodes.assign_cur[starts]
         endpoint_nodes = artifact.nodes.assign_next[endpoint_rows]
-        remaining = np.minimum(artifact.cost[endpoint_nodes] / c, c_max_steps)
-        values = h + remaining
-        values[has_success] = first_success[has_success] + 1.0
+        start_raw = np.asarray(artifact.cost[start_nodes], dtype=np.float64) / c
+        end_raw = np.asarray(artifact.cost[endpoint_nodes], dtype=np.float64) / c
+        start_finite = np.isfinite(start_raw) & (start_raw < c_max_steps)
+        end_finite = np.isfinite(end_raw) & (end_raw < c_max_steps)
+        start_cost = np.minimum(start_raw, c_max_steps)
+        end_cost = np.minimum(end_raw, c_max_steps)
+        start_cost[~np.isfinite(start_cost)] = c_max_steps
+        end_cost[~np.isfinite(end_cost)] = c_max_steps
 
-        # Preserve the explicit current-state success label, including states
-        # at a sampler-segment boundary after sticky success rows.
-        values[trans.success_cur[:n_starts]] = 0.0
         chunk_success = has_success | trans.success_cur[:n_starts]
-        graph_used = (
-            ~chunk_success
-            & np.isfinite(artifact.cost[endpoint_nodes])
-            & (artifact.cost[endpoint_nodes] / c < c_max_steps)
-        )
-        clipped = valid[:n_starts] & ~chunk_success & ~graph_used
-        source[:n_starts][valid[:n_starts] & chunk_success] = 0
-        source[:n_starts][graph_used & valid[:n_starts]] = 1
-        source[:n_starts][clipped] = 2
+        values = np.zeros(n_starts, dtype=np.float64)
+        if cfg.kind == "cost":
+            values = h + end_cost
+            values[has_success] = first_success[has_success] + 1.0
+            # Preserve the explicit current-state success label, including
+            # states at a sampler-segment boundary after sticky success rows.
+            values[trans.success_cur[:n_starts]] = 0.0
+            graph_used = ~chunk_success & end_finite
+            capped = valid[:n_starts] & ~chunk_success & ~end_finite
+            source[:n_starts][valid[:n_starts] & chunk_success] = 0
+            source[:n_starts][graph_used & valid[:n_starts]] = 1
+            source[:n_starts][capped] = 2
+            loss_mask[:n_starts] = valid[:n_starts]
+        else:
+            # A temporal path of h edges from the chunk start to endpoint
+            # makes C(start) <= h + C(end). A finite endpoint behind a
+            # capped start therefore signals a broken graph/target invariant.
+            impossible = valid[:n_starts] & ~start_finite & end_finite
+            if np.any(impossible):
+                rows = np.flatnonzero(impossible)[:8].tolist()
+                raise SchemaError(
+                    "regret property 1 violated: start cost is capped while endpoint is finite "
+                    f"(rows {rows})"
+                )
+
+            finite_pair = start_finite & end_finite & ~chunk_success
+            capped_end = start_finite & ~end_finite & ~chunk_success
+            both_capped = ~start_finite & ~end_finite & ~chunk_success
+            success_rows = valid[:n_starts] & chunk_success
+            finite_success = success_rows & start_finite
+            if np.any(success_rows & ~start_finite):
+                rows = np.flatnonzero(success_rows & ~start_finite)[:8].tolist()
+                raise SchemaError(
+                    "regret property 1 violated: success chunk starts at capped graph cost "
+                    f"(rows {rows})"
+                )
+
+            values[finite_pair] = h + end_cost[finite_pair] - start_cost[finite_pair]
+            values[capped_end] = cfg.regret_max
+            success_steps = first_success.astype(np.float64) + 1.0
+            success_steps[trans.success_cur[:n_starts]] = 0.0
+            values[finite_success] = success_steps[finite_success] - start_cost[finite_success]
+
+            # Allow only floating-point roundoff below zero; anything larger
+            # would contradict the temporal shortest-path triangle inequality.
+            finite_labels = finite_pair | finite_success
+            violations = valid[:n_starts] & finite_labels & (values < -1e-5)
+            if np.any(violations):
+                rows = np.flatnonzero(violations)[:8].tolist()
+                raise SchemaError(f"regret property 1 violated: negative regret at rows {rows}")
+            values[finite_labels & (values < 0.0)] = 0.0
+            values = np.minimum(values, cfg.regret_max)
+
+            source[:n_starts][finite_success] = 0
+            source[:n_starts][valid[:n_starts] & finite_pair] = 1
+            source[:n_starts][valid[:n_starts] & capped_end] = 2
+            source[:n_starts][valid[:n_starts] & both_capped] = 4
+            loss_mask[:n_starts] = valid[:n_starts] & ~both_capped
+
         y_steps = np.zeros(n_rows, dtype=np.float64)
         y_steps[:n_starts] = np.where(valid[:n_starts], values, 0.0)
     else:
@@ -75,6 +129,9 @@ def critic_targets(
         graph_hash=artifact.content_hash,
         dataset_id=str(artifact.meta["dataset_id"]),
         source=source,
+        kind=cfg.kind,
+        loss_mask=loss_mask,
+        regret_max=cfg.regret_max,
     )
     targets.validate(trans)
     return targets

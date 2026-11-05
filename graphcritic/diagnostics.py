@@ -162,6 +162,7 @@ def report(
         "merge_ratio": float(n_states / max(1, n_nodes)),
         "n_goal_nodes": int(np.count_nonzero(artifact.nodes.is_goal)),
         "n_success_episodes": int(len(successful_episodes)),
+        "n_failed_episodes": int(len(failed_episode_rows)),
         "reachable_frac": reachable_frac,
         "reachable_frac_failed_eps": (
             float(np.mean(np.isfinite(artifact.cost[artifact.nodes.assign_cur[np.concatenate(failed_episode_rows)]])))
@@ -215,6 +216,14 @@ def report(
                 }
                 for label, code in (("R", 0), ("M", 1))
             },
+            "puzzle_press_calibration": artifact.meta.get("bridge_puzzle_press_calibration"),
+            "puzzle_tau_real": artifact.meta.get("bridge_puzzle_tau_real"),
+            "puzzle_bucket_sizes": artifact.meta.get("bridge_puzzle_bucket_sizes"),
+            "puzzle_candidate_search": artifact.meta.get("bridge_candidate_search"),
+            "puzzle_free_state_fraction": artifact.meta.get("bridge_free_state_fraction"),
+            "puzzle_tau_max_steps": artifact.meta.get("bridge_tau_max_steps"),
+            "puzzle_success_rho": artifact.meta.get("bridge_success_rho"),
+            "puzzle_lambda_rho_steps": artifact.meta.get("bridge_lambda_rho_steps"),
         },
         "modes": {
             "count": artifact.meta.get("n_mode_values", 1),
@@ -249,7 +258,7 @@ def report(
         valid_count = int(np.count_nonzero(valid))
         mix = {
             str(code): float(np.count_nonzero(valid & (source == code)) / max(1, valid_count))
-            for code in (0, 1, 2)
+            for code in (0, 1, 2, 4)
         }
         graph_target = valid & (source == 1)
         cap_pool = valid & (source != 0)
@@ -263,7 +272,9 @@ def report(
             "y_mean": float(np.mean(valid_y)) if valid_y.size else 0.0,
             "y_p50": q(valid_y, 50), "y_p95": q(valid_y, 95),
             "y_max": float(np.max(valid_y)) if valid_y.size else 0.0,
-            "frac_at_cmax": float(np.mean(valid_y >= cap_value - 1e-6)) if valid_y.size else 0.0,
+            "frac_at_cmax": (
+                float(np.mean(valid_y >= cap_value - 1e-6)) if valid_y.size else 0.0
+            ) if targets.kind == "cost" else None,
             "target_mix": mix,
             "y_graph_q": {"p5": q(graph_y, 5), "p50": q(graph_y, 50), "p95": q(graph_y, 95)},
             "valid_non_success_cap_frac": (
@@ -271,4 +282,48 @@ def report(
                 if np.count_nonzero(cap_pool) else 0.0
             ),
         }
+        if targets.kind == "regret":
+            train_rows = valid & targets.loss_mask
+            regret = targets.y[train_rows].astype(np.float64)
+            max_value = targets.regret_max * (c if targets.unit == "nats" else 1.0)
+            starts = np.arange(max(0, n_rows - targets.h + 1), dtype=np.int64)
+            if starts.size:
+                endpoint_rows = starts + targets.h - 1
+                start_cost = artifact.cost[artifact.nodes.assign_cur[starts]] / c
+                end_cost = artifact.cost[artifact.nodes.assign_next[endpoint_rows]] / c
+                cmax = float(artifact.meta["c_max_steps"])
+                start_finite = np.isfinite(start_cost) & (start_cost < cmax)
+                end_finite = np.isfinite(end_cost) & (end_cost < cmax)
+                audited = valid[starts]
+                impossible = audited & ~start_finite & end_finite
+                success_steps = np.zeros(starts.size, dtype=np.float64)
+                window = np.stack(
+                    [trans.success[offset : offset + starts.size] for offset in range(targets.h)],
+                    axis=1,
+                )
+                has_success = np.any(window, axis=1)
+                success_steps[has_success] = np.argmax(window[has_success], axis=1) + 1
+                success_steps[trans.success_cur[starts]] = 0.0
+                success_row = (source[starts] == 0) & audited
+                success_violation = success_row & (start_finite == 0) | (
+                    success_row & (start_cost > success_steps + 1e-8)
+                )
+                finite_edge = (source[starts] == 1) & audited
+                temporal_violation = finite_edge & (start_cost > targets.h + end_cost + 1e-8)
+                property_violations = int(np.count_nonzero(impossible | success_violation | temporal_violation))
+            else:
+                property_violations = 0
+            graph_result["targets"].update({
+                "kind": "regret",
+                "regret_loss_mask_frac": float(np.mean(targets.loss_mask[valid])) if valid_count else 0.0,
+                "regret_excluded_both_capped": int(np.count_nonzero(valid & (source == 4))),
+                "regret_p50": q(regret, 50),
+                "regret_p90": q(regret, 90),
+                "regret_zero_frac": float(np.mean(regret <= 1e-6)) if regret.size else 0.0,
+                "regret_rmax_frac": float(np.mean(regret >= max_value - 1e-5)) if regret.size else 0.0,
+                "regret_max": float(max_value),
+                "property_1_violation_count": property_violations,
+            })
+        else:
+            graph_result["targets"].update({"kind": "cost", "loss_mask_frac": float(np.mean(targets.loss_mask[valid])) if valid_count else 0.0})
     return graph_result

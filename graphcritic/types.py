@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 SCHEMA_VERSION = "0.3"
 LEGACY_GRAPH_SCHEMA_VERSION = "0.4"
 GRAPH_SCHEMA_VERSION = "0.5"
+TARGET_SCHEMA_VERSION = "0.6"
 
 
 class SchemaError(ValueError):
@@ -686,6 +687,9 @@ class TargetSet:
     graph_hash: str
     dataset_id: str
     source: NDArray[np.uint8] | None = None
+    kind: str = "cost"
+    loss_mask: NDArray[np.bool_] | None = None
+    regret_max: float = 50.0
 
     def __post_init__(self) -> None:
         self.y = _array(self.y, np.float32, "y")
@@ -694,22 +698,45 @@ class TargetSet:
             self.source = np.where(self.valid, 1, 3).astype(np.uint8)
         else:
             self.source = _array(self.source, np.uint8, "source")
+        if self.loss_mask is None:
+            self.loss_mask = self.valid.copy()
+        else:
+            self.loss_mask = _array(self.loss_mask, np.bool_, "loss_mask")
         if isinstance(self.h, bool) or not isinstance(self.h, Integral):
             raise SchemaError("h must be an integer")
         self.h = int(self.h)
         self.validate()
 
     def validate(self, trans: TransitionSet | None = None) -> None:
-        if self.y.ndim != 1 or self.valid.shape != self.y.shape or self.source.shape != self.y.shape:
-            raise SchemaError("y, valid, and source must be equally sized one-dimensional arrays")
+        if (self.y.ndim != 1 or self.valid.shape != self.y.shape
+                or self.source.shape != self.y.shape or self.loss_mask.shape != self.y.shape):
+            raise SchemaError("y, valid, source, and loss_mask must be equally sized one-dimensional arrays")
         if not np.all(np.isfinite(self.y)) or np.any(self.y < 0):
             raise SchemaError("targets must be finite and non-negative")
         if np.any(self.y[~self.valid] != 0):
             raise SchemaError("invalid targets must be filled with zero")
-        if np.any(~np.isin(self.source, (0, 1, 2, 3))):
-            raise SchemaError("source codes must be 0 (chunk success), 1 (graph), 2 (cap), or 3 (invalid)")
+        if np.any(~np.isin(self.source, (0, 1, 2, 3, 4))):
+            raise SchemaError("source codes must be 0 (success), 1 (finite graph), 2 (capped endpoint), 3 (invalid), or 4 (both capped)")
         if np.any(self.source[~self.valid] != 3) or np.any(self.source[self.valid] == 3):
             raise SchemaError("source code 3 must correspond exactly to invalid targets")
+        if np.any(self.loss_mask & ~self.valid):
+            raise SchemaError("loss_mask must be a subset of valid QC chunks")
+        if not np.array_equal(self.valid & (self.source == 4), self.valid & ~self.loss_mask):
+            raise SchemaError("source code 4 must identify rows excluded from target loss")
+        if np.any((self.source == 4) & self.loss_mask):
+            raise SchemaError("source code 4 (both endpoints capped) must have loss_mask=0")
+        if np.any(self.y[self.source == 4] != 0):
+            raise SchemaError("source code 4 (both endpoints capped) must use the zero placeholder target")
+        if self.kind not in {"cost", "regret"}:
+            raise SchemaError("target kind must be 'cost' or 'regret'")
+        if self.kind == "cost" and (np.any(self.source == 4) or not np.array_equal(self.loss_mask, self.valid)):
+            raise SchemaError("cost targets cannot contain excluded both-capped rows")
+        if (not isinstance(self.regret_max, (int, float)) or not np.isfinite(self.regret_max)
+                or self.regret_max <= 0):
+            raise SchemaError("regret_max must be finite and positive")
+        if (self.kind == "regret" and self.unit == "steps"
+                and np.any(self.y[self.loss_mask] > self.regret_max + 1e-4)):
+            raise SchemaError("regret targets cannot exceed regret_max")
         if self.h < 1:
             raise SchemaError("h must be at least one")
         if self.unit not in {"steps", "nats"}:

@@ -145,7 +145,7 @@ def test_target_provenance_and_schema_three_sidecars_round_trip(tmp_path):
     trans = _trajectories()
     cfg = _config()
     artifact = build_artifact(trans, cfg, dataset_id="roundtrip", source="test")
-    target = critic_targets(trans, artifact, TargetConfig(h=3, unit="steps"))
+    target = critic_targets(trans, artifact, TargetConfig(h=3, unit="steps", kind="cost"))
     assert set(np.unique(target.source)).issubset({0, 1, 2, 3})
     graph_path = tmp_path / "graph.npz"
     save_graph(artifact, graph_path)

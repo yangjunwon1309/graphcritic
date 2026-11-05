@@ -1,6 +1,18 @@
 # Benchmark environment and fork notes
 
-Status date: 2026-11-04. The `bench` Pixi environment is Linux x86_64 only. It keeps the benchmark stack separate from the project's NumPy 1/2 core environments.
+Status date: 2026-11-05. The `bench` Pixi environment is Linux x86_64 only. It keeps the benchmark stack separate from the project's NumPy 1/2 core environments.
+
+## v0.6 regret targets and OGBench Puzzle (2026-11-05)
+
+- Graph targets use schema 0.6, default to non-negative chunk regret, and store a separate `loss_mask`; rows with both endpoint costs capped remain QC-valid but do not train the critic. Graph artifacts remain schema 0.5 and retain their previous format.
+- The QC worktree is based on submodule commit `ce81e33`. Its local v0.6 changes validate target kind and explicit loss-mask provenance, attach both graph masks to sampled chunk starts, regress `softplus(Q)` on masked regret targets, log masked batch Spearman, and leave actor selection on the negative ensemble maximum. The edits are currently uncommitted in the submodule.
+- `envs/ogbench.py` has a Puzzle-specific data path that reads the task's static button goal and QC-aligned arrays without constructing or stepping a MuJoCo simulator. The simulator remains available only to the separate servo/witness evaluations.
+- `experiments/inspect_puzzle.py` opens standard play archives through QC's `load_dataset`, verifies sidecar/observation alignment, and measures button-configuration connectivity and Lights Out press counts for all five task definitions.
+- `graphcritic.puzzle` contains the simulator-free GF(2) solver, minimum-press enumerator, and button-state transition helpers. `graphcritic.puzzle_bridges` searches R edges inside exact discrete-board buckets and records realized-time and bucket diagnostics.
+- `experiments/gen_puzzle_task_data.py` implements the conditional P13 task-directed data branch with the official noisy button oracle, seeded GF(2) solutions, paired detours, optional post-success play, standard-data mixing, and script/config/seed provenance. Its transition budget counts QC-usable actions and writes a separate terminal-only final state for each episode.
+- Generated immutable archives can be passed to `experiments/build_graph.py --ogbench-dataset ... --dataset-path ...`; the adjacent JSON tag and SHA are verified and included in the graph dataset ID. QC accepts the same path through `--ogbench_dataset_path` for graph-target training without dataset replacement.
+- Puzzle actuator calibration and simulator witnesses use `--schema ogbench_puzzle`. The replay baseline is matched by graph, data, seed, and exact start-selection hash before puzzle witness-normal gates are assessed.
+- Bench-only QC plumbing checks live in `third_party/qc/tests/test_graph_targets.py`; run with `JAX_PLATFORM_NAME=cpu pixi run -e bench pytest -q third_party/qc/tests/test_graph_targets.py`.
 
 ## v0.3 Scene observation and replay findings (2026-11-04)
 
@@ -14,7 +26,7 @@ The first 100 deterministic-reset trials initially matched bitwise in only 93%. 
 
 | Component | Source / version | Use |
 | --- | --- | --- |
-| QC | `third_party/qc`, commit `48283b4f662bd1c127ec9fa80647b49759f10653` | Main benchmark runner, dataset loaders, QC and QC-FQL agents |
+| QC | `third_party/qc`, v0.6 working tree based on `ce81e33` | Main benchmark runner, dataset loaders, QC and QC-FQL agents |
 | FQL | `third_party/fql`, commit `e8cd16eb490332924dfa2492097219f181765933` | Pinned upstream reference; the Kitchen environment is excluded for the dependency conflict below |
 | Python | Pixi `3.11.*` (resolved in `pixi.lock`) | Bench interpreter |
 | QC requirements | Exact versions from `third_party/qc/requirements.txt` | JAX, CUDA 12 wheels, NumPy, SciPy, OGBench, Gymnasium, MuJoCo and QC runtime |

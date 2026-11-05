@@ -16,6 +16,7 @@ from graphcritic.config import GraphConfig
 from graphcritic.featurize import state_table
 from graphcritic.modes import resolve_state_modes, state_episode_time
 from graphcritic.passive_bridges import build_passive_bridges
+from graphcritic.puzzle_bridges import build_puzzle_bridges
 from graphcritic.segments import contract_segments
 from graphcritic.tau_model import FrameGapModel
 from graphcritic.types import EdgeSet, NodeSet, SchemaError, SimStateSet, TransitionSet
@@ -662,7 +663,7 @@ def build_state_graph(
     cost_meta: dict[str, Any] = {"bridge_cost_policy": cfg.bridge.cost.policy}
     bridge_type_b = np.full(0, -1, dtype=np.int8)
     manual_bridges = cfg.bridge.strategy in {
-        "passive_r", "passive_r_real", "passive_r_strict", "passive_rm", "passive_rm_real"
+        "passive_r", "passive_r_real", "passive_r_strict", "passive_rm", "passive_rm_real", "puzzle_r"
     }
     if not cfg.bridge.enabled:
         src_b = dst_b = anchor_b = kappa_b = np.empty(0, dtype=np.int64)
@@ -671,6 +672,13 @@ def build_state_graph(
         n_pos_b = n_neg_b = np.empty(0, dtype=np.int64)
         bridge_meta = {"bridge_enabled": False, "bridge_type_counts": {"R": 0, "M": 0}}
         cost_meta["bridge_cost_policy"] = "disabled"
+    elif cfg.bridge.strategy == "puzzle_r":
+        (
+            src_b, dst_b, dist_b, anchor_b, kappa_b, bridge_type_b, modes, bridge_meta
+        ) = build_puzzle_bridges(trans, states, success, cfg, sim_state)
+        n_pos_b = np.zeros(src_b.size, dtype=np.int64)
+        n_neg_b = np.zeros(src_b.size, dtype=np.int64)
+        cost_meta["bridge_cost_policy"] = "puzzle_realized_time_plus_rho"
     elif manual_bridges:
         (
             src_b, dst_b, dist_b, anchor_b, kappa_b, bridge_type_b, modes, bridge_meta

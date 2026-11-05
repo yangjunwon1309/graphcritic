@@ -1,4 +1,4 @@
-"""Estimate v0.5 free-space response and tau_real from saved Scene data."""
+"""Estimate free-space actuator response and tau_real from saved transitions."""
 
 from __future__ import annotations
 
@@ -22,7 +22,11 @@ from graphcritic.physical_time import (
     free_space_mask,
     realized_time_validation,
 )
-from graphcritic.state_schema import get_state_schema
+from graphcritic.state_schema import (
+    OGBenchPuzzleStateSchema,
+    estimate_puzzle_press_height,
+    get_state_schema,
+)
 from graphcritic.types import SchemaError
 
 
@@ -35,6 +39,7 @@ def main() -> int:
     parser.add_argument("--settle", type=int, default=2)
     parser.add_argument("--pairs", type=int, default=50_000)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--schema", choices=("ogbench_scene", "ogbench_puzzle"), default="ogbench_scene")
     args = parser.parse_args()
     if args.distance <= 0 or args.settle < 0 or args.pairs < 1:
         parser.error("distance/pairs must be positive and settle non-negative")
@@ -43,15 +48,39 @@ def main() -> int:
     sim_state = load_sim_state(args.sim_state)
     states, _, success, _ = state_table(trans)
     sim_state.validate(states.shape[0])
-    schema = get_state_schema("ogbench_scene")
     aux = {"qpos": sim_state.qpos, "qvel": sim_state.qvel}
     if sim_state.button_states is not None:
         aux["button_states"] = sim_state.button_states
-    coordinates = schema.coordinates(states, aux)
     episode, times = state_episode_time(trans)
-    free = free_space_mask(states, sim_state.qpos, coordinates, distance=args.distance)
+    if args.schema == "ogbench_puzzle":
+        if sim_state.button_states is None:
+            raise SchemaError("puzzle calibration requires the button_states sidecar")
+        final_rows = np.flatnonzero(trans.terminal)
+        next_state_ids = np.empty(trans.n_rows, dtype=np.int64)
+        nonterminal_rows = np.flatnonzero(~trans.terminal)
+        next_state_ids[nonterminal_rows] = nonterminal_rows + 1
+        next_state_ids[final_rows] = trans.n_rows + np.arange(final_rows.size, dtype=np.int64)
+        press_fit = estimate_puzzle_press_height(
+            trans.feat, sim_state.button_states[: trans.n_rows],
+            next_observations=trans.next_feat,
+            next_button_states=sim_state.button_states[next_state_ids],
+        )
+        schema = OGBenchPuzzleStateSchema(press_height=float(press_fit["press_height_m"]))
+        coordinates = schema.coordinates(states, aux)
+        free = coordinates.mode == 0
+        static = None
+        grasped = np.zeros(states.shape[0], dtype=np.bool_)
+    else:
+        press_fit = None
+        schema = get_state_schema("ogbench_scene")
+        coordinates = schema.coordinates(states, aux)
+        free = free_space_mask(states, sim_state.qpos, coordinates, distance=args.distance)
+        static = estimate_static_articulation_tolerance(
+            coordinates.q_p, episode, times, free,
+        )
+        static["epsilon"] = np.asarray(static["epsilon"]).tolist()
+        grasped = coordinates.mode // 64 > 0
     observed_contact = states[:, 18] > 0.0
-    grasped = coordinates.mode // 64 > 0
     non_success_source = ~success
     r_source_free = non_success_source & free
     response = estimate_realized_speed(trans, coordinates, free, schema)
@@ -60,11 +89,8 @@ def main() -> int:
         trans, coordinates, free, speed95, schema,
         seed=args.seed, max_pairs=args.pairs, settle=args.settle,
     )
-    static = estimate_static_articulation_tolerance(
-        coordinates.q_p, episode, times, free,
-    )
-    static["epsilon"] = np.asarray(static["epsilon"]).tolist()
     result = {
+        "state_schema": args.schema,
         "dataset_id": transition_meta["dataset_id"],
         "free_state_count": int(np.count_nonzero(free)),
         "free_state_fraction": float(np.mean(free)),
@@ -84,6 +110,7 @@ def main() -> int:
         "real_settle_steps": args.settle,
         "response": response,
         "same_episode_validation": validation,
+        "puzzle_press_height_calibration": press_fit,
         "static_articulation_tolerance": static,
         "simulator_used": False,
         "td_checkpoint_used": False,

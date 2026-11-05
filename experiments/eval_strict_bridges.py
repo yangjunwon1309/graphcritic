@@ -1,4 +1,4 @@
-"""Direct simulator landing check for sampled v0.5 R_strict bridges."""
+"""Direct simulator landing check for sampled R bridge edges."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import numpy as np
 from graphcritic.featurize import state_table
 from graphcritic.io import load_graph, load_sim_state, load_transitions
 from graphcritic.physical_time import estimate_realized_speed, free_space_mask
-from graphcritic.state_schema import get_state_schema, passive_difference, wrap_angle
+from graphcritic.state_schema import OGBenchPuzzleStateSchema, get_state_schema, passive_difference, wrap_angle
 from graphcritic.types import SchemaError
 from graphcritic.verification import OGBenchVerifier
 
@@ -40,24 +40,35 @@ def main() -> int:
     states = state_table(trans)[0]
     sim_state.validate(states.shape[0])
     graph = load_graph(args.graph, trans=trans)
-    if graph.config.bridge.strategy != "passive_r_strict":
-        raise SchemaError("direct R landing evaluation requires a passive_r_strict graph")
+    if graph.config.bridge.strategy not in {"passive_r_strict", "puzzle_r"}:
+        raise SchemaError("direct R landing evaluation requires a passive_r_strict or puzzle_r graph")
     edge_ids = np.flatnonzero((graph.edges.kind == 1) & (graph.edges.bridge_type == 0))
     if edge_ids.size == 0:
-        raise SchemaError("R_strict graph contains no R bridges to evaluate")
+        raise SchemaError("graph contains no R bridges to evaluate")
     if trans.action is None:
         raise SchemaError("direct bridge evaluation requires recorded actions")
 
-    schema = get_state_schema("ogbench_scene")
+    schema_name = graph.config.bridge.state_schema or "ogbench_scene"
+    schema = get_state_schema(schema_name)
+    press_height = None
+    if schema_name == "ogbench_puzzle":
+        press_height = float(graph.meta.get("bridge_puzzle_press_calibration", {}).get("press_height_m", schema.press_height))
+        from dataclasses import replace
+
+        schema = replace(schema, press_height=press_height)
     aux = {"qpos": sim_state.qpos, "qvel": sim_state.qvel}
     if sim_state.button_states is not None:
         aux["button_states"] = sim_state.button_states
     coordinates = schema.coordinates(states, aux)
-    free = free_space_mask(states, sim_state.qpos, coordinates, distance=graph.config.bridge.free_distance)
+    free = (
+        coordinates.mode == 0 if schema_name == "ogbench_puzzle"
+        else free_space_mask(states, sim_state.qpos, coordinates, distance=graph.config.bridge.free_distance)
+    )
     calibration = estimate_realized_speed(trans, coordinates, free, schema)
     response_gain = np.asarray(calibration["feedback_gain_by_dimension"], dtype=np.float64)
     limits = np.asarray(schema.action_limits, dtype=np.float64)
     tube = np.asarray([0.01, 0.01, 0.01, np.deg2rad(5.0), 0.1], dtype=np.float64)
+    epsilon_p = np.asarray([0.5]) if schema_name == "ogbench_puzzle" else np.asarray(graph.meta["bridge_passive_epsilon"])
 
     rng = np.random.default_rng(args.seed)
     chosen = rng.choice(edge_ids, size=args.trials, replace=edge_ids.size < args.trials)
@@ -81,26 +92,55 @@ def main() -> int:
             tau = int(graph.edges.kappa[edge_id])
             budget = tau + args.settle_extra
             landed = False
+            passive_drift = False
             final_error = None
+            failure_reason = None
             steps = 0
             for steps in range(1, budget + 1):
-                current = verifier.sim_readout(obs)
+                current = verifier.sim_readout(obs, schema_name=schema_name, press_height=press_height)
+                if schema_name == "ogbench_puzzle" and not np.array_equal(
+                    np.rint(current["q_p"]).astype(np.int64),
+                    np.rint(coordinates.q_p[source]).astype(np.int64),
+                ):
+                    passive_drift = True
+                    failure_reason = "passive_drift"
+                    break
                 error = np.asarray(coordinates.q_a[target] - current["q_a"], dtype=np.float64)
                 error[3] = float(wrap_angle(np.asarray(error[3])))
-                action = np.asarray(trans.action[row], dtype=np.float64).copy()
-                action[:4] = np.clip(
-                    response_gain[:4] * error[:4] / limits[:4], -1.0, 1.0
-                )
+                if schema_name == "ogbench_puzzle":
+                    action = np.zeros_like(limits)
+                    action[:4] = np.clip(response_gain[:4] * error[:4] / limits[:4], -1.0, 1.0)
+                    action[4] = 0.0
+                else:
+                    action = np.asarray(trans.action[row], dtype=np.float64).copy()
+                    action[:4] = np.clip(
+                        response_gain[:4] * error[:4] / limits[:4], -1.0, 1.0
+                    )
                 obs, _, terminated, truncated, _ = verifier.step(action.astype(np.float32))
-                readout = verifier.sim_readout(obs)
+                readout = verifier.sim_readout(obs, schema_name=schema_name, press_height=press_height)
+                if schema_name == "ogbench_puzzle" and not np.array_equal(
+                    np.rint(readout["q_p"]).astype(np.int64),
+                    np.rint(coordinates.q_p[source]).astype(np.int64),
+                ):
+                    passive_drift = True
+                    failure_reason = "passive_drift"
+                    break
                 final_error = np.asarray(coordinates.q_a[target] - readout["q_a"], dtype=np.float64)
                 final_error[3] = float(wrap_angle(np.asarray(final_error[3])))
                 landed = bool(np.max(np.abs(final_error) / tube) <= 1.0)
                 if landed or terminated or truncated:
+                    if (terminated or truncated) and not landed:
+                        failure_reason = "timeout"
                     break
+            if not landed and failure_reason is None:
+                failure_reason = "active_tracking"
+            landed = bool(landed and not passive_drift)
             passive_delta = passive_difference(
                 schema, coordinates.q_p[source], coordinates.q_p[target]
             )
+            same_board = bool(np.array_equal(
+                np.asarray(coordinates.q_p[source]), np.asarray(coordinates.q_p[target])
+            )) if schema_name == "ogbench_puzzle" else None
             outcomes.append({
                 "edge_id": int(edge_id),
                 "source": source,
@@ -109,13 +149,16 @@ def main() -> int:
                 "steps": int(steps),
                 "landed": landed,
                 "landing_ratio": float(steps / max(tau, 1)),
-                "passive_difference_epsilon": float(np.max(
-                    np.abs(passive_delta) / np.asarray(graph.meta["bridge_passive_epsilon"])
-                )),
+                "passive_difference_epsilon": (
+                    float(np.max(np.abs(passive_delta) / epsilon_p)) if schema_name != "ogbench_puzzle" else None
+                ),
+                "same_button_configuration": same_board,
+                "passive_drift": passive_drift,
+                "failure_reason": failure_reason,
                 "final_tube_error": None if final_error is None else float(np.max(np.abs(final_error) / tube)),
             })
             if number % 25 == 0:
-                print(f"R_strict direct landing: {number}/{args.trials}", file=sys.stderr, flush=True)
+                print(f"R direct landing: {number}/{args.trials}", file=sys.stderr, flush=True)
     finally:
         wrapped.close()
 
@@ -124,6 +167,10 @@ def main() -> int:
         "graph_hash": graph.content_hash,
         "trials": len(outcomes),
         "landing_rate": float(np.mean([item["landed"] for item in outcomes])),
+        "failure_counts": {
+            reason: int(sum(item["failure_reason"] == reason for item in outcomes))
+            for reason in ("passive_drift", "active_tracking", "timeout")
+        },
         "gate": 0.8,
         "passed_gate": bool(np.mean([item["landed"] for item in outcomes]) >= 0.8),
         "budget": "tau_real + settle_extra",

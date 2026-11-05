@@ -132,7 +132,7 @@ def _brute_targets(trans, artifact, h, unit):
 @pytest.mark.parametrize("unit", ["steps", "nats"])
 def test_targets_match_row_loop_and_qc_validity(h, unit):
     trans, _, _, artifact = _chain_artifact()
-    targets = critic_targets(trans, artifact, TargetConfig(h=h, unit=unit))
+    targets = critic_targets(trans, artifact, TargetConfig(h=h, unit=unit, kind="cost"))
     expected_y, expected_valid = _brute_targets(trans, artifact, h, unit)
     np.testing.assert_array_equal(targets.valid, expected_valid)
     np.testing.assert_allclose(targets.y, expected_y, rtol=1e-6, atol=1e-6)
@@ -149,7 +149,7 @@ def test_targets_match_row_loop_and_qc_validity(h, unit):
 
 def test_sft_weights_zero_invalid_bounded_and_one_on_shortest_chain():
     trans, _, _, artifact = _chain_artifact()
-    targets = critic_targets(trans, artifact, TargetConfig(h=3, unit="steps"))
+    targets = critic_targets(trans, artifact, TargetConfig(h=3, unit="steps", kind="cost"))
     weights = sft_weights(trans, artifact, targets, beta=2.0, w_max=7.0)
     assert np.all(weights[~targets.valid] == 0.0)
     assert np.max(weights) <= 7.0

@@ -341,8 +341,141 @@ class RobomimicStateSchema:
         )
 
 
+@dataclass(frozen=True)
+class OGBenchPuzzleStateSchema:
+    """Physical state adapter for OGBench Lights Out puzzle manipulation."""
+
+    name: str = "ogbench_puzzle"
+    action_limits: NDArray[np.float32] = field(default_factory=lambda: np.asarray([0.05, 0.05, 0.05, 0.3, 1.0], dtype=np.float32))
+    passive_names: tuple[str, ...] = ("button_configuration",)
+    periodic_passive: tuple[int, ...] = ()
+    periodic_action: tuple[int, ...] = (3,)
+    press_height: float = 0.15
+    press_xy_radius: float = 0.035
+
+    @staticmethod
+    def _button_centers(n_buttons: int) -> NDArray[np.float64]:
+        shapes = {9: (3, 3), 16: (4, 4), 20: (4, 5)}
+        if n_buttons not in shapes:
+            raise SchemaError("OGBench puzzle supports 3x3, 4x4, and 4x5 button layouts")
+        n_rows, n_cols = shapes[n_buttons]
+        x = 0.425 - 0.05 * (n_rows - 1) + 0.1 * np.arange(n_rows)
+        y = -0.05 * (n_cols - 1) + 0.1 * np.arange(n_cols)
+        return np.asarray([[xx, yy] for xx in x for yy in y], dtype=np.float64)
+
+    def _inputs(self, obs: NDArray, aux: Mapping[str, NDArray] | None):
+        x, _ = _matrix(obs)
+        buttons = _aux_matrix(aux, "button_states", x.shape[0])
+        qpos = _aux_matrix(aux, "qpos", x.shape[0])
+        if buttons is None or qpos is None:
+            raise SchemaError("ogbench_puzzle StateSchema requires aligned qpos and button_states")
+        if buttons.shape[1] not in {9, 16, 20}:
+            raise SchemaError("puzzle button_states width must be 9, 16, or 20")
+        expected_obs = 19 + 4 * buttons.shape[1]
+        if x.shape[1] != expected_obs:
+            raise SchemaError(f"puzzle observation layout mismatch: expected {expected_obs}, found {x.shape[1]}")
+        if qpos.shape[1] != 14 + buttons.shape[1]:
+            raise SchemaError("puzzle qpos width must contain 14 arm/gripper coordinates and one joint per button")
+        if np.any((buttons != 0) & (buttons != 1)):
+            raise SchemaError("puzzle button_states must be binary")
+        return x, qpos, buttons.astype(np.int64)
+
+    def action_coordinates(self, obs: NDArray, aux: Mapping[str, NDArray] | None = None) -> NDArray:
+        x, _ = _matrix(obs)
+        if x.shape[1] < 19:
+            raise SchemaError("puzzle observation must expose the 19-dimensional robot prefix")
+        yaw = np.arctan2(x[:, 16], x[:, 15])
+        grip = np.clip(x[:, 17] / 3.0, 0.0, 1.0)
+        position = x[:, 12:15] / 10.0 + np.asarray([0.425, 0.0, 0.0])
+        return np.asarray(np.column_stack((position, yaw, grip)), dtype=np.float32)
+
+    def robot(self, obs: NDArray, aux: Mapping[str, NDArray] | None = None) -> NDArray:
+        x, qpos, _ = self._inputs(obs, aux)
+        return np.asarray(np.concatenate((qpos[:, :14], self.action_coordinates(x, aux)), axis=1), dtype=np.float32)
+
+    def objects(self, obs: NDArray, aux: Mapping[str, NDArray] | None = None) -> NDArray:
+        _, _, buttons = self._inputs(obs, aux)
+        bits = np.left_shift(np.ones(buttons.shape[1], dtype=np.int64), np.arange(buttons.shape[1], dtype=np.int64))
+        code = buttons @ bits
+        return code.astype(np.float32)[:, None]
+
+    def relative(self, obs: NDArray, aux: Mapping[str, NDArray] | None = None) -> NDArray:
+        x, qpos, buttons = self._inputs(obs, aux)
+        eef = self.action_coordinates(x, aux)[:, :3].astype(np.float64)
+        centers = self._button_centers(buttons.shape[1])
+        distances = np.linalg.norm(eef[:, None, :2] - centers[None, :, :], axis=2)
+        nearest = np.argmin(distances, axis=1)
+        top_z = 0.1254 + qpos[np.arange(qpos.shape[0]), 14 + nearest]
+        selected = centers[nearest]
+        return np.column_stack((eef[:, 0] - selected[:, 0], eef[:, 1] - selected[:, 1], eef[:, 2] - top_z)).astype(np.float32)
+
+    def mode(self, obs: NDArray, aux: Mapping[str, NDArray] | None = None) -> NDArray[np.int64]:
+        x, _, buttons = self._inputs(obs, aux)
+        qa = self.action_coordinates(x, aux)
+        centers = self._button_centers(buttons.shape[1])
+        nearest_xy = np.min(np.linalg.norm(qa[:, None, :2] - centers[None, :, :], axis=2), axis=1)
+        contact = x[:, 18] > 0.0
+        pressing = contact | ((nearest_xy <= self.press_xy_radius) & (qa[:, 2] <= self.press_height))
+        return pressing.astype(np.int64)
+
+    def passive(self, obs: NDArray, aux: Mapping[str, NDArray] | None, mode: NDArray) -> NDArray:
+        del mode
+        return self.objects(obs, aux)
+
+    def kinematic_steps(self, r_u: NDArray, r_v: NDArray) -> NDArray:
+        u, v = np.broadcast_arrays(np.asarray(r_u, dtype=np.float64), np.asarray(r_v, dtype=np.float64))
+        if u.shape[-1] != 19:
+            raise SchemaError("puzzle kinematic_steps expects 14 arm/gripper coordinates and 5 pose coordinates")
+        delta = v[..., 14:19] - u[..., 14:19]
+        delta[..., 3] = wrap_angle(delta[..., 3])
+        return np.max(np.ceil(np.maximum(np.abs(delta) / self.action_limits - 1e-6, 0.0)), axis=-1).astype(np.int64)
+
+    def coordinates(self, obs: NDArray, aux: Mapping[str, NDArray] | None = None) -> StateCoordinates:
+        x, _, _ = self._inputs(obs, aux)
+        mode = self.mode(x, aux)
+        return StateCoordinates(
+            r=self.robot(x, aux), o=self.objects(x, aux), e=self.relative(x, aux),
+            q_p=self.passive(x, aux, mode), mode=mode, q_a=self.action_coordinates(x, aux),
+        )
+
+
+def estimate_puzzle_press_height(
+    observations: NDArray,
+    button_states: NDArray,
+    *,
+    next_observations: NDArray | None = None,
+    next_button_states: NDArray | None = None,
+    default: float = 0.15,
+    margin: float = 0.005,
+) -> dict[str, float | int]:
+    """Fit a conservative pressing-height threshold from observed toggle events."""
+    obs = np.asarray(observations, dtype=np.float64)
+    states = np.asarray(button_states, dtype=np.int64)
+    if obs.ndim != 2 or states.ndim != 2 or obs.shape[0] != states.shape[0] or obs.shape[1] < 19:
+        raise SchemaError("puzzle press-height calibration requires aligned observations and button states")
+    if next_observations is not None or next_button_states is not None:
+        if next_observations is None or next_button_states is None:
+            raise SchemaError("both next observations and next button states are required")
+        nxt_obs = np.asarray(next_observations, dtype=np.float64)
+        nxt_states = np.asarray(next_button_states, dtype=np.int64)
+        if nxt_obs.shape != obs.shape or nxt_states.shape != states.shape:
+            raise SchemaError("puzzle current and next press-height arrays must have identical shapes")
+        changed = np.any(states != nxt_states, axis=1)
+        heights = np.maximum(obs[:, 14], nxt_obs[:, 14])[changed] / 10.0
+    else:
+        if states.shape[0] < 2:
+            return {"press_height_m": float(default), "toggle_pairs": 0}
+        changed = np.any(states[1:] != states[:-1], axis=1)
+        heights = obs[1:, 14][changed] / 10.0
+    if heights.size == 0:
+        return {"press_height_m": float(default), "toggle_pairs": 0}
+    threshold = float(np.clip(np.quantile(heights, 0.95) + margin, 0.13, 0.30))
+    return {"press_height_m": threshold, "toggle_pairs": int(heights.size)}
+
+
 STATE_SCHEMAS: dict[str, StateSchema] = {
     "ogbench_scene": OGBenchSceneStateSchema(),
+    "ogbench_puzzle": OGBenchPuzzleStateSchema(),
     "robomimic": RobomimicStateSchema(),
 }
 

@@ -14,6 +14,7 @@ from graphcritic.types import (
     GRAPH_SCHEMA_VERSION,
     LEGACY_GRAPH_SCHEMA_VERSION,
     SCHEMA_VERSION,
+    TARGET_SCHEMA_VERSION,
     EdgeSet,
     GraphArtifact,
     NodeSet,
@@ -70,7 +71,7 @@ def _read_pair(path: str | Path) -> tuple[dict[str, NDArray[Any]], dict[str, Any
         metadata = json.loads(json_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SchemaError(f"cannot read artifact metadata at {json_path}") from exc
-    if not isinstance(metadata, dict) or metadata.get("schema_version") not in {SCHEMA_VERSION, LEGACY_GRAPH_SCHEMA_VERSION, GRAPH_SCHEMA_VERSION}:
+    if not isinstance(metadata, dict) or metadata.get("schema_version") not in {SCHEMA_VERSION, LEGACY_GRAPH_SCHEMA_VERSION, GRAPH_SCHEMA_VERSION, TARGET_SCHEMA_VERSION}:
         found = metadata.get("schema_version") if isinstance(metadata, dict) else None
         raise SchemaError(f"unsupported or missing schema_version: {found!r}")
     try:
@@ -335,7 +336,12 @@ def load_graph(path: str | Path, *, trans: TransitionSet | None = None) -> Graph
 
 
 def _target_arrays(targets: TargetSet) -> dict[str, NDArray[Any]]:
-    return {"y": targets.y, "valid": targets.valid, "source": targets.source}
+    return {
+        "y": targets.y,
+        "valid": targets.valid,
+        "source": targets.source,
+        "loss_mask": targets.loss_mask,
+    }
 
 
 def _target_config(targets: TargetSet) -> dict[str, Any]:
@@ -344,6 +350,8 @@ def _target_config(targets: TargetSet) -> dict[str, Any]:
         "graph_hash": targets.graph_hash,
         "h": targets.h,
         "unit": targets.unit,
+        "kind": targets.kind,
+        "regret_max": targets.regret_max,
     }
 
 
@@ -351,12 +359,12 @@ def save_targets(targets: TargetSet, path: str | Path) -> str:
     targets.validate()
     arrays = _target_arrays(targets)
     config = _target_config(targets)
-    content_hash = _content_hash(SCHEMA_VERSION, config, arrays)
+    content_hash = _content_hash(TARGET_SCHEMA_VERSION, config, arrays)
     _write_pair(
         path,
         arrays,
         {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": TARGET_SCHEMA_VERSION,
             "config": config,
             "meta": {},
             "content_hash": content_hash,
@@ -374,10 +382,22 @@ def load_targets(
     *,
     graph: GraphArtifact | None = None,
     expected_dataset_id: str | None = None,
+    require_loss_mask: bool = False,
 ) -> TargetSet:
     arrays, metadata = _read_pair(path)
-    if set(arrays) != {"y", "valid", "source"}:
-        raise SchemaError("target arrays must be exactly ['source', 'valid', 'y']")
+    schema_version = metadata.get("schema_version")
+    if require_loss_mask and schema_version != TARGET_SCHEMA_VERSION:
+        raise SchemaError(
+            "QC graph-target training requires a v0.6 target artifact with an explicit loss_mask; rebuild targets"
+        )
+    if schema_version == TARGET_SCHEMA_VERSION:
+        if set(arrays) != {"y", "valid", "source", "loss_mask"}:
+            raise SchemaError("v0.6 target arrays must be exactly ['loss_mask', 'source', 'valid', 'y']")
+    elif schema_version == SCHEMA_VERSION:
+        if set(arrays) != {"y", "valid", "source"}:
+            raise SchemaError("legacy v0.3 target arrays must be exactly ['source', 'valid', 'y']")
+    else:
+        raise SchemaError(f"unsupported target schema_version: {schema_version!r}")
     config = metadata.get("config")
     if not isinstance(config, dict):
         raise SchemaError("target metadata must include its configuration")
@@ -390,6 +410,9 @@ def load_targets(
         unit=config.get("unit"),
         graph_hash=config.get("graph_hash"),
         dataset_id=config.get("dataset_id"),
+        kind=config.get("kind", "cost"),
+        loss_mask=arrays.get("loss_mask", arrays["valid"]),
+        regret_max=config.get("regret_max", 50.0),
     )
     source_path = _pair_paths(path)[0].with_name(f"{_pair_paths(path)[0].stem}_source.npy")
     if source_path.is_file():

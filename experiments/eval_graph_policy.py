@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -42,14 +43,21 @@ def _choose_starts(trans, artifact, count: int, seed: int) -> list[tuple[int, bo
     episode_kind = _episode_kind(trans)
     failed = candidates[np.asarray([not episode_kind[int(trans.episode_id[row])] for row in candidates])]
     successful = candidates[np.asarray([episode_kind[int(trans.episode_id[row])] for row in candidates])]
-    if failed.size == 0 or successful.size == 0:
-        raise SchemaError("graph evaluation needs finite-cost rows from both failed and successful episodes")
-    n_failed = count // 2
-    n_success = count - n_failed
+    if failed.size == 0 and successful.size == 0:
+        raise SchemaError("graph evaluation needs finite-cost rows from at least one episode")
     result: list[tuple[int, bool]] = []
-    for pool, size, label in ((failed, n_failed, True), (successful, n_success, False)):
-        chosen = rng.choice(pool, size=size, replace=pool.size < size)
-        result.extend((int(row), label) for row in chosen)
+    if failed.size == 0:
+        chosen = rng.choice(successful, size=count, replace=successful.size < count)
+        result.extend((int(row), False) for row in chosen)
+    elif successful.size == 0:
+        chosen = rng.choice(failed, size=count, replace=failed.size < count)
+        result.extend((int(row), True) for row in chosen)
+    else:
+        n_failed = count // 2
+        n_success = count - n_failed
+        for pool, size, label in ((failed, n_failed, True), (successful, n_success, False)):
+            chosen = rng.choice(pool, size=size, replace=pool.size < size)
+            result.extend((int(row), label) for row in chosen)
     rng.shuffle(result)
     return result
 
@@ -78,6 +86,8 @@ def main() -> int:
                         help="JSON from eval_servo_free_space.py, used by the v0.5 witness gate")
     parser.add_argument("--bridge-landing-result", type=Path,
                         help="JSON from eval_strict_bridges.py, used by the R_strict connection gate")
+    parser.add_argument("--replay-baseline-result", type=Path,
+                        help="Matched replay-controller JSON for the zero-bridge witness baseline")
     parser.add_argument("--starts", type=int, default=500)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--window", type=int, default=10)
@@ -141,23 +151,35 @@ def main() -> int:
         if schema_name is None:
             raise SchemaError("servo evaluation requires a bridge.state_schema or position feature")
         schema = get_state_schema(schema_name)
+        puzzle_press_height = None
+        if schema_name == "ogbench_puzzle":
+            from dataclasses import replace as replace_dataclass
+
+            puzzle_press_height = float(
+                artifact.meta.get("bridge_puzzle_press_calibration", {}).get("press_height_m", schema.press_height)
+            )
+            schema = replace_dataclass(schema, press_height=puzzle_press_height)
         coordinates = schema.coordinates(states, aux)
         episode, times = state_episode_time(trans)
-        smooth_modes = smooth_mode_changes(
-            coordinates.mode, episode, times, artifact.config.min_dwell
+        smooth_modes = (
+            coordinates.mode if schema_name == "ogbench_puzzle"
+            else smooth_mode_changes(coordinates.mode, episode, times, artifact.config.min_dwell)
         )
         coordinates = replace(
             coordinates, mode=smooth_modes,
         )
-        free = free_space_mask(
-            states, sim_state.qpos, coordinates,
-            distance=artifact.config.bridge.free_distance,
+        free = (
+            coordinates.mode == 0 if schema_name == "ogbench_puzzle"
+            else free_space_mask(
+                states, sim_state.qpos, coordinates,
+                distance=artifact.config.bridge.free_distance,
+            )
         )
         witness_calibration = estimate_realized_speed(trans, coordinates, free, schema)
         response_gain = np.asarray(
             witness_calibration["feedback_gain_by_dimension"], dtype=np.float64
         )
-        epsilon_p = artifact.meta.get("bridge_passive_epsilon")
+        epsilon_p = np.asarray([0.5]) if schema_name == "ogbench_puzzle" else artifact.meta.get("bridge_passive_epsilon")
         if epsilon_p is None:
             contact = states[:, 18] > 0 if schema_name == "ogbench_scene" and states.shape[1] > 18 else None
             epsilon_p = estimate_passive_tolerance(
@@ -172,6 +194,10 @@ def main() -> int:
             free_distance=artifact.config.bridge.free_distance,
         )
     starts = _choose_starts(trans, artifact, count, args.seed)
+    start_selection = np.asarray(starts, dtype=np.int64)
+    start_selection_hash = hashlib.sha256(
+        np.ascontiguousarray(start_selection).tobytes()
+    ).hexdigest()
 
     try:
         import ogbench  # noqa: F401
@@ -221,7 +247,9 @@ def main() -> int:
                         current_aux = verifier.current_state()
                         action = policy.act(obs, current_aux)  # type: ignore[union-attr]
                     else:
-                        action = servo_policy.act(verifier.sim_readout(obs))
+                        action = servo_policy.act(verifier.sim_readout(
+                            obs, schema_name=schema_name, press_height=puzzle_press_height
+                        ))
                 except SchemaError as exc:
                     failure_reason = str(exc)
                     break
@@ -407,7 +435,8 @@ def main() -> int:
         graph_gate_reasons.append(f"valid non-success cap fraction {float(cap_fraction):.4f} exceeds 0.5")
     if graph_diagnostics["reachable_frac"] < 0.5:
         graph_gate_reasons.append("reachable fraction is below 0.5")
-    if graph_diagnostics["reachable_frac_failed_eps"] < 0.3:
+    failed_episode_count = int(graph_diagnostics.get("n_failed_episodes", 0))
+    if failed_episode_count > 0 and graph_diagnostics["reachable_frac_failed_eps"] < 0.3:
         graph_gate_reasons.append("failed-episode reachable fraction is below 0.3")
     kin_violation = graph_diagnostics["bridge_calibration"].get("kinematic_violation")
     has_m_bridges = bool(np.any(np.asarray(artifact.edges.bridge_type) == 1))
@@ -439,7 +468,7 @@ def main() -> int:
         graph_reasons = []
         if cap_fraction is None or float(cap_fraction) > 0.8:
             graph_reasons.append("valid non-success cap fraction exceeds 0.8 or is unavailable")
-        if graph_diagnostics["reachable_frac_failed_eps"] <= 0.1:
+        if failed_episode_count > 0 and graph_diagnostics["reachable_frac_failed_eps"] <= 0.1:
             graph_reasons.append("failed-episode reachable fraction must be greater than 0.1")
         if artifact.config.bridge.strategy in {"passive_r_real", "passive_r_strict", "passive_rm_real"}:
             tau_report = artifact.meta.get("bridge_r_tau_real", {})
@@ -464,8 +493,32 @@ def main() -> int:
         free_fraction = None if free_space_result is None else float(free_space_result.get("success_fraction", 0.0))
         if free_fraction is None or free_fraction < 0.9:
             witness_reasons.append("free-space arrival within tau_real+2 is below 0.9 or unavailable")
-        if zero_rate is None or zero_rate < 0.614:
-            witness_reasons.append("zero-bridge success is below replay baseline 0.614 or unavailable")
+        replay_baseline = None
+        if args.replay_baseline_result is not None:
+            replay_result = json.loads(args.replay_baseline_result.read_text(encoding="utf-8"))
+            for key, expected in (
+                ("controller", "replay"),
+                ("dataset_id", dataset_id),
+                ("graph_hash", artifact.content_hash),
+                ("n_starts", len(starts)),
+                ("start_selection_sha256", start_selection_hash),
+            ):
+                if replay_result.get(key) != expected:
+                    raise SchemaError(
+                        f"replay baseline {key} mismatch: expected {expected!r}, "
+                        f"found {replay_result.get(key)!r}"
+                    )
+            replay_baseline = replay_result.get("zero_bridge_success")
+        elif "puzzle" not in env_id:
+            # Preserve the historical Scene comparison when no matched replay
+            # evaluation is supplied. Puzzle tasks require their own baseline.
+            replay_baseline = 0.614
+        if replay_baseline is None:
+            witness_reasons.append("matched replay baseline is unavailable")
+        elif zero_rate is None or zero_rate < float(replay_baseline):
+            witness_reasons.append(
+                f"zero-bridge success is below replay baseline {float(replay_baseline):.4f} or unavailable"
+            )
         witness_stage_passed = graph_stage_passed and not witness_reasons
 
         accuracy_reasons = []
@@ -504,6 +557,7 @@ def main() -> int:
                 "reasons": graph_reasons,
                 "valid_non_success_cap_fraction": cap_fraction,
                 "reachable_frac_failed_eps": graph_diagnostics["reachable_frac_failed_eps"],
+                "failed_episode_reachability_applicable": failed_episode_count > 0,
                 "tau_real_kinematic_violation_count": artifact.meta.get("bridge_r_tau_real", {}).get("kinematic_violation_count"),
                 "M_kinematic_violation": kin_violation,
             },
@@ -512,7 +566,7 @@ def main() -> int:
                 "reasons": witness_reasons,
                 "free_space_arrival_fraction": free_fraction,
                 "zero_bridge_success": zero_rate,
-                "replay_baseline": 0.614,
+                "replay_baseline": replay_baseline,
             },
             "connection_accuracy": {
                 "evaluated": accuracy_evaluated,
@@ -553,10 +607,15 @@ def main() -> int:
         "bridge_targets_reached": bridge_targets_reached,
         "bridge_targets_unreached": bridge_targets_unreached,
         "controller": args.controller,
+        "start_selection_sha256": start_selection_hash,
         "contact_gain": float(args.contact_gain),
         "witness_calibration": witness_calibration,
         "zero_bridge_success": zero_rate,
         "zero_bridge_starts": int(zero_bridge["n"]),
+        "start_episode_counts": {
+            "failed": int(sum(item["failed_episode"] for item in outcomes)),
+            "successful": int(sum(not item["failed_episode"] for item in outcomes)),
+        },
         "bridge_success_1_to_3": bridged_rate,
         "bridge_retention_1_to_3": relative_retention,
         "success_cost_time_spearman": rank,

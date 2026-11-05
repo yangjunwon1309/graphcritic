@@ -28,6 +28,8 @@ def edge_weights(
                 # their cost is exactly c*tau and has no additive prior.
                 if cfg.bridge.strategy == "passive_r_strict":
                     lambda_bridge = c * cfg.bridge.cost.lambda0_steps
+                elif cfg.bridge.strategy == "puzzle_r":
+                    lambda_bridge = c * cfg.bridge.cost.lambda0_steps
                 elif cfg.bridge.strategy in {
                     "passive_r", "passive_r_real", "passive_rm", "passive_rm_real"
                 }:

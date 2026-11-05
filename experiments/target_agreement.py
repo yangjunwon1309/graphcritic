@@ -1,4 +1,4 @@
-"""Compare graph cost targets with an existing TD QC critic (diagnostic only)."""
+"""Compare graph cost/regret targets with a TD QC critic (diagnostic only)."""
 
 from __future__ import annotations
 
@@ -74,18 +74,25 @@ def _q_td(agent, observations: np.ndarray, action_chunks: np.ndarray, batch_size
     return output
 
 
-def _group_stats(q_graph: np.ndarray, q_td: np.ndarray, mask: np.ndarray) -> dict[str, Any]:
+def _group_stats(
+    q_graph: np.ndarray, q_td: np.ndarray, mask: np.ndarray, *, compare_levels: bool = True
+) -> dict[str, Any]:
     x, y = q_graph[mask], q_td[mask]
     if x.size == 0:
-        return {"n": 0, "spearman": None, "median_optimism_qg_minus_qtd": None}
+        empty = {"n": 0, "spearman": None}
+        if compare_levels:
+            empty["median_optimism_qg_minus_qtd"] = None
+        return empty
     corr = spearmanr(x, y).statistic
-    return {
+    result = {
         "n": int(x.size),
         "spearman": float(corr) if np.isfinite(corr) else None,
-        "median_optimism_qg_minus_qtd": float(np.median(x - y)),
         "q_graph_p50": float(np.median(x)),
         "q_td_p50": float(np.median(y)),
     }
+    if compare_levels:
+        result["median_optimism_qg_minus_qtd"] = float(np.median(x - y))
+    return result
 
 
 def _graph_report(name: str, graph_path: Path, trans, q_td: np.ndarray, gamma: float) -> dict[str, Any]:
@@ -106,10 +113,15 @@ def _graph_report(name: str, graph_path: Path, trans, q_td: np.ndarray, gamma: f
     b_nodes = _bridge_counts(artifact)
     bridge_count = np.zeros(n_rows, dtype=np.int32)
     bridge_count[in_range] = b_nodes[endpoint_nodes[in_range]]
-    q_graph = -(
-        1.0 - np.power(float(gamma), np.maximum(targets.y.astype(np.float64) - 1.0, 0.0))
-    ) / (1.0 - float(gamma))
-    valid = targets.valid
+    if targets.kind == "regret":
+        # Regret is a local advantage target rather than a remaining return.
+        # Its action-selection convention is Q_G=-regret.
+        q_graph = -targets.y.astype(np.float64)
+    else:
+        q_graph = -(
+            1.0 - np.power(float(gamma), np.maximum(targets.y.astype(np.float64) - 1.0, 0.0))
+        ) / (1.0 - float(gamma))
+    valid = targets.valid & targets.loss_mask
     groups = {
         "g0_chunk_success": valid & (targets.source == 0),
         "g1_finite_b0": valid & (targets.source == 1) & (bridge_count == 0),
@@ -118,6 +130,7 @@ def _graph_report(name: str, graph_path: Path, trans, q_td: np.ndarray, gamma: f
     }
     return {
         "graph": name,
+        "target_kind": targets.kind,
         "graph_hash": artifact.content_hash,
         "bridge_edges": int(np.count_nonzero(artifact.edges.kind == 1)),
         "bridge_count_by_row": {
@@ -125,7 +138,14 @@ def _graph_report(name: str, graph_path: Path, trans, q_td: np.ndarray, gamma: f
             "p95": float(np.percentile(bridge_count[valid], 95)) if np.any(valid) else None,
             "max": int(np.max(bridge_count[valid])) if np.any(valid) else None,
         },
-        "groups": {key: _group_stats(q_graph, q_td, mask) for key, mask in groups.items()},
+        "groups": {
+            key: _group_stats(q_graph, q_td, mask, compare_levels=targets.kind == "cost")
+            for key, mask in groups.items()
+        },
+        "comparison_semantics": (
+            "rowwise ranking only: Q_G=-regret omits the state cost-to-go"
+            if targets.kind == "regret" else "cost-value comparison"
+        ),
     }
 
 

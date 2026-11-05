@@ -1,0 +1,36 @@
+{
+  "gamma": 0.99,
+  "graph_kind": "state",
+  "radius": 1.0,
+  "radius_unit": "step",
+  "feature": {"name": "identity", "standardize": true},
+  "mode_fn": "ogbench_puzzle",
+  "min_dwell": 1,
+  "bridge": {
+    "enabled": true,
+    "k": 4,
+    "radius": 1.0,
+    "radius_unit": "step",
+    "landing_steps": 5,
+    "min_time_gap": 20,
+    "source_stride": 1,
+    "same_mode": true,
+    "knn_backend": "ckdtree",
+    "strategy": "puzzle_r",
+    "state_schema": "ogbench_puzzle",
+    "real_speed_quantile": 0.95,
+    "real_settle_steps": 2,
+    "cost": {
+      "policy": "time",
+      "candidate_k": 64,
+      "tau_max_steps": 20,
+      "bridge_success_rho": 1.0,
+      "lambda0_steps": 0.0
+    }
+  },
+  "compress": false,
+  "consistency": false,
+  "weight_policy": "time",
+  "c_max_steps": null,
+  "segment_max_len": 1000
+}

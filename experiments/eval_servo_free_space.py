@@ -1,4 +1,4 @@
-"""Check v0.5 calibrated pose tracking on object/handle-free Scene states."""
+"""Check calibrated pose tracking on free-space OGBench Scene or Puzzle states."""
 
 from __future__ import annotations
 
@@ -16,7 +16,12 @@ import numpy as np
 from graphcritic.featurize import state_table
 from graphcritic.io import load_sim_state, load_transitions
 from graphcritic.physical_time import estimate_realized_speed, free_space_mask, realized_travel_steps
-from graphcritic.state_schema import get_state_schema, wrap_angle
+from graphcritic.state_schema import (
+    OGBenchPuzzleStateSchema,
+    estimate_puzzle_press_height,
+    get_state_schema,
+    wrap_angle,
+)
 from graphcritic.types import SchemaError
 from graphcritic.verification import OGBenchVerifier
 
@@ -41,13 +46,32 @@ def main() -> int:
     sim_state = load_sim_state(args.sim_state)
     states = state_table(trans)[0]
     sim_state.validate(states.shape[0])
-    schema = get_state_schema("ogbench_scene")
     aux = {"qpos": sim_state.qpos, "qvel": sim_state.qvel}
     if sim_state.button_states is not None:
         aux["button_states"] = sim_state.button_states
-    coords = schema.coordinates(states, aux)
-    free = free_space_mask(states, sim_state.qpos, coords, distance=0.05)
-    candidates_free = free_space_mask(states, sim_state.qpos, coords, distance=0.15)
+    if sim_state.button_states is not None and sim_state.button_states.shape[1] in {9, 16, 20}:
+        final_rows = np.flatnonzero(trans.terminal)
+        next_ids = np.empty(trans.n_rows, dtype=np.int64)
+        nonterminal = np.flatnonzero(~trans.terminal)
+        next_ids[nonterminal] = nonterminal + 1
+        next_ids[final_rows] = trans.n_rows + np.arange(final_rows.size, dtype=np.int64)
+        press_fit = estimate_puzzle_press_height(
+            trans.feat, sim_state.button_states[: trans.n_rows],
+            next_observations=trans.next_feat,
+            next_button_states=sim_state.button_states[next_ids],
+        )
+        schema = OGBenchPuzzleStateSchema(press_height=float(press_fit["press_height_m"]))
+        coords = schema.coordinates(states, aux)
+        free = coords.mode == 0
+        candidates_free = free
+        schema_name = "ogbench_puzzle"
+    else:
+        press_fit = None
+        schema = get_state_schema("ogbench_scene")
+        coords = schema.coordinates(states, aux)
+        free = free_space_mask(states, sim_state.qpos, coords, distance=0.05)
+        candidates_free = free_space_mask(states, sim_state.qpos, coords, distance=0.15)
+        schema_name = "ogbench_scene"
     calibration = estimate_realized_speed(trans, coords, free, schema)
     speed = np.asarray(calibration["speed_quantiles"][args.speed_quantile], dtype=np.float64)
     response_gain = np.asarray(calibration["feedback_gain_by_dimension"], dtype=np.float64)
@@ -89,8 +113,12 @@ def main() -> int:
             if sim_state.button_states is not None:
                 payload["button_states"] = sim_state.button_states[start]
             obs = verifier.reset_to(payload)
+            passive_drift = False
             for _ in range(budget):
-                readout = verifier.sim_readout(obs)
+                readout = verifier.sim_readout(
+                    obs, schema_name=schema_name,
+                    press_height=None if press_fit is None else float(press_fit["press_height_m"]),
+                )
                 delta = target - np.asarray(readout["q_a"], dtype=np.float64)
                 delta[3] = float(wrap_angle(np.asarray(delta[3])))
                 action = np.zeros_like(limits, dtype=np.float64)
@@ -100,16 +128,25 @@ def main() -> int:
                 action[4] = 0.0
                 action = action.astype(np.float32)
                 obs, _, terminated, truncated, _ = verifier.step(action)
+                if schema_name == "ogbench_puzzle":
+                    current_buttons = np.asarray(verifier.current_state()["button_states"], dtype=np.int64)
+                    if not np.array_equal(current_buttons, sim_state.button_states[start]):
+                        passive_drift = True
+                        break
                 if terminated or truncated:
                     break
-            actual = np.asarray(verifier.sim_readout(obs)["q_a"], dtype=np.float64)
+            actual = np.asarray(verifier.sim_readout(
+                obs, schema_name=schema_name,
+                press_height=None if press_fit is None else float(press_fit["press_height_m"]),
+            )["q_a"], dtype=np.float64)
             error = target - actual
             error[3] = float(wrap_angle(np.asarray(error[3])))
             normalized_error = float(np.max(np.abs(error) / tracking_tube))
             outcomes.append({
                 "start_state": int(start), "tau_real": tau_real,
                 "budget": budget, "normalized_error": normalized_error,
-                "passed": bool(normalized_error <= 1.0),
+                "passive_drift": passive_drift,
+                "passed": bool(normalized_error <= 1.0 and not passive_drift),
             })
             if len(outcomes) % 25 == 0:
                 print(f"free-space servo: {len(outcomes)}/{args.trials}", file=sys.stderr, flush=True)
@@ -117,8 +154,11 @@ def main() -> int:
         wrapped.close()
 
     result = {
+        "state_schema": schema_name,
+        "puzzle_press_height_calibration": press_fit,
         "n_trials": len(outcomes),
         "success_fraction": float(np.mean([item["passed"] for item in outcomes])),
+        "passive_drift_count": int(sum(item["passive_drift"] for item in outcomes)),
         "gate": 0.9,
         "passed_gate": bool(np.mean([item["passed"] for item in outcomes]) >= 0.9),
         "tracking_tube": tracking_tube.tolist(),

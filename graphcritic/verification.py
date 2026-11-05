@@ -363,15 +363,29 @@ class OGBenchVerifier:
             pass
         return state
 
-    def sim_readout(self, observation: NDArray) -> Mapping[str, NDArray]:
-        """Return the physical Scene coordinates required by ServoTrackingPolicy."""
+    def sim_readout(
+        self,
+        observation: NDArray,
+        *,
+        schema_name: str = "ogbench_scene",
+        press_height: float | None = None,
+    ) -> Mapping[str, NDArray]:
+        """Return physical coordinates required by ServoTrackingPolicy."""
         state = dict(self.current_state())
         obs = np.asarray(observation, dtype=np.float32).reshape(1, -1)
         aux = {key: np.asarray(state[key]).reshape(1, -1) for key in ("qpos", "qvel", "button_states", "eef_position", "eef_yaw", "gripper_opening", "gripper_contact") if key in state}
-        coordinates = get_state_schema("ogbench_scene").coordinates(obs, aux)
-        is_free = free_space_mask(
-            obs, aux["qpos"], coordinates, distance=0.05,
-        )
+        schema = get_state_schema(schema_name)
+        if schema_name == "ogbench_puzzle" and press_height is not None:
+            from dataclasses import replace
+
+            schema = replace(schema, press_height=float(press_height))
+        coordinates = schema.coordinates(obs, aux)
+        if schema_name == "ogbench_puzzle":
+            is_free = coordinates.mode == 0
+        else:
+            is_free = free_space_mask(
+                obs, aux["qpos"], coordinates, distance=0.05,
+            )
         return {
             **state,
             "observation": obs[0].copy(),

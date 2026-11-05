@@ -162,7 +162,7 @@ class BridgeConfig:
     source_stride: int = 1
     same_mode: bool = True
     knn_backend: Literal["auto", "ckdtree", "faiss", "jax_gpu"] = "auto"
-    strategy: Literal["feature", "passive_r", "passive_r_real", "passive_r_strict", "passive_rm", "passive_rm_real"] = "feature"
+    strategy: Literal["feature", "passive_r", "passive_r_real", "passive_r_strict", "passive_rm", "passive_rm_real", "puzzle_r"] = "feature"
     state_schema: str | None = None
     passive_jitter_multiplier: float = 1.0
     passive_max_multiplier: float = 10.0
@@ -187,10 +187,12 @@ class BridgeConfig:
             raise SchemaError("bridge.radius_unit must be 'abs' or 'step'")
         if self.knn_backend not in {"auto", "ckdtree", "faiss", "jax_gpu"}:
             raise SchemaError("bridge.knn_backend must be auto, ckdtree, faiss, or jax_gpu")
-        if self.strategy not in {"feature", "passive_r", "passive_r_real", "passive_r_strict", "passive_rm", "passive_rm_real"}:
-            raise SchemaError("bridge.strategy must be feature, passive_r, passive_r_real, passive_r_strict, passive_rm, or passive_rm_real")
-        if self.strategy in {"passive_r", "passive_r_real", "passive_r_strict", "passive_rm", "passive_rm_real"} and self.cost.policy != "time":
+        if self.strategy not in {"feature", "passive_r", "passive_r_real", "passive_r_strict", "passive_rm", "passive_rm_real", "puzzle_r"}:
+            raise SchemaError("bridge.strategy must be feature, passive_r, passive_r_real, passive_r_strict, passive_rm, passive_rm_real, or puzzle_r")
+        if self.strategy in {"passive_r", "passive_r_real", "passive_r_strict", "passive_rm", "passive_rm_real", "puzzle_r"} and self.cost.policy != "time":
             raise SchemaError("passive R/M bridge strategies require bridge.cost.policy='time'")
+        if self.strategy == "puzzle_r" and self.state_schema != "ogbench_puzzle":
+            raise SchemaError("puzzle_r requires bridge.state_schema='ogbench_puzzle'")
         if self.state_schema is not None and (not isinstance(self.state_schema, str) or not self.state_schema):
             raise SchemaError("bridge.state_schema must be a non-empty name when provided")
         for name in ("passive_jitter_multiplier", "passive_max_multiplier"):
@@ -353,17 +355,24 @@ class GraphConfig:
 class TargetConfig:
     h: int
     unit: Literal["steps", "nats"] = "steps"
+    kind: Literal["cost", "regret"] = "regret"
+    regret_max: float = 50.0
 
     def __post_init__(self) -> None:
         _positive_int("h", self.h)
         if self.unit not in {"steps", "nats"}:
             raise SchemaError("unit must be 'steps' or 'nats'")
+        if self.kind not in {"cost", "regret"}:
+            raise SchemaError("kind must be 'cost' or 'regret'")
+        if (not isinstance(self.regret_max, (int, float)) or not math.isfinite(self.regret_max)
+                or self.regret_max <= 0):
+            raise SchemaError("regret_max must be finite and positive")
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> TargetConfig:
         if not isinstance(value, Mapping):
             raise SchemaError("TargetConfig data must be a mapping")
-        unknown = set(value) - {"h", "unit"}
+        unknown = set(value) - {"h", "unit", "kind", "regret_max"}
         if unknown:
             raise SchemaError(f"unknown TargetConfig fields: {sorted(unknown)}")
         try:

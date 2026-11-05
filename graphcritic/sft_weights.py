@@ -17,6 +17,8 @@ def sft_weights(
     trans.validate()
     artifact.validate(trans)
     targets.validate(trans)
+    if targets.kind != "cost":
+        raise SchemaError("SFT cost-advantage weights require kind='cost' targets")
     if targets.graph_hash != artifact.content_hash:
         raise SchemaError("targets were generated from a different graph artifact")
     if targets.dataset_id != artifact.meta["dataset_id"]:

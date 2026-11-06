@@ -1,7 +1,7 @@
 import numpy as np
 
 from graphcritic.bridges.insert import IterativeBridgeGraph, insert_validated_bridges
-from experiments.eval_bridges import cross_episode_knn_pairs
+from experiments.eval_bridges import cross_episode_knn_pairs, load_or_build_candidate_pairs
 from experiments.v07_runtime import make_and_evaluate
 
 
@@ -99,14 +99,73 @@ def test_sequential_insertion_rechecks_before_calling_model():
     assert graph.cost[0] == 6.0
 
 
-def test_candidates_are_cross_episode_and_never_target_goals():
-    features = np.asarray([[0.0], [0.1], [0.2], [0.3]], dtype=np.float32)
+def test_candidates_are_cross_episode_and_success_states_can_be_targets():
+    features = np.asarray([[0.0], [0.1], [0.2], [0.01]], dtype=np.float32)
     episodes = np.asarray([0, 1, 0, 1])
     goals = np.asarray([False, False, False, True])
     pairs = cross_episode_knn_pairs(features, episodes, goals, k=1, initial_query=4)
     assert pairs.shape == (4, 2)
-    assert not np.any(goals[pairs[:, 1]])
+    assert np.any(goals[pairs[:, 1]])
     assert np.all(episodes[pairs[:, 0]] != episodes[pairs[:, 1]])
+
+
+def test_candidate_cache_is_dataset_and_knn_bound(tmp_path):
+    features = np.asarray([[0.0], [0.1], [0.2], [0.01]], dtype=np.float32)
+    episodes = np.asarray([0, 1, 0, 1])
+    goals = np.asarray([False, False, False, True])
+    cache = tmp_path / "candidate-pairs.npz"
+    expected = load_or_build_candidate_pairs(
+        features, episodes, goals, dataset_id="data-a", k=1,
+        cache_path=cache,
+    )
+    loaded = load_or_build_candidate_pairs(
+        features, episodes, goals, dataset_id="data-a", k=1,
+        cache_path=cache,
+    )
+    np.testing.assert_array_equal(loaded, expected)
+    try:
+        load_or_build_candidate_pairs(
+            features, episodes, goals, dataset_id="data-b", k=1,
+            cache_path=cache,
+        )
+    except ValueError as exc:
+        assert "dataset_id mismatch" in str(exc)
+    else:
+        raise AssertionError("a candidate cache from another dataset must be rejected")
+
+
+def test_success_destination_bridge_gets_zero_cost_and_source_cost_equals_edge():
+    from types import SimpleNamespace
+
+    graph = IterativeBridgeGraph(
+        n_nodes=3, goals=np.asarray([2]),
+        base_src=np.asarray([0, 1]), base_dst=np.asarray([1, 2]),
+        base_weight=np.asarray([10.0, 10.0]),
+    )
+    plan = SimpleNamespace(
+        length_chunks=1, chunks=np.zeros((1, 5, 5), dtype=np.float32),
+        endpoint_error=0.0, sample_index=0,
+    )
+    accepted = insert_validated_bridges(
+        graph, np.asarray([[0, 2]]), lambda batch: [plan],
+        min_edge_cost=5.0, delta=5.0, b_max=2,
+    )
+    assert len(accepted) == 1
+    assert graph.cost[2] == 0.0
+    assert graph.cost[0] == 5.0
+    assert graph.bridge_count[0] == 1
+
+
+def test_model_pair_rejects_a_different_dataset_id():
+    from experiments.v07_runtime import validate_checkpoint_dataset_ids
+
+    metadata = {"dataset_id": "dataset-a"}
+    try:
+        validate_checkpoint_dataset_ids(metadata, metadata, "dataset-b")
+    except ValueError as exc:
+        assert "does not match" in str(exc)
+    else:
+        raise AssertionError("cross-dataset checkpoint loading should be rejected")
 
 
 def test_knn_expands_until_it_finds_k_cross_episode_neighbors():

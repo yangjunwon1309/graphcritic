@@ -46,8 +46,10 @@ def critic_targets(
         endpoint_nodes = artifact.nodes.assign_next[endpoint_rows]
         start_raw = np.asarray(artifact.cost[start_nodes], dtype=np.float64) / c
         end_raw = np.asarray(artifact.cost[endpoint_nodes], dtype=np.float64) / c
-        start_finite = np.isfinite(start_raw) & (start_raw < c_max_steps)
-        end_finite = np.isfinite(end_raw) & (end_raw < c_max_steps)
+        start_reachable = np.isfinite(start_raw)
+        end_reachable = np.isfinite(end_raw)
+        start_finite = start_reachable & (start_raw < c_max_steps)
+        end_finite = end_reachable & (end_raw < c_max_steps)
         start_cost = np.minimum(start_raw, c_max_steps)
         end_cost = np.minimum(end_raw, c_max_steps)
         start_cost[~np.isfinite(start_cost)] = c_max_steps
@@ -69,9 +71,11 @@ def critic_targets(
             loss_mask[:n_starts] = valid[:n_starts]
         else:
             # A temporal path of h edges from the chunk start to endpoint
-            # makes C(start) <= h + C(end). A finite endpoint behind a
-            # capped start therefore signals a broken graph/target invariant.
-            impossible = valid[:n_starts] & ~start_finite & end_finite
+            # makes C(start) <= h + C(end). An unreachable start behind a
+            # reachable endpoint is impossible. A *finite* start above the
+            # target cap is different: when the endpoint is below the cap,
+            # use the uncapped finite costs to retain the exact regret.
+            impossible = valid[:n_starts] & ~start_reachable & end_reachable
             if np.any(impossible):
                 rows = np.flatnonzero(impossible)[:8].tolist()
                 raise SchemaError(
@@ -79,7 +83,7 @@ def critic_targets(
                     f"(rows {rows})"
                 )
 
-            finite_pair = start_finite & end_finite & ~chunk_success
+            finite_pair = start_reachable & end_finite & ~chunk_success
             capped_end = start_finite & ~end_finite & ~chunk_success
             both_capped = ~start_finite & ~end_finite & ~chunk_success
             success_rows = valid[:n_starts] & chunk_success
@@ -91,7 +95,7 @@ def critic_targets(
                     f"(rows {rows})"
                 )
 
-            values[finite_pair] = h + end_cost[finite_pair] - start_cost[finite_pair]
+            values[finite_pair] = h + end_raw[finite_pair] - start_raw[finite_pair]
             values[capped_end] = cfg.regret_max
             success_steps = first_success.astype(np.float64) + 1.0
             success_steps[trans.success_cur[:n_starts]] = 0.0

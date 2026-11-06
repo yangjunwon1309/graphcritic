@@ -14,10 +14,10 @@ from graphcritic.targets import critic_targets
 from graphcritic.types import SchemaError, _content_hash
 
 
-def _artifact(trans, graph_kind="state"):
+def _artifact(trans, graph_kind="state", c_max_steps=None):
     cfg = GraphConfig(
         graph_kind=graph_kind, radius=0.25, compress=False, weight_policy="time",
-        bridge=BridgeConfig(enabled=False),
+        bridge=BridgeConfig(enabled=False), c_max_steps=c_max_steps,
     )
     return build_artifact(trans, cfg, dataset_id="toy:regret", source="unit-test")
 
@@ -62,6 +62,20 @@ def test_both_capped_rows_remain_qc_valid_but_are_excluded_from_loss():
     assert np.all(~targets.loss_mask[targets.source == 4])
     assert np.all(targets.valid[targets.source == 4])
     assert np.all(targets.y[targets.source == 4] == 0)
+
+
+def test_finite_start_above_cap_keeps_exact_regret_when_endpoint_is_below_cap():
+    trans, _ = make_chain(L=12, n_episodes=3, p_forward=1.0, seed=9)
+    artifact = _artifact(trans, c_max_steps=5.0)
+    targets = critic_targets(trans, artifact, TargetConfig(h=3))
+    starts = np.arange(trans.n_rows - 3 + 1)
+    endpoint_nodes = artifact.nodes.assign_next[starts + 2]
+    endpoint_cost = artifact.cost[endpoint_nodes] / -np.log(artifact.config.gamma)
+    selected = targets.valid[:len(starts)] & (targets.source[:len(starts)] == 1) & (endpoint_cost < 5.0)
+    assert np.any(selected)
+    np.testing.assert_allclose(targets.y[:len(starts)][selected], 0.0, atol=1e-5)
+    assert np.all(targets.loss_mask[:len(starts)][selected])
+    assert report(trans, artifact, targets)["targets"]["property_1_violation_count"] == 0
 
 
 def test_target_schema_v06_round_trip_persists_kind_and_loss_mask(tmp_path):

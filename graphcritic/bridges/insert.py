@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import heapq
+import sys
 from typing import Callable, Iterable
 
 import numpy as np
@@ -161,16 +162,22 @@ def insert_validated_bridges(
     b_max: int = 2,
     max_candidates_per_round: int = 2048,
     lambda_cost: float = 0.0,
+    progress: bool = False,
 ) -> list[dict[str, float | int]]:
     """Sequentially evaluate sorted candidates and update G0 path values."""
     pairs = np.asarray(candidate_pairs, dtype=np.int64)
     if pairs.ndim != 2 or pairs.shape[1] != 2:
         raise ValueError("candidate_pairs must have shape (N, 2)")
     accepted: list[dict[str, float | int]] = []
+    round_index = 0
     while True:
         src, dst = pairs[:, 0], pairs[:, 1]
         target_finite = np.isfinite(graph.cost[dst])
-        score = graph.cost[src] - graph.cost[dst]
+        # Both endpoints can be unreachable initially; inf - inf is NaN and
+        # is ineligible because the target must be finite. Keep that expected
+        # case quiet while preserving the score ordering for valid candidates.
+        with np.errstate(invalid="ignore"):
+            score = graph.cost[src] - graph.cost[dst]
         eligible_mask = target_finite & (score >= min_edge_cost + delta)
         eligible_mask &= graph.bridge_count[dst] + 1 <= b_max
         eligible_ids = np.flatnonzero(eligible_mask)
@@ -201,7 +208,8 @@ def insert_validated_bridges(
                 continue
             if graph.decrease_update(s, t, weight, b_max=b_max):
                 accepted.append({
-                    "order": len(accepted), "source": s, "target": t,
+                    "order": len(accepted), "round": round_index,
+                    "source": s, "target": t,
                     "length_chunks": length, "weight_steps": weight,
                     "improvement_steps": improvement,
                     "endpoint_error": float(plan.endpoint_error),
@@ -210,6 +218,13 @@ def insert_validated_bridges(
                 added += 1
         if added == 0:
             break
+        if progress:
+            print(
+                f"sequential bridge round {round_index}: added={added}, "
+                f"total={len(accepted)}",
+                file=sys.stderr, flush=True,
+            )
+        round_index += 1
     return accepted
 
 
@@ -223,13 +238,15 @@ def insert_validated_bridges_bulk(
     b_max: int = 2,
     max_candidates: int = 2048,
     lambda_cost: float = 0.0,
+    progress: bool = False,
 ) -> list[dict[str, float | int]]:
     """Comparison ablation: validate one G0-ranked batch, then add at once."""
     pairs = np.asarray(candidate_pairs, dtype=np.int64)
     if pairs.ndim != 2 or pairs.shape[1] != 2:
         raise ValueError("candidate_pairs must have shape (N, 2)")
     src, dst = pairs[:, 0], pairs[:, 1]
-    score = graph.cost[src] - graph.cost[dst]
+    with np.errstate(invalid="ignore"):
+        score = graph.cost[src] - graph.cost[dst]
     mask = np.isfinite(graph.cost[dst]) & (score >= min_edge_cost + delta)
     mask &= graph.bridge_count[dst] + 1 <= b_max
     ids = np.flatnonzero(mask)
@@ -258,12 +275,18 @@ def insert_validated_bridges_bulk(
         graph.added_dst.append(t)
         graph.added_weight.append(weight)
         graph._extra_predecessors.setdefault(t, []).append((s, weight))
-        accepted.append({"order": len(accepted), "source": s, "target": t,
+        accepted.append({"order": len(accepted), "round": 0,
+                         "source": s, "target": t,
                          "length_chunks": length, "weight_steps": weight,
                          "improvement_steps": improvement,
                          "endpoint_error": float(plan.endpoint_error),
                          "sample_index": int(plan.sample_index)})
     if accepted:
         graph.cost, graph.bridge_count, graph.successor = graph.full_recompute_paths(b_max=b_max)
+    if progress:
+        print(
+            f"bulk bridge pass: candidates={len(batch)}, added={len(accepted)}",
+            file=sys.stderr, flush=True,
+        )
     return accepted
 

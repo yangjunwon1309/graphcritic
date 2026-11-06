@@ -69,9 +69,38 @@ def save_checkpoint(directory: str | Path, params: Any, step: int,
     return path
 
 
-def load_model_pair(directory: str | Path, n_cont: int, n_bits: int):
+def validate_checkpoint_dataset_ids(
+    pi_metadata: dict[str, Any], f_metadata: dict[str, Any],
+    expected_dataset_id: str,
+) -> None:
+    """Reject mixed or cross-dataset π/f checkpoints before graph building."""
+    pi_id = pi_metadata.get("dataset_id")
+    f_id = f_metadata.get("dataset_id")
+    if not expected_dataset_id:
+        raise ValueError("an expected dataset ID is required when loading v0.7 models")
+    if pi_id != f_id:
+        raise ValueError(f"π/f checkpoint dataset IDs differ: π={pi_id!r}, f={f_id!r}")
+    if pi_id != expected_dataset_id:
+        raise ValueError(
+            "checkpoint dataset ID does not match graph-build data: "
+            f"checkpoint={pi_id!r}, expected={expected_dataset_id!r}"
+        )
+
+
+def load_model_pair(
+    directory: str | Path, n_cont: int, n_bits: int, *,
+    expected_dataset_id: str | None = None,
+):
     jax, jnp, _, serialization, _, MLP, TransitionMLP = _flax_modules()
     root = Path(directory)
+    pi_metadata = json.loads((root / "pi" / "metadata.json").read_text(encoding="utf-8"))
+    f_metadata = json.loads((root / "f" / "metadata.json").read_text(encoding="utf-8"))
+    if expected_dataset_id is None:
+        raise ValueError("expected_dataset_id is required for v0.7 model loading")
+    validate_checkpoint_dataset_ids(pi_metadata, f_metadata, expected_dataset_id)
+    for model_meta in (pi_metadata, f_metadata):
+        if int(model_meta.get("n_cont", -1)) != n_cont or int(model_meta.get("n_bits", -1)) != n_bits:
+            raise ValueError("checkpoint state dimensions do not match the graph-build dataset")
     pi_model = MLP(output_dim=25)
     f_model = TransitionMLP(n_cont=n_cont, n_bits=n_bits)
     key = jax.random.PRNGKey(0)

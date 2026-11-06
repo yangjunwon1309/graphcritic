@@ -154,11 +154,19 @@ def report(
         "n_edges": int(n_edges),
         "n_temporal_edges": int(np.count_nonzero(artifact.edges.kind == 0)),
         "n_bridge_edges": int(np.count_nonzero(bridge_mask)),
-        "bridge_counts": {
-            "R": int(np.count_nonzero(bridge_mask & (bridge_type == 0))),
-            "M": int(np.count_nonzero(bridge_mask & (bridge_type == 1))),
-            "legacy_unclassified": int(np.count_nonzero(bridge_mask & (bridge_type == -1))),
-        },
+        "bridge_counts": (
+            {
+                "R": int(np.count_nonzero(bridge_mask & (bridge_type == 0))),
+                "Graph Critic learned": int(np.count_nonzero(bridge_mask & (bridge_type == 1))),
+                "legacy_unclassified": int(np.count_nonzero(bridge_mask & (bridge_type == -1))),
+            }
+            if artifact.meta.get("bridge_v07") else
+            {
+                "R": int(np.count_nonzero(bridge_mask & (bridge_type == 0))),
+                "M": int(np.count_nonzero(bridge_mask & (bridge_type == 1))),
+                "legacy_unclassified": int(np.count_nonzero(bridge_mask & (bridge_type == -1))),
+            }
+        ),
         "merge_ratio": float(n_states / max(1, n_nodes)),
         "n_goal_nodes": int(np.count_nonzero(artifact.nodes.is_goal)),
         "n_success_episodes": int(len(successful_episodes)),
@@ -292,10 +300,11 @@ def report(
                 start_cost = artifact.cost[artifact.nodes.assign_cur[starts]] / c
                 end_cost = artifact.cost[artifact.nodes.assign_next[endpoint_rows]] / c
                 cmax = float(artifact.meta["c_max_steps"])
-                start_finite = np.isfinite(start_cost) & (start_cost < cmax)
-                end_finite = np.isfinite(end_cost) & (end_cost < cmax)
+                start_reachable = np.isfinite(start_cost)
+                end_reachable = np.isfinite(end_cost)
+                start_finite = start_reachable & (start_cost < cmax)
                 audited = valid[starts]
-                impossible = audited & ~start_finite & end_finite
+                impossible = audited & ~start_reachable & end_reachable
                 success_steps = np.zeros(starts.size, dtype=np.float64)
                 window = np.stack(
                     [trans.success[offset : offset + starts.size] for offset in range(targets.h)],
@@ -305,11 +314,14 @@ def report(
                 success_steps[has_success] = np.argmax(window[has_success], axis=1) + 1
                 success_steps[trans.success_cur[starts]] = 0.0
                 success_row = (source[starts] == 0) & audited
-                success_violation = success_row & (start_finite == 0) | (
+                success_violation = (success_row & ~start_finite) | (
                     success_row & (start_cost > success_steps + 1e-8)
                 )
                 finite_edge = (source[starts] == 1) & audited
-                temporal_violation = finite_edge & (start_cost > targets.h + end_cost + 1e-8)
+                temporal_violation = (
+                    finite_edge & start_reachable & end_reachable
+                    & (start_cost > targets.h + end_cost + 1e-8)
+                )
                 property_violations = int(np.count_nonzero(impossible | success_violation | temporal_violation))
             else:
                 property_violations = 0

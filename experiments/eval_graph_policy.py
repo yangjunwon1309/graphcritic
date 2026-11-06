@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import numpy as np
-from scipy.stats import spearmanr
+from scipy.stats import binomtest, spearmanr
 
 from graphcritic.featurize import StateFeaturizer, state_table
 from graphcritic.io import load_graph, load_sim_state, load_targets, load_transitions
@@ -72,6 +72,40 @@ def _quantiles(values: list[float]) -> dict[str, float | int | None]:
     }
 
 
+def _one_sided_success_rate_p(successes: int, n: int, baseline_rate: float) -> float:
+    """One-sample binomial p-value for improvement over a measured baseline."""
+    if n < 0 or successes < 0 or successes > n:
+        raise ValueError("successes and n must satisfy 0 <= successes <= n")
+    if not 0.0 <= baseline_rate <= 1.0:
+        raise ValueError("baseline_rate must lie in [0, 1]")
+    if n == 0:
+        return 1.0
+    return float(binomtest(successes, n, baseline_rate, alternative="greater").pvalue)
+
+
+def _mean_exp_minus_graph_cost(costs: list[float | None], step_cost_value: float) -> float:
+    """Treat an unreachable graph state as infinite cost, with exp(-C)=0."""
+    if not costs:
+        return 0.0
+    discounted = [
+        float(np.exp(-step_cost_value * cost))
+        if cost is not None and np.isfinite(cost) else 0.0
+        for cost in costs
+    ]
+    return float(np.mean(discounted))
+
+
+def _single_bridge_landing_records(outcomes: list[dict]) -> list[dict]:
+    """Collect R landing records only from reachable one-bridge paths."""
+    return [
+        record
+        for item in outcomes
+        if item.get("planned_bridges") is not None and int(item["planned_bridges"]) == 1
+        for record in item.get("bridge_landing", [])
+        if int(record.get("bridge_type", -1)) == 0
+    ]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--graph", type=Path, required=True)
@@ -88,6 +122,10 @@ def main() -> int:
                         help="JSON from eval_strict_bridges.py, used by the R_strict connection gate")
     parser.add_argument("--replay-baseline-result", type=Path,
                         help="Matched replay-controller JSON for the zero-bridge witness baseline")
+    parser.add_argument("--matched-starts", type=Path,
+                        help="Reuse the ordered 500 start rows from a prior witness JSON")
+    parser.add_argument("--compare-result", type=Path,
+                        help="Matched witness JSON for paired success and cost/time-rank comparison")
     parser.add_argument("--starts", type=int, default=500)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--window", type=int, default=10)
@@ -193,11 +231,28 @@ def main() -> int:
             response_gain=response_gain, contact_gain=args.contact_gain,
             free_distance=artifact.config.bridge.free_distance,
         )
-    starts = _choose_starts(trans, artifact, count, args.seed)
+    matched_result = None
+    if args.matched_starts is not None:
+        matched_result = json.loads(args.matched_starts.read_text(encoding="utf-8"))
+        if matched_result.get("dataset_id") != dataset_id:
+            raise SchemaError("matched start witness belongs to a different dataset")
+        matched_outcomes = matched_result.get("outcomes", [])
+        if len(matched_outcomes) != count:
+            raise SchemaError(
+                f"matched start witness has {len(matched_outcomes)} rows; expected {count}"
+            )
+        starts = [
+            (int(item["start_state"]), bool(item["failed_episode"]))
+            for item in matched_outcomes
+        ]
+    else:
+        starts = _choose_starts(trans, artifact, count, args.seed)
     start_selection = np.asarray(starts, dtype=np.int64)
     start_selection_hash = hashlib.sha256(
         np.ascontiguousarray(start_selection).tobytes()
     ).hexdigest()
+    if matched_result is not None and matched_result.get("start_selection_sha256") != start_selection_hash:
+        raise SchemaError("matched start witness hash does not match its outcome rows")
 
     try:
         import ogbench  # noqa: F401
@@ -217,6 +272,16 @@ def main() -> int:
     bridge_targets_unreached = 0
     try:
         for number, (start, failed_episode) in enumerate(starts, start=1):
+            if not np.isfinite(artifact.cost[start]):
+                outcomes.append({
+                    "start_state": start, "failed_episode": failed_episode,
+                    "planned_bridges": None, "used_bridges": 0,
+                    "graph_cost_steps": None, "actual_steps": 0,
+                    "success": False, "pessimism_hold": False,
+                    "time_ratio": None, "bridge_time_ratios": [],
+                    "bridge_landing": [], "failure_reason": "graph_unreachable",
+                })
+                continue
             if servo_policy is None:
                 assert policy is not None
                 policy.reset(start)
@@ -338,21 +403,24 @@ def main() -> int:
         wrapped_env.close()
 
     by_bridge: dict[str, dict[str, float | int]] = {}
-    labels = ["0", "1", "2", "3", "4+"]
+    labels = ["0", "1", "2", "3", "4+", "unreachable"]
     for label in labels:
         selected = [
             item for item in outcomes
-            if (str(item["planned_bridges"]) if item["planned_bridges"] < 4 else "4+") == label
+            if (
+                "unreachable" if item["planned_bridges"] is None else
+                (str(item["planned_bridges"]) if item["planned_bridges"] < 4 else "4+")
+            ) == label
         ]
         by_bridge[label] = {
             "n": len(selected),
             "success_rate": float(np.mean([item["success"] for item in selected])) if selected else 0.0,
         }
     successful = [item for item in outcomes if item["success"]]
-    bridge_le3 = [item for item in outcomes if item["planned_bridges"] <= 3]
+    bridge_le3 = [item for item in outcomes if item["planned_bridges"] is not None and item["planned_bridges"] <= 3]
     time_ratios = [item["time_ratio"] for item in successful if item["time_ratio"] is not None]
     zero_bridge = by_bridge["0"]
-    bridged_0_to_3 = [item for item in outcomes if 1 <= item["planned_bridges"] <= 3]
+    bridged_0_to_3 = [item for item in outcomes if item["planned_bridges"] is not None and 1 <= item["planned_bridges"] <= 3]
     bridged_rate = float(np.mean([item["success"] for item in bridged_0_to_3])) if bridged_0_to_3 else None
     zero_rate = float(zero_bridge["success_rate"]) if zero_bridge["n"] else None
     relative_retention = bridged_rate / zero_rate if bridged_rate is not None and zero_rate and zero_rate > 0 else None
@@ -367,9 +435,9 @@ def main() -> int:
         np.exp(-c * item["actual_steps"]) if item["success"] else 0.0
         for item in outcomes
     ])) if outcomes else 0.0
-    conservative_rhs = float(np.mean([
-        np.exp(-c * item["graph_cost_steps"]) for item in outcomes
-    ])) if outcomes else 0.0
+    conservative_rhs = _mean_exp_minus_graph_cost(
+        [item["graph_cost_steps"] for item in outcomes], c
+    )
     failure_reasons = {
         label: {
             "count": int(sum(item.get("failure_reason") == label for item in outcomes)),
@@ -386,7 +454,12 @@ def main() -> int:
     }
     landing_records = [record for item in outcomes for record in item.get("bridge_landing", [])]
     bridge_landing_by_type = {}
-    for label, code in (("R", 0), ("M", 1), ("legacy", -1)):
+    bridge_type_labels = (
+        (("R", 0), ("Graph Critic learned", 1), ("legacy", -1))
+        if artifact.meta.get("bridge_v07") else
+        (("R", 0), ("M", 1), ("legacy", -1))
+    )
+    for label, code in bridge_type_labels:
         selected = [record for record in landing_records if int(record.get("bridge_type", -1)) == code]
         landed = [record for record in selected if record.get("landed")]
         passive_groups = {}
@@ -439,7 +512,9 @@ def main() -> int:
     if failed_episode_count > 0 and graph_diagnostics["reachable_frac_failed_eps"] < 0.3:
         graph_gate_reasons.append("failed-episode reachable fraction is below 0.3")
     kin_violation = graph_diagnostics["bridge_calibration"].get("kinematic_violation")
-    has_m_bridges = bool(np.any(np.asarray(artifact.edges.bridge_type) == 1))
+    has_m_bridges = bool(np.any(np.asarray(artifact.edges.bridge_type) == 1)) and not bool(
+        artifact.meta.get("bridge_v07")
+    )
     if has_m_bridges:
         if kin_violation is None or float(kin_violation) > 0.05:
             graph_gate_reasons.append("M-bridge kinematic violation exceeds 0.05 or is unavailable")
@@ -523,12 +598,7 @@ def main() -> int:
 
         accuracy_reasons = []
         r_landing_rate = bridge_landing_by_type.get("R", {}).get("landing_rate")
-        strict_single_r_records = [
-            record
-            for item in outcomes if int(item["planned_bridges"]) == 1
-            for record in item.get("bridge_landing", [])
-            if int(record.get("bridge_type", -1)) == 0
-        ]
+        strict_single_r_records = _single_bridge_landing_records(outcomes)
         strict_single_r_landing_rate = (
             float(np.mean([bool(record.get("landed")) for record in strict_single_r_records]))
             if strict_single_r_records else None
@@ -587,6 +657,68 @@ def main() -> int:
             bool(record.get("landed"))
             for outcome in outcomes for record in outcome.get("bridge_landing", [])
         )
+    q3_comparison = None
+    if args.compare_result is not None:
+        compare = json.loads(args.compare_result.read_text(encoding="utf-8"))
+        if compare.get("dataset_id") != dataset_id:
+            raise SchemaError("Q3 comparison witness belongs to a different dataset")
+        if compare.get("controller") != args.controller:
+            raise SchemaError("Q3 comparison witness uses a different controller")
+        compare_outcomes = compare.get("outcomes", [])
+        if len(compare_outcomes) != len(outcomes):
+            raise SchemaError("Q3 comparison witness must have the same number of outcomes")
+        if compare.get("start_selection_sha256") != start_selection_hash:
+            raise SchemaError("Q3 comparison witness uses a different start selection")
+        current_success = np.asarray([bool(item["success"]) for item in outcomes])
+        other_success = np.asarray([bool(item["success"]) for item in compare_outcomes])
+        current_rate = float(np.mean(current_success))
+        other_rate = float(np.mean(other_success))
+        # Q3 specifies a one-sided binomial test against the measured V0 rate.
+        # Keep the paired McNemar test as an additional matched-start result.
+        p_rate = _one_sided_success_rate_p(
+            int(np.count_nonzero(current_success)), len(current_success), other_rate
+        )
+        wins = int(np.count_nonzero(current_success & ~other_success))
+        losses = int(np.count_nonzero(~current_success & other_success))
+        p_success = float(
+            binomtest(wins, wins + losses, 0.5, alternative="greater").pvalue
+        ) if wins + losses else 1.0
+        common = current_success & other_success
+        current_rho = other_rho = None
+        rank_ci = None
+        p_rank = None
+        if np.count_nonzero(common) >= 3:
+            current_cost = np.asarray([item["graph_cost_steps"] for item in outcomes])[common]
+            current_time = np.asarray([item["actual_steps"] for item in outcomes])[common]
+            other_cost = np.asarray([item["graph_cost_steps"] for item in compare_outcomes])[common]
+            other_time = np.asarray([item["actual_steps"] for item in compare_outcomes])[common]
+            current_rho = float(spearmanr(current_cost, current_time).statistic)
+            other_rho = float(spearmanr(other_cost, other_time).statistic)
+            rng = np.random.default_rng(0)
+            differences = []
+            for _ in range(2000):
+                sample = rng.integers(0, len(current_cost), len(current_cost))
+                rho_a = spearmanr(current_cost[sample], current_time[sample]).statistic
+                rho_b = spearmanr(other_cost[sample], other_time[sample]).statistic
+                if np.isfinite(rho_a) and np.isfinite(rho_b):
+                    differences.append(float(rho_a - rho_b))
+            if differences:
+                differences = np.asarray(differences)
+                rank_ci = np.quantile(differences, [0.025, 0.975]).tolist()
+                p_rank = float((1 + np.count_nonzero(differences <= 0.0)) / (len(differences) + 1))
+        q3_comparison = {
+            "comparison_result": str(args.compare_result),
+            "wins": wins, "losses": losses,
+            "one_sided_binomial_p_vs_comparison_rate": p_rate,
+            "passed_success_rate_gate": bool(current_rate > other_rate and p_rate < 0.05),
+            "one_sided_mcnemar_p": p_success,
+            "success_rate": current_rate,
+            "comparison_success_rate": other_rate,
+            "success_cost_time_spearman_common_success": current_rho,
+            "comparison_cost_time_spearman_common_success": other_rho,
+            "rank_difference_bootstrap_95ci": rank_ci,
+            "rank_difference_bootstrap_one_sided_p": p_rank,
+        }
     result = {
         "dataset_id": dataset_id,
         "graph_hash": artifact.content_hash,
@@ -608,6 +740,7 @@ def main() -> int:
         "bridge_targets_unreached": bridge_targets_unreached,
         "controller": args.controller,
         "start_selection_sha256": start_selection_hash,
+        "q3_comparison": q3_comparison,
         "contact_gain": float(args.contact_gain),
         "witness_calibration": witness_calibration,
         "zero_bridge_success": zero_rate,

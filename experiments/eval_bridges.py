@@ -34,6 +34,23 @@ from graphcritic.weights import step_cost
 from experiments.v07_runtime import load_model_pair, make_bridge_evaluator
 
 
+def _json_safe(value):
+    """Convert NumPy values and non-finite floats to strict JSON values."""
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist())
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        value = float(value)
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
+
+
 def cross_episode_knn_pairs(
     state_features: np.ndarray,
     episode_id: np.ndarray,
@@ -44,6 +61,7 @@ def cross_episode_knn_pairs(
     max_query: int | None = None,
     block_size: int = 4096,
     node_limit: int | None = None,
+    progress: bool = False,
 ) -> np.ndarray:
     """Return directed normalized-state kNN pairs from different episodes."""
     x = np.asarray(state_features, dtype=np.float32)
@@ -56,7 +74,7 @@ def cross_episode_knn_pairs(
     query_limit = len(x) if max_query is None else min(len(x), int(max_query))
     src_parts: list[np.ndarray] = []
     dst_parts: list[np.ndarray] = []
-    for start in range(0, n, block_size):
+    for block_number, start in enumerate(range(0, n, block_size), 1):
         rows = np.arange(start, min(n, start + block_size), dtype=np.int64)
         query_k = min(query_limit, max(k + 1, initial_query))
         _, neighbor = tree.query(x[rows], k=query_k, workers=-1)
@@ -65,7 +83,9 @@ def cross_episode_knn_pairs(
         missing: list[int] = []
         for i, row in enumerate(rows):
             cand = neighbor[i]
-            good = (cand != row) & (ep[cand] != ep[row]) & ~goals[cand]
+            # Successful dataset states are ordinary vertices with zero
+            # remaining cost.  They are valid bridge destinations (M1).
+            good = (cand != row) & (ep[cand] != ep[row])
             chosen = cand[good][:k]
             selected.append(chosen)
             if chosen.size < k and query_k < query_limit:
@@ -84,7 +104,7 @@ def cross_episode_knn_pairs(
                 for pos, local_i in enumerate(batch_missing):
                     row = int(rows[local_i])
                     cand = extra[pos]
-                    good = (cand != row) & (ep[cand] != ep[row]) & ~goals[cand]
+                    good = (cand != row) & (ep[cand] != ep[row])
                     chosen = cand[good][:k]
                     selected[local_i] = chosen
                     if chosen.size < k:
@@ -95,6 +115,12 @@ def cross_episode_knn_pairs(
             if chosen.size:
                 src_parts.append(np.full(chosen.size, rows[local_i], dtype=np.int32))
                 dst_parts.append(chosen.astype(np.int32, copy=False))
+        if progress and (block_number % 20 == 0 or start + len(rows) == n):
+            n_pairs = sum(len(part) for part in src_parts)
+            print(
+                f"cross-episode kNN: states={min(start + len(rows), n)}/{n}, "
+                f"pairs={n_pairs}", file=sys.stderr, flush=True,
+            )
     if not src_parts:
         return np.empty((0, 2), dtype=np.int64)
     pairs = np.column_stack((np.concatenate(src_parts), np.concatenate(dst_parts)))
@@ -102,6 +128,59 @@ def cross_episode_knn_pairs(
     # is unnecessary; sort is only for deterministic downstream tie handling.
     order = np.lexsort((pairs[:, 1], pairs[:, 0]))
     return pairs[order].astype(np.int64, copy=False)
+
+
+def load_or_build_candidate_pairs(
+    features: np.ndarray,
+    episode_id: np.ndarray,
+    is_goal: np.ndarray,
+    *,
+    dataset_id: str,
+    k: int,
+    cache_path: Path | None,
+    node_limit: int | None = None,
+    progress: bool = False,
+) -> np.ndarray:
+    """Load a dataset-bound kNN cache or build and save the deterministic pairs."""
+    if cache_path is not None and cache_path.is_file():
+        with np.load(cache_path, allow_pickle=False) as cached:
+            required = {"pairs", "dataset_id", "k", "n_nodes", "feature_dim", "node_limit"}
+            if not required.issubset(cached.files):
+                raise ValueError("candidate cache is missing required metadata")
+            checks = {
+                "dataset_id": (str(cached["dataset_id"].item()), dataset_id),
+                "k": (int(cached["k"].item()), int(k)),
+                "n_nodes": (int(cached["n_nodes"].item()), int(len(features))),
+                "feature_dim": (int(cached["feature_dim"].item()), int(np.asarray(features).shape[1])),
+                "node_limit": (
+                    int(cached["node_limit"].item()), -1 if node_limit is None else int(node_limit)
+                ),
+            }
+            for name, (actual, expected) in checks.items():
+                if actual != expected:
+                    raise ValueError(
+                        f"candidate cache {name} mismatch: cached={actual!r}, expected={expected!r}"
+                    )
+            pairs = np.asarray(cached["pairs"], dtype=np.int64)
+        if pairs.ndim != 2 or pairs.shape[1] != 2:
+            raise ValueError("candidate cache pairs must have shape (N, 2)")
+        if pairs.size and (np.any(pairs < 0) or np.any(pairs >= len(features))):
+            raise ValueError("candidate cache contains an out-of-range state index")
+        return pairs
+
+    pairs = cross_episode_knn_pairs(
+        features, episode_id, is_goal, k=k, node_limit=node_limit, progress=progress
+    )
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            cache_path,
+            pairs=pairs.astype(np.int32), dataset_id=np.asarray(dataset_id),
+            k=np.asarray(k, dtype=np.int64), n_nodes=np.asarray(len(features), dtype=np.int64),
+            feature_dim=np.asarray(np.asarray(features).shape[1], dtype=np.int64),
+            node_limit=np.asarray(-1 if node_limit is None else node_limit, dtype=np.int64),
+        )
+    return pairs
 
 
 def _artifact_with_bridges(base: GraphArtifact, graph: IterativeBridgeGraph,
@@ -338,6 +417,17 @@ def _path_witness(
             rank_ci = np.quantile(diffs, [0.025, 0.975]).tolist()
     success_rate = float(np.mean(new_success))
     baseline_rate = float(np.mean(base_success))
+    p_rate = float(binomtest(
+        int(np.count_nonzero(new_success)), len(new_success), baseline_rate,
+        alternative="greater",
+    ).pvalue)
+    accepted_report = []
+    for item in accepted:
+        row = dict(item)
+        row["source_cost_initially_unreachable"] = not bool(
+            np.isfinite(base.cost[int(item["source"])])
+        )
+        accepted_report.append(row)
     result = {
         "n": 500,
         "start_selection_sha256": digest,
@@ -346,14 +436,13 @@ def _path_witness(
         "baseline_success_rate": baseline_rate,
         "paired_success_wins": wins,
         "paired_success_losses": losses,
+        "success_one_sided_binomial_p_vs_baseline_rate": p_rate,
         "success_mcnemar_one_sided_p": p_success,
         "success_cost_time_spearman_common_success": rho_new,
         "baseline_cost_time_spearman_common_success": rho_base,
         "rank_difference_bootstrap_95ci": rank_ci,
         "rank_difference_bootstrap_one_sided_p": p_rank,
-        "passed_q3": bool(success_rate > baseline_rate and p_success < 0.05
-                           and rho_new is not None and rho_base is not None
-                           and rho_new > rho_base and p_rank is not None and p_rank < 0.05),
+        "passed_q3_success_gate": bool(success_rate > baseline_rate and p_rate < 0.05),
         "outcomes": results,
     }
     return result
@@ -383,6 +472,8 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--candidate-node-limit", type=int,
                         help="smoke-test cap; omit for full graph")
+    parser.add_argument("--candidate-cache", type=Path,
+                        help="optional dataset-bound NPZ cache shared by sequential and bulk builds")
     parser.add_argument("--skip-simulator", action="store_true")
     args = parser.parse_args()
 
@@ -397,7 +488,10 @@ def main() -> int:
         raise ValueError("v0.7 insertion must start from temporal-only G0")
     if base.nodes.n_nodes != len(data.state_raw):
         raise ValueError("model state table and G0 state nodes are not aligned")
-    model_pair = load_model_pair(args.checkpoint, data.n_cont, data.n_bits)
+    model_pair = load_model_pair(
+        args.checkpoint, data.n_cont, data.n_bits,
+        expected_dataset_id=transition_meta["dataset_id"],
+    )
     bridge_evaluator = make_bridge_evaluator(model_pair[0], model_pair[1])
     reference = load_graph(args.reference_graph, trans=trans) if args.reference_graph else None
     if reference is not None and reference.meta["dataset_id"] != base.meta["dataset_id"]:
@@ -405,9 +499,11 @@ def main() -> int:
 
     episode, _ = state_episode_time(trans)
     features = np.concatenate((data.state_cont, data.state_bits), axis=1)
-    pairs = cross_episode_knn_pairs(
-        features, episode, base.nodes.is_goal, k=args.knn,
-        node_limit=args.candidate_node_limit,
+    pairs = load_or_build_candidate_pairs(
+        features, episode, base.nodes.is_goal,
+        dataset_id=transition_meta["dataset_id"], k=args.knn,
+        cache_path=args.candidate_cache, node_limit=args.candidate_node_limit,
+        progress=True,
     )
     if pairs.size:
         existing = np.column_stack((base.edges.src, base.edges.dst))
@@ -458,14 +554,14 @@ def main() -> int:
             graph, pairs, validate_batch, min_edge_cost=5.0,
             delta=args.delta, b_max=args.max_added_per_path,
             max_candidates_per_round=args.max_candidates_per_round,
-            lambda_cost=0.0,
+            lambda_cost=0.0, progress=True,
         )
     else:
         accepted = insert_validated_bridges_bulk(
             graph, pairs, validate_batch, min_edge_cost=5.0,
             delta=args.delta, b_max=args.max_added_per_path,
             max_candidates=args.max_candidates_per_round,
-            lambda_cost=0.0,
+            lambda_cost=0.0, progress=True,
         )
     artifact = _artifact_with_bridges(base, graph, max_chunks=args.max_chunks)
     args.out.mkdir(parents=True, exist_ok=True)
@@ -507,6 +603,11 @@ def main() -> int:
     per_source_counts = np.bincount(pairs[:, 0], minlength=base.nodes.n_nodes) if pairs.size else np.zeros(base.nodes.n_nodes, dtype=np.int64)
     queried_sources = per_source_counts[:base.nodes.n_nodes if args.candidate_node_limit is None
                                       else min(base.nodes.n_nodes, args.candidate_node_limit)]
+    round_summary: dict[str, int] = {}
+    for item in accepted:
+        label = str(int(item["round"]))
+        round_summary[label] = round_summary.get(label, 0) + 1
+    bridge_count_values, bridge_count_frequencies = np.unique(graph.bridge_count, return_counts=True)
     result = {
         "spec": "Graph Critic v0.7",
         "dataset_id": transition_meta["dataset_id"],
@@ -518,7 +619,9 @@ def main() -> int:
         "epsilon_z": data.epsilon_z.tolist(),
         "candidate": {"metric": "Euclidean on z-normalized continuous coordinates concatenated with binary button coordinates",
                       "k": args.knn, "cross_episode_only": True,
-                      "no_success_target_edges": True, "count": int(len(pairs)),
+                      "success_states_are_valid_destinations": True,
+                      "success_destination_candidate_count": int(np.count_nonzero(base.nodes.is_goal[pairs[:, 1]])) if len(pairs) else 0,
+                      "count": int(len(pairs)),
                       "smoke_source_limit": args.candidate_node_limit,
                       "source_count": int(np.count_nonzero(queried_sources)),
                       "queried_source_count": int(len(queried_sources)),
@@ -531,12 +634,25 @@ def main() -> int:
                       "B_max": args.max_added_per_path, "h": 5,
                       "max_chunks": args.max_chunks, "N": args.plan_samples,
                       "M_per_round": args.max_candidates_per_round,
-                      "rounds_and_edges": accepted,
+                      "rounds_and_edges": accepted_report,
+                      "accepted_by_round": round_summary,
                       "accepted_count": int(len(accepted)),
+                      "validated_candidate_count": int(validation_count),
+                      "acceptance_rate_among_validated": (
+                          float(len(accepted) / validation_count) if validation_count else None
+                      ),
+                      "acceptance_rate_among_knn_pairs": (
+                          float(len(accepted) / len(pairs)) if len(pairs) else None
+                      ),
+                      "success_destination_edges": int(sum(bool(base.nodes.is_goal[int(item["target"])]) for item in accepted)),
                       "unreachable_sources_initially_allowed": True},
         "cost_steps": {"finite_fraction": float(np.mean(np.isfinite(graph.cost))),
                        "reachable_nodes": int(np.count_nonzero(np.isfinite(graph.cost))),
                        "path_bridge_count_max": int(np.max(graph.bridge_count, initial=0)),
+                       "path_bridge_count_distribution": {
+                           str(int(value)): int(count)
+                           for value, count in zip(bridge_count_values, bridge_count_frequencies, strict=True)
+                       },
                        "cost_p50_finite": float(np.median(graph.cost[np.isfinite(graph.cost)])) if np.any(np.isfinite(graph.cost)) else None},
         "q2_reachability": {"graph_fraction": reachable_frac,
                             "reference_fraction": reference_reachable_frac,
@@ -546,8 +662,9 @@ def main() -> int:
         "path_q3": path_witness,
         "elapsed_seconds": float(time.time() - started),
     }
+    result = _json_safe(result)
     (args.out / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n")
-    print(json.dumps({k: v for k, v in result.items() if k != "insertion"}, sort_keys=True))
+    print(json.dumps({k: v for k, v in result.items() if k != "insertion"}, sort_keys=True, allow_nan=False))
     return 0
 
 

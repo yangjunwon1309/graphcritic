@@ -454,14 +454,23 @@ def collapse_alarm(diagnostics: dict[str, Any], *, last_projector_layer: str,
 
 
 def make_distance_predictor(model, params, *, batch_size: int = 8192):
-    """Build a fixed-shape JIT forward function and NumPy batch adapter."""
+    """Predict distances through the same separately batched encoder as cache."""
     jax, jnp, _, _, _ = _jax_modules()
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
 
+    embedder = make_quasimetric_embedder(model)
     @jax.jit
-    def predict_jit(source, destination):
-        return model.apply({"params": params}, source, destination)
+    def embed_jit(inputs):
+        return embedder.apply({"params": params}, inputs)
+
+    @jax.jit
+    def distance_jit(source_embedding, destination_embedding):
+        return iqe_distance_from_embeddings(
+            source_embedding, destination_embedding, params["raw_alpha"],
+            n_components=model.n_components,
+            component_dim=model.component_dim, jnp=jnp,
+        )
 
     def predict(source: np.ndarray, destination: np.ndarray) -> np.ndarray:
         src = np.asarray(source, dtype=np.float32)
@@ -476,7 +485,9 @@ def make_distance_predictor(model, params, *, batch_size: int = 8192):
             destination_batch = np.zeros_like(source_batch)
             source_batch[:current_n] = src[start:end]
             destination_batch[:current_n] = dst[start:end]
-            values = np.asarray(predict_jit(jnp.asarray(source_batch), jnp.asarray(destination_batch)))
+            source_embedding = embed_jit(jnp.asarray(source_batch))
+            destination_embedding = embed_jit(jnp.asarray(destination_batch))
+            values = np.asarray(distance_jit(source_embedding, destination_embedding))
             out[start:end] = values[:current_n]
         return out
 
@@ -502,7 +513,7 @@ def make_embedding_cache_predictor(
     dataset_id: str,
     cache_path: str | Path,
     embed_batch_size: int = 8192,
-    pair_batch_size: int = 262_144,
+    pair_batch_size: int = 4096,
 ):
     """Encode each candidate node once and expose cached node-pair distances.
 

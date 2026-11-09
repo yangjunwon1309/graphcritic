@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import replace
 import json
+import math
 from pathlib import Path
 import sys
 import time
@@ -79,6 +80,18 @@ def _flow_judge(args, data, features, dataset_id: str) -> FlowJudge:
     )
 
 
+def _apply_bridge_lambda(cost_steps: np.ndarray, bridge_lambda_steps: float) -> np.ndarray:
+    """Add the per-bridge penalty after acceptance, without changing distance."""
+    costs = np.asarray(cost_steps, dtype=np.float64)
+    if costs.ndim != 1 or np.any(~np.isfinite(costs)) or np.any(costs < 0):
+        raise ValueError("accepted bridge costs must be a finite non-negative vector")
+    if not math.isfinite(bridge_lambda_steps) or bridge_lambda_steps < 0:
+        raise ValueError("bridge_lambda_steps must be finite and non-negative")
+    if bridge_lambda_steps == 0:
+        return costs.copy()
+    return costs + float(bridge_lambda_steps)
+
+
 def _make_artifact(
     base: GraphArtifact,
     bridge_src: np.ndarray,
@@ -92,6 +105,7 @@ def _make_artifact(
     model_metadata: dict,
     candidate_rule: str,
     window_size: int,
+    bridge_lambda_steps: float = 0.0,
 ) -> GraphArtifact:
     src = np.asarray(bridge_src, dtype=np.int64)
     dst = np.asarray(bridge_dst, dtype=np.int64)
@@ -101,9 +115,11 @@ def _make_artifact(
         raise ValueError("bridge endpoint, cost, and distance arrays must align")
     if np.any(~np.isfinite(costs)) or np.any(costs < 0):
         raise ValueError("bridge costs must be finite and non-negative")
+    if not math.isfinite(bridge_lambda_steps) or bridge_lambda_steps < 0:
+        raise ValueError("bridge_lambda_steps must be finite and non-negative")
 
-    # kappa is legacy integer step metadata. The canonical judge cost remains
-    # the float GraphArtifact weight and is also recorded as bridge dist.
+    # kappa is legacy integer step metadata. Graph weights store penalized
+    # bridge costs while edge dist preserves the judge's unpenalized distance.
     kappa = np.maximum(1, np.ceil(costs).astype(np.int64))
     old = base.edges
     n_added = len(src)
@@ -138,10 +154,13 @@ def _make_artifact(
         "bridge_window_size": int(window_size),
         "bridge_max_added_per_path": 2,
         "bridge_max_judge_distance_steps": 20.0 if judge_name == "quasimetric" else None,
-        "bridge_lambda_steps": 0.0,
+        "bridge_lambda_steps": float(bridge_lambda_steps),
         "bridge_cost_definition": (
-            "quasimetric_distance_steps" if judge_name == "quasimetric"
-            else "flow_chunk_count_times_5_steps"
+            ("quasimetric_distance_steps" if bridge_lambda_steps == 0
+             else "quasimetric_distance_steps_plus_bridge_lambda_steps")
+            if judge_name == "quasimetric" else
+            ("flow_chunk_count_times_5_steps" if bridge_lambda_steps == 0
+             else "flow_chunk_count_times_5_steps_plus_bridge_lambda_steps")
         ),
         "bridge_model_metadata": model_metadata,
     })
@@ -179,9 +198,16 @@ def _parse(argv: list[str] | None = None):
     parser.add_argument("--plan-samples", type=int, default=64)
     parser.add_argument("--max-chunks", type=int, default=4)
     parser.add_argument("--max-bridge-distance", type=float, default=20.0)
+    parser.add_argument(
+        "--bridge-lambda-steps", type=float, default=0.0,
+        help="extra pessimism cost added per accepted bridge, in steps",
+    )
     parser.add_argument("--embedding-cache", type=Path,
                         help="float32 .npy cache for per-node IQE embeddings")
-    parser.add_argument("--embedding-pair-batch-size", type=int, default=262_144)
+    parser.add_argument(
+        "--embedding-pair-batch-size", type=int, default=4096,
+        help="node pairs per GPU embedding lookup; lower this if GPU memory is limited",
+    )
     return parser.parse_args(argv)
 
 
@@ -192,6 +218,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("v0.8 fixes k=32 and delta=5; judge-batch-size must be positive")
     if not 1 <= args.max_chunks <= 4 or args.plan_samples < 1 or args.max_bridge_distance != 20.0:
         raise SystemExit("v0.8 fixes K=20 and at most four flow chunks")
+    if not math.isfinite(args.bridge_lambda_steps) or args.bridge_lambda_steps < 0:
+        raise SystemExit("--bridge-lambda-steps must be finite and non-negative")
     started = time.time()
     stages: dict[str, float] = {}
     trans, trans_meta = load_transitions(args.transitions)
@@ -414,7 +442,9 @@ def main(argv: list[str] | None = None) -> int:
         stages["judge_setup_and_evaluation_seconds"] = time.time() - judge_setup_started
     accepted_indices = np.flatnonzero(accepted).astype(np.int64)
     accepted_pairs = optimistic_pairs[accepted_indices]
-    accepted_costs = judge_cost[accepted_indices].astype(np.float64)
+    accepted_costs = _apply_bridge_lambda(
+        judge_cost[accepted_indices], args.bridge_lambda_steps
+    )
     if args.judge == "quasimetric":
         accepted_distances = judge_distance[accepted_indices]
     else:
@@ -447,6 +477,7 @@ def main(argv: list[str] | None = None) -> int:
                        "frame_dim", "window", "constraint_horizon", "encoder_widths",
                        "projector_widths", "n_components", "component_dim"}
         }, candidate_rule=candidate_rule, window_size=candidate_window,
+        bridge_lambda_steps=args.bridge_lambda_steps,
     )
     graph_hash = save_graph(artifact, args.out / "graph.npz")
     targets = critic_targets(
@@ -509,6 +540,7 @@ def main(argv: list[str] | None = None) -> int:
         "spec_version": "v0.8",
         "dataset_id": dataset_id,
         "judge": args.judge,
+        "bridge_lambda_steps": float(args.bridge_lambda_steps),
         "g0_hash": base.content_hash,
         "graph_hash": graph_hash,
         "model_checkpoint": str(args.checkpoint),
@@ -549,10 +581,17 @@ def main(argv: list[str] | None = None) -> int:
         "h5_regret_valid_fraction": float(np.mean(targets.valid)),
         "quasimetric_distance_summary": (
             {
-                "accepted_p50": float(np.quantile(accepted_costs, 0.5)),
-                "accepted_p90": float(np.quantile(accepted_costs, 0.9)),
-                "accepted_max": float(np.max(accepted_costs)),
-            } if args.judge == "quasimetric" and len(accepted_costs) else None
+                "accepted_p50": float(np.quantile(accepted_distances, 0.5)),
+                "accepted_p90": float(np.quantile(accepted_distances, 0.9)),
+                "accepted_max": float(np.max(accepted_distances)),
+            } if args.judge == "quasimetric" and len(accepted_distances) else None
+        ),
+        "accepted_bridge_cost_summary": (
+            {
+                "p50": float(np.quantile(accepted_costs, 0.5)),
+                "p90": float(np.quantile(accepted_costs, 0.9)),
+                "max": float(np.max(accepted_costs)),
+            } if len(accepted_costs) else None
         ),
         "embedding_cache": embedding_report,
         "stage_seconds": stages,

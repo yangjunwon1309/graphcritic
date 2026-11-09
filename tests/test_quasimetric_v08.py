@@ -259,8 +259,10 @@ def test_embedding_then_iqe_head_matches_direct_model_within_tolerance():
     )["params"]
     direct = model.apply({"params": params}, jnp.asarray(states[:16]), jnp.asarray(states[16:]))
     embedder = make_quasimetric_embedder(model)
-    z_source = embedder.apply({"params": params}, jnp.asarray(states[:16]))
-    z_target = embedder.apply({"params": params}, jnp.asarray(states[16:]))
+    # Match the pair model's single joined Dense batch so backend matrix
+    # kernels see the same shape on both sides of this decomposition check.
+    joined = embedder.apply({"params": params}, jnp.asarray(states))
+    z_source, z_target = joined[:16], joined[16:]
     decomposed = iqe_distance_from_embeddings(
         z_source, z_target, params["raw_alpha"], n_components=2,
         component_dim=4, jnp=jnp,

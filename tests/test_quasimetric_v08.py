@@ -53,6 +53,126 @@ def test_iqe_model_has_zero_self_distance_and_triangle_inequality():
     assert np.any(np.abs(d_uv - predict(v, u)) > 1e-6)
 
 
+@pytest.mark.skipif(not _has_jax(), reason="model configuration test requires JAX/Flax")
+def test_gelu_layernorm_model_exposes_collapse_diagnostics():
+    import jax
+    import jax.numpy as jnp
+
+    from experiments.v08_runtime import (
+        activation_diagnostics,
+        make_activation_diagnostic_fn,
+        make_quasimetric_model,
+    )
+
+    model = make_quasimetric_model(
+        encoder_widths=(16, 8), projector_widths=(16, 8),
+        n_components=2, component_dim=4,
+    )
+    states = np.random.default_rng(4).normal(size=(64, 5)).astype(np.float32)
+    params = model.init(
+        jax.random.PRNGKey(5), jnp.asarray(states[:4]), jnp.asarray(states[4:8])
+    )["params"]
+    assert "encoder_0_norm" in params
+    assert "projector_0_norm" in params
+    report = activation_diagnostics(
+        make_activation_diagnostic_fn(model), params, states, activation="gelu"
+    )
+    assert report["n_diagnostic_states"] == len(states)
+    assert set(report["dead_unit_frac_by_layer"]) == {"encoder_0", "projector_0"}
+    assert all(0.0 <= value <= 1.0 for value in report["dead_unit_frac_by_layer"].values())
+    assert report["projector_output_mean_variance"] >= 0.0
+
+
+def test_collapse_alarm_uses_strict_dead_fraction_and_variance_limits():
+    from experiments.v08_runtime import collapse_alarm
+
+    healthy = {
+        "dead_unit_frac_by_layer": {"projector_1": 0.95},
+        "projector_output_mean_variance": 1e-6,
+    }
+    assert collapse_alarm(healthy, last_projector_layer="projector_1") == (False, None)
+    dead = {
+        "dead_unit_frac_by_layer": {"projector_1": 0.951},
+        "projector_output_mean_variance": 1.0,
+    }
+    alarm, reason = collapse_alarm(dead, last_projector_layer="projector_1")
+    assert alarm and "dead_unit_frac" in reason
+    constant = {
+        "dead_unit_frac_by_layer": {"projector_1": 0.1},
+        "projector_output_mean_variance": 0.0,
+    }
+    alarm, reason = collapse_alarm(constant, last_projector_layer="projector_1")
+    assert alarm and "projector_output_mean_variance" in reason
+
+
+def test_projected_dual_sgd_moves_lambda_with_gap_and_respects_zero_boundary():
+    if not _has_jax():
+        pytest.skip("dual update test requires JAX")
+    import jax
+    import jax.numpy as jnp
+
+    from experiments.v08_runtime import projected_dual_sgd
+
+    increased = projected_dual_sgd(jnp.asarray(0.3), 0.1, 1.0, jnp)
+    decreased = projected_dual_sgd(jnp.asarray(0.3), -0.1, 1.0, jnp)
+    projected = projected_dual_sgd(jnp.asarray(0.1), -1.0, 1.0, jnp)
+    np.testing.assert_allclose(increased, 0.4, atol=1e-6)
+    np.testing.assert_allclose(decreased, 0.2, atol=1e-6)
+    np.testing.assert_allclose(projected, 0.0, atol=0.0)
+
+
+def test_warm_start_copies_dense_and_alpha_but_preserves_identity_layernorm():
+    from experiments.train_quasimetric import _warm_start_parameters
+
+    target = {
+        "encoder_0": {"kernel": np.zeros((2, 3)), "bias": np.zeros(3)},
+        "encoder_0_norm": {"scale": np.ones(3), "bias": np.zeros(3)},
+        "projector_out": {"kernel": np.zeros((3, 4)), "bias": np.zeros(4)},
+        "raw_alpha": np.asarray(0.0),
+    }
+    source = {
+        "encoder_0": {"kernel": np.full((2, 3), 2.0), "bias": np.full(3, 3.0)},
+        "projector_out": {"kernel": np.full((3, 4), 4.0), "bias": np.full(4, 5.0)},
+        "raw_alpha": np.asarray(-2.0),
+    }
+    result = _warm_start_parameters(target, source)
+    assert np.all(result["encoder_0"]["kernel"] == 2.0)
+    assert np.all(result["projector_out"]["bias"] == 5.0)
+    assert np.all(result["encoder_0_norm"]["scale"] == 1.0)
+    assert np.all(result["encoder_0_norm"]["bias"] == 0.0)
+    np.testing.assert_array_equal(result["raw_alpha"], -2.0)
+
+
+@pytest.mark.skipif(not _has_jax(), reason="optimizer test requires JAX/Flax/Optax")
+def test_train_step_reports_preclip_norm_with_projected_sgd_dual():
+    import jax
+    import jax.numpy as jnp
+
+    from experiments.v08_runtime import initialize_train_state, make_quasimetric_model, make_train_step
+
+    model = make_quasimetric_model(
+        encoder_widths=(8, 4), projector_widths=(8, 8),
+        n_components=2, component_dim=4,
+    )
+    update, primal_optimizer, dual_optimizer = make_train_step(
+        model, batch_size=4, grad_clip=0.1, dual="sgd", lambda_learning_rate=1.0
+    )
+    params, primal_state, raw_lambda, dual_state, key = initialize_train_state(
+        model, seed=3, input_dim=5,
+        primal_optimizer=primal_optimizer, dual_optimizer=dual_optimizer,
+    )
+    states = jnp.asarray(np.random.default_rng(8).normal(size=(12, 5)), dtype=jnp.float32)
+    next_indices = jnp.asarray(np.roll(np.arange(12, dtype=np.int32), -1))
+    train_rows = jnp.arange(12, dtype=jnp.int32)
+    result = update(
+        params, primal_state, raw_lambda, dual_state, key,
+        states, next_indices, train_rows,
+    )
+    metrics = result[-1]
+    assert float(metrics["gradient_norm_preclip"]) > 0.0
+    assert np.isfinite(float(metrics["lambda"]))
+
+
 def test_quasimetric_judge_batches_and_uses_distance_as_cost():
     from graphcritic.bridges.judge_quasimetric import QuasimetricJudge
 

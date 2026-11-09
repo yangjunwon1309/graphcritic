@@ -39,6 +39,8 @@ def make_quasimetric_model(
     projector_widths: tuple[int, ...] = DEFAULT_PROJECTOR_WIDTHS,
     n_components: int = DEFAULT_COMPONENTS,
     component_dim: int = DEFAULT_COMPONENT_DIM,
+    activation: str = "gelu",
+    layernorm: bool = True,
 ):
     """Create the shared encoder/projector and IQE-maxmean model.
 
@@ -53,35 +55,59 @@ def make_quasimetric_model(
         raise ValueError("all network widths must be positive")
     if n_components < 1 or component_dim < 1:
         raise ValueError("IQE component dimensions must be positive")
+    if activation not in {"relu", "gelu"}:
+        raise ValueError("activation must be 'relu' or 'gelu'")
 
     class IQEQuasimetric(nn.Module):
         encoder_widths: tuple[int, ...]
         projector_widths: tuple[int, ...]
         n_components: int
         component_dim: int
+        activation: str
+        layernorm: bool
 
         @nn.compact
-        def __call__(self, source, destination):
+        def __call__(self, source, destination, *, return_diagnostics=False):
             if source.shape != destination.shape or source.ndim != 2:
                 raise ValueError("quasimetric inputs must be aligned rank-2 arrays")
             joined = jnp.concatenate((source, destination), axis=0)
+            preactivations = {}
             for layer, width in enumerate(self.encoder_widths[:-1]):
+                name = f"encoder_{layer}"
                 joined = nn.Dense(
                     width, kernel_init=nn.initializers.xavier_uniform(),
-                    name=f"encoder_{layer}",
+                    name=name,
                 )(joined)
-                joined = nn.relu(joined)
+                if self.layernorm:
+                    joined = nn.LayerNorm(
+                        scale_init=nn.initializers.ones,
+                        bias_init=nn.initializers.zeros,
+                        name=f"{name}_norm",
+                    )(joined)
+                if return_diagnostics:
+                    preactivations[name] = joined
+                joined = nn.relu(joined) if self.activation == "relu" else jax.nn.gelu(joined)
             joined = nn.Dense(
                 self.encoder_widths[-1],
                 kernel_init=nn.initializers.xavier_uniform(),
                 name="encoder_out",
             )(joined)
+            encoder_embedding = joined
             for layer, width in enumerate(self.projector_widths[:-1]):
+                name = f"projector_{layer}"
                 joined = nn.Dense(
                     width, kernel_init=nn.initializers.xavier_uniform(),
-                    name=f"projector_{layer}",
+                    name=name,
                 )(joined)
-                joined = nn.relu(joined)
+                if self.layernorm:
+                    joined = nn.LayerNorm(
+                        scale_init=nn.initializers.ones,
+                        bias_init=nn.initializers.zeros,
+                        name=f"{name}_norm",
+                    )(joined)
+                if return_diagnostics:
+                    preactivations[name] = joined
+                joined = nn.relu(joined) if self.activation == "relu" else jax.nn.gelu(joined)
             joined = nn.Dense(
                 self.projector_widths[-1],
                 kernel_init=nn.initializers.xavier_uniform(),
@@ -107,9 +133,17 @@ def make_quasimetric_model(
                 "raw_alpha", nn.initializers.constant(-1.0), ()
             )
             alpha = jax.nn.sigmoid(raw_alpha)
-            return alpha * jnp.max(component_distance, axis=-1) + (
+            distance = alpha * jnp.max(component_distance, axis=-1) + (
                 1.0 - alpha
             ) * jnp.mean(component_distance, axis=-1)
+            if return_diagnostics:
+                return {
+                    "distance": distance,
+                    "preactivations": preactivations,
+                    "encoder_embedding": encoder_embedding[:batch],
+                    "projector_embedding": joined[:batch],
+                }
+            return distance
 
     # The nested module needs no closure over JAX; this makes its checkpoint
     # structure stable across the training and graph-build entry points.
@@ -117,6 +151,7 @@ def make_quasimetric_model(
         encoder_widths=tuple(map(int, encoder_widths)),
         projector_widths=tuple(map(int, projector_widths)),
         n_components=int(n_components), component_dim=int(component_dim),
+        activation=activation, layernorm=bool(layernorm),
     )
 
 
@@ -147,14 +182,27 @@ def qrl_loss_components(distance_goal, distance_step, lambda_value, *, epsilon: 
     return total, distance_maximization_loss, one_step_violation, constraint_gap
 
 
+def projected_dual_sgd(raw_lambda, constraint_gap, learning_rate, jnp):
+    """Apply λ ← max(0, λ + η·gap) in direct, projected-lambda space."""
+    return jnp.maximum(0.0, raw_lambda + learning_rate * constraint_gap)
+
+
 def make_train_step(model, *, batch_size: int = 4096, epsilon: float = 0.25,
-                    learning_rate: float = 5e-4, lambda_learning_rate: float = 1e-2):
+                    learning_rate: float = 5e-4, lambda_learning_rate: float = 1e-2,
+                    grad_clip: float = 1.0, dual: str = "adam"):
     """Create the compiled primal/dual QRL update for one training batch."""
     jax, jnp, _, _, optax = _jax_modules()
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
-    primal_optimizer = optax.adam(learning_rate)
-    dual_optimizer = optax.adam(lambda_learning_rate)
+    if grad_clip < 0:
+        raise ValueError("grad_clip must be non-negative")
+    if dual not in {"adam", "sgd"}:
+        raise ValueError("dual must be 'adam' or 'sgd'")
+    primal_optimizer = (
+        optax.chain(optax.clip_by_global_norm(grad_clip), optax.adam(learning_rate))
+        if grad_clip > 0 else optax.adam(learning_rate)
+    )
+    dual_optimizer = optax.adam(lambda_learning_rate) if dual == "adam" else None
 
     @jax.jit
     def update(params, primal_state, raw_lambda, dual_state, key,
@@ -173,7 +221,9 @@ def make_train_step(model, *, batch_size: int = 4096, epsilon: float = 0.25,
         independent_goal = states[next_state_index[goal_rows]]
         left = jnp.concatenate((current, current), axis=0)
         right = jnp.concatenate((independent_goal, one_step_next), axis=0)
-        dual_value = jax.lax.stop_gradient(jax.nn.softplus(raw_lambda))
+        dual_value = jax.lax.stop_gradient(
+            jax.nn.softplus(raw_lambda) if dual == "adam" else raw_lambda
+        )
 
         def primal_loss(parameters):
             distances = model.apply({"params": parameters}, left, right)
@@ -190,26 +240,33 @@ def make_train_step(model, *, batch_size: int = 4096, epsilon: float = 0.25,
                  violation, constraint_gap)), grads = jax.value_and_grad(
             primal_loss, has_aux=True
         )(params)
+        gradient_norm_preclip = optax.global_norm(grads)
         updates, primal_state = primal_optimizer.update(grads, primal_state, params)
         params = optax.apply_updates(params, updates)
 
-        def dual_loss_fn(raw):
-            lam = jax.nn.softplus(raw)
-            return -lam * jax.lax.stop_gradient(constraint_gap)
+        if dual == "adam":
+            def dual_loss_fn(raw):
+                lam = jax.nn.softplus(raw)
+                return -lam * jax.lax.stop_gradient(constraint_gap)
 
-        dual_grad = jax.grad(dual_loss_fn)(raw_lambda)
-        dual_updates, dual_state = dual_optimizer.update(
-            dual_grad, dual_state, raw_lambda
-        )
-        raw_lambda = optax.apply_updates(raw_lambda, dual_updates)
+            dual_grad = jax.grad(dual_loss_fn)(raw_lambda)
+            dual_updates, dual_state = dual_optimizer.update(
+                dual_grad, dual_state, raw_lambda
+            )
+            raw_lambda = optax.apply_updates(raw_lambda, dual_updates)
+        else:
+            raw_lambda = projected_dual_sgd(
+                raw_lambda, constraint_gap, lambda_learning_rate, jnp
+            )
         metrics = {
             "loss": total,
             "distance_maximization_loss": distance_loss,
             "one_step_violation_squared": violation,
             "constraint_gap": constraint_gap,
-            "lambda": jax.nn.softplus(raw_lambda),
+            "lambda": jax.nn.softplus(raw_lambda) if dual == "adam" else raw_lambda,
             "distance_goal_mean": jnp.mean(distance_goal),
             "distance_step_mean": jnp.mean(distance_step),
+            "gradient_norm_preclip": gradient_norm_preclip,
         }
         return params, primal_state, raw_lambda, dual_state, key, metrics
 
@@ -226,11 +283,71 @@ def initialize_train_state(model, *, seed: int, input_dim: int,
         jnp.zeros((2, input_dim), dtype=jnp.float32),
     )["params"]
     primal_state = primal_optimizer.init(params)
-    # Inverse softplus so the requested initial positive dual variable is 0.01.
+    # Adam follows QRL's softplus parameterization. Projected SGD stores λ directly.
     initial_lambda = 0.01
-    raw_lambda = jnp.asarray(np.log(np.expm1(initial_lambda)), dtype=jnp.float32)
-    dual_state = dual_optimizer.init(raw_lambda)
+    raw_lambda = jnp.asarray(
+        np.log(np.expm1(initial_lambda)) if dual_optimizer is not None else initial_lambda,
+        dtype=jnp.float32,
+    )
+    dual_state = (
+        dual_optimizer.init(raw_lambda) if dual_optimizer is not None
+        else jnp.asarray(0.0, dtype=jnp.float32)
+    )
     return params, primal_state, raw_lambda, dual_state, key
+
+
+def make_activation_diagnostic_fn(model):
+    """Compile the fixed-shape held-out activation/embedding diagnostic."""
+    jax, _, _, _, _ = _jax_modules()
+
+    @jax.jit
+    def diagnose(params, states):
+        return model.apply(
+            {"params": params}, states, states, return_diagnostics=True
+        )
+
+    return diagnose
+
+
+def activation_diagnostics(diagnose, params, states: np.ndarray, *, activation: str):
+    """Summarize dead hidden units and representation variance on fixed states."""
+    if activation not in {"relu", "gelu"}:
+        raise ValueError("activation must be 'relu' or 'gelu'")
+    states = np.asarray(states, dtype=np.float32)
+    if states.ndim != 2 or len(states) == 0:
+        raise ValueError("diagnostic states must be a non-empty rank-2 array")
+    raw = diagnose(params, states)
+    preactivations = raw["preactivations"]
+    dead_threshold = 0.0 if activation == "relu" else -3.0
+    dead_compare = np.less_equal if activation == "relu" else np.less
+    dead = {}
+    for name, values in preactivations.items():
+        values = np.asarray(values)
+        dead[name] = float(np.mean(np.all(dead_compare(values, dead_threshold), axis=0)))
+
+    def mean_dim_variance(values):
+        values = np.asarray(values, dtype=np.float32)
+        return float(np.mean(np.var(values, axis=0, dtype=np.float64)))
+
+    return {
+        "n_diagnostic_states": int(len(states)),
+        "dead_unit_frac_by_layer": dead,
+        "encoder_output_mean_variance": mean_dim_variance(raw["encoder_embedding"]),
+        "projector_output_mean_variance": mean_dim_variance(raw["projector_embedding"]),
+    }
+
+
+def collapse_alarm(diagnostics: dict[str, Any], *, last_projector_layer: str,
+                   dead_fraction_limit: float = 0.95,
+                   min_projector_variance: float = 1e-6) -> tuple[bool, str | None]:
+    """Apply the v0.8 F3 collapse gates."""
+    dead = float(diagnostics["dead_unit_frac_by_layer"][last_projector_layer])
+    variance = float(diagnostics["projector_output_mean_variance"])
+    if dead > dead_fraction_limit:
+        return True, f"dead_unit_frac:{last_projector_layer}={dead:.8g}"
+    if variance < min_projector_variance:
+        return True, f"projector_output_mean_variance={variance:.8g}"
+    return False, None
 
 
 def make_distance_predictor(model, params, *, batch_size: int = 8192):
@@ -341,6 +458,9 @@ def load_quasimetric_checkpoint(
         projector_widths=tuple(metadata["projector_widths"]),
         n_components=int(metadata["n_components"]),
         component_dim=int(metadata["component_dim"]),
+        # Checkpoints predating v0.8 §2.1 used ReLU with no LayerNorm.
+        activation=str(metadata.get("activation", "relu")),
+        layernorm=bool(metadata.get("layernorm", False)),
     )
     template = model.init(
         __import__("jax").random.PRNGKey(0),

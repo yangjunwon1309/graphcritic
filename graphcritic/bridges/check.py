@@ -51,6 +51,7 @@ def make_and_evaluate(
     action_low: float = -1.0,
     action_high: float = 1.0,
     candidate_batch: int = 32,
+    noise: np.ndarray | None = None,
 ) -> list[BridgePlan | None]:
     """Sample policy chunks and retain plans whose modeled endpoint is valid.
 
@@ -81,6 +82,11 @@ def make_and_evaluate(
     results: list[BridgePlan | None] = [None] * count
     if count == 0:
         return results
+    fixed_noise = None if noise is None else np.asarray(noise, dtype=np.float32)
+    if fixed_noise is not None and fixed_noise.shape != (
+        max_chunks, count, n_samples, h * 5
+    ):
+        raise ValueError("fixed noise must have shape (max_chunks, candidates, samples, h * 5)")
 
     scale = delta_std / state_std
     rng = np.random.default_rng(seed)
@@ -96,7 +102,10 @@ def make_and_evaluate(
         found_length = np.zeros(b * n_samples, dtype=np.int8)
         found_error = np.full(b * n_samples, np.inf, dtype=np.float32)
         for length in range(1, max_chunks + 1):
-            action = rng.standard_normal((b * n_samples, h * 5), dtype=np.float32)
+            if fixed_noise is None:
+                action = rng.standard_normal((b * n_samples, h * 5), dtype=np.float32)
+            else:
+                action = fixed_noise[length - 1, base:end].reshape(b * n_samples, h * 5).copy()
             for flow_step in range(10):
                 tau = np.full((b * n_samples, 1), flow_step / 10.0, dtype=np.float32)
                 flow_input = np.concatenate((trajectories, goal, action, tau), axis=1)

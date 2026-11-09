@@ -20,8 +20,8 @@ def solve(
     weights = np.asarray(w, dtype=np.float64)
     if weights.shape != (edges.n_edges,):
         raise SchemaError("w must have one value per edge")
-    if not np.all(np.isfinite(weights)) or np.any(weights <= 0):
-        raise SchemaError("Dijkstra edge weights must be finite and strictly positive")
+    if not np.all(np.isfinite(weights)) or np.any(weights < 0):
+        raise SchemaError("Dijkstra edge weights must be finite and non-negative")
 
     n_nodes = nodes.n_nodes
     goals = np.flatnonzero(nodes.is_goal).astype(np.int64, copy=False)

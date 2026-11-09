@@ -84,6 +84,14 @@ def test_reverse_dijkstra_chain_duplicates_isolates_and_no_goal():
     np.testing.assert_array_equal(succ[:4], [1, 2, 3, -1])
     assert np.isinf(cost[4]) and succ[4] == -1
 
+
+def test_reverse_dijkstra_accepts_exact_zero_weight_bridge():
+    nodes = _nodes(3, [2])
+    edges = _edges([0, 1], [1, 2], kind=[1, 0], n_pos=[0, 1])
+    cost, successor = solve(nodes, edges, np.asarray([0.0, 1.0]))
+    np.testing.assert_allclose(cost, [1.0, 1.0, 0.0])
+    np.testing.assert_array_equal(successor, [1, 2, -1])
+
     duplicate_edges = _edges([0, 0, 1], [1, 1, 2], kind=[0, 1, 0])
     duplicate_nodes = _nodes(4, [2])
     duplicate_cost, duplicate_succ = solve(duplicate_nodes, duplicate_edges, [5.0, 2.0, 1.0])

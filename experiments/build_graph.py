@@ -85,6 +85,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # The v0.8 judged builder shares the command name and graph-construction
+    # procedure across both judge implementations. Keep the legacy generic
+    # graph CLI intact when --judge is absent.
+    dispatch_argv = list(sys.argv[1:] if argv is None else argv)
+    if "--judge" in dispatch_argv:
+        from experiments.build_judged_graph import main as judged_main
+
+        return judged_main(dispatch_argv)
     args = _parse_args(argv)
     verifier_env = None
     try:

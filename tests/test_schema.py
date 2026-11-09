@@ -199,10 +199,10 @@ def test_graph_invariants_and_hash_staleness():
     graph.validate(make_transitions())
     assert graph.content_hash == graph.compute_hash()
 
-    with pytest.raises(SchemaError, match="strictly positive"):
+    with pytest.raises(SchemaError, match="non-negative"):
         GraphArtifact(
             config=GraphConfig(graph_kind="node", radius=0.5), feature_stats={"mean": [0.0], "std": [1.0]},
-            nodes=make_nodes(), edges=make_edges(), weights=[1.0, 0.0, 1.0],
+            nodes=make_nodes(), edges=make_edges(), weights=[1.0, -0.1, 1.0],
             cost=[2.0, 1.0, 0.0, np.inf], succ=[1, 2, -1, -1],
             meta={"dataset_id": "x", "source": "test", "core_version": "0.1", "n_rows": 3, "c_max_steps": 4},
         )
@@ -211,7 +211,7 @@ def test_graph_invariants_and_hash_staleness():
         make_graph(cost=[2.0, -1.0, 0.0, np.inf])
     with pytest.raises(SchemaError, match="goal-node costs"):
         make_graph(cost=[2.0, 1.0, 0.5, np.inf])
-    with pytest.raises(SchemaError, match="finite and strictly positive"):
+    with pytest.raises(SchemaError, match="finite and non-negative"):
         make_graph(weights=[1.0, np.inf, 1.0])
     with pytest.raises(SchemaError, match="successor"):
         make_graph(succ=[-1, 2, -1, -1])
@@ -220,6 +220,12 @@ def test_graph_invariants_and_hash_staleness():
     graph.weights[0] = 2.0
     with pytest.raises(SchemaError, match="stale"):
         graph.validate()
+
+
+def test_graph_artifact_allows_exact_zero_cost_bridge_weights():
+    graph = make_graph(weights=[1.0, 0.0, 1.0])
+    assert graph.weights[1] == 0.0
+    graph.validate()
 
 
 @pytest.mark.parametrize(

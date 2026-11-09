@@ -588,8 +588,8 @@ class GraphArtifact:
         n_nodes = self.nodes.n_nodes
         if self.weights.shape != (self.edges.n_edges,):
             raise SchemaError("weights must have one value per edge")
-        if not np.all(np.isfinite(self.weights)) or np.any(self.weights <= 0):
-            raise SchemaError("weights must be finite and strictly positive")
+        if not np.all(np.isfinite(self.weights)) or np.any(self.weights < 0):
+            raise SchemaError("weights must be finite and non-negative")
         if self.cost.shape != (n_nodes,) or self.succ.shape != (n_nodes,):
             raise SchemaError("cost and succ must have one value per node")
         if np.any(np.isnan(self.cost)) or np.any(self.cost < 0):

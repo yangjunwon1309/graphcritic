@@ -20,16 +20,23 @@ if str(ROOT) not in sys.path:
 
 import numpy as np
 
-from experiments.eval_bridges import CANDIDATE_RULE, _array_sha256, load_or_build_candidate_pairs
+from experiments.eval_bridges import (
+    CANDIDATE_RULE,
+    _array_sha256,
+    load_or_build_candidate_pairs,
+    load_or_build_window_candidate_pairs,
+)
 from experiments.v08_runtime import (
     load_quasimetric_checkpoint,
     make_distance_predictor,
+    make_embedding_cache_predictor,
     provenance,
 )
 from graphcritic.bridges.insert import layered_reverse_dijkstra
 from graphcritic.bridges.judge_flow import FlowJudge
 from graphcritic.bridges.judge_quasimetric import QuasimetricJudge
 from graphcritic.bridges.models import prepare_puzzle_model_data
+from graphcritic.bridges.windows import puzzle_state_windows, puzzle_window_candidate_nodes
 from graphcritic.config import TargetConfig
 from graphcritic.io import load_graph, load_sim_state, load_transitions, save_graph, save_targets
 from graphcritic.modes import state_episode_time
@@ -83,6 +90,8 @@ def _make_artifact(
     *,
     judge_name: str,
     model_metadata: dict,
+    candidate_rule: str,
+    window_size: int,
 ) -> GraphArtifact:
     src = np.asarray(bridge_src, dtype=np.int64)
     dst = np.asarray(bridge_dst, dtype=np.int64)
@@ -125,7 +134,8 @@ def _make_artifact(
         "spec_version": "v0.8",
         "bridge_judge": judge_name,
         "bridge_strategy": "judge_all_optimistic_candidates_layered_dijkstra",
-        "bridge_candidate_rule": CANDIDATE_RULE,
+        "bridge_candidate_rule": candidate_rule,
+        "bridge_window_size": int(window_size),
         "bridge_max_added_per_path": 2,
         "bridge_max_judge_distance_steps": 20.0 if judge_name == "quasimetric" else None,
         "bridge_lambda_steps": 0.0,
@@ -156,6 +166,10 @@ def _parse(argv: list[str] | None = None):
     parser.add_argument("--sim-state", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--candidate-cache", type=Path, required=True)
+    parser.add_argument(
+        "--candidate-window", type=int, default=None,
+        help="window size used to generate shared candidate pairs (defaults from the quasi checkpoint or cache)",
+    )
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--knn", type=int, default=32)
     parser.add_argument("--delta", type=float, default=5.0)
@@ -165,12 +179,16 @@ def _parse(argv: list[str] | None = None):
     parser.add_argument("--plan-samples", type=int, default=64)
     parser.add_argument("--max-chunks", type=int, default=4)
     parser.add_argument("--max-bridge-distance", type=float, default=20.0)
+    parser.add_argument("--embedding-cache", type=Path,
+                        help="float32 .npy cache for per-node IQE embeddings")
+    parser.add_argument("--embedding-pair-batch-size", type=int, default=262_144)
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
-    if args.knn != 32 or args.delta != 5.0 or args.judge_batch_size < 1:
+    if (args.knn != 32 or args.delta != 5.0 or args.judge_batch_size < 1
+            or args.embedding_pair_batch_size < 1):
         raise SystemExit("v0.8 fixes k=32 and delta=5; judge-batch-size must be positive")
     if not 1 <= args.max_chunks <= 4 or args.plan_samples < 1 or args.max_bridge_distance != 20.0:
         raise SystemExit("v0.8 fixes K=20 and at most four flow chunks")
@@ -191,14 +209,82 @@ def main(argv: list[str] | None = None) -> int:
     if reference is not None and reference.meta["dataset_id"] != dataset_id:
         raise ValueError("reference graph and G0 graph dataset IDs differ")
 
-    features = np.concatenate((data.state_cont, data.state_bits), axis=1).astype(np.float32)
+    frame_features = np.concatenate((data.state_cont, data.state_bits), axis=1).astype(np.float32)
     episode, _ = state_episode_time(trans)
+    features = frame_features  # judge inputs; Flow consumes the physical frame vector
+    model_window = 1
+    candidate_window = args.candidate_window
+    model = params = model_meta = None
+    embedding_node_ids = np.arange(len(frame_features), dtype=np.int64)
+    if args.judge == "quasimetric":
+        raw_model_meta = json.loads((args.checkpoint / "metadata.json").read_text(encoding="utf-8"))
+        model_window = int(raw_model_meta.get("window", 1))
+        if candidate_window is not None and candidate_window != model_window:
+            raise ValueError("candidate window must match the quasimetric checkpoint window")
+        candidate_window = model_window
+        features = (
+            puzzle_state_windows(
+                frame_features, trans, data.terminal_state_index, window=model_window
+            ) if model_window > 1 else frame_features
+        )
+        model, params, model_meta = load_quasimetric_checkpoint(
+            args.checkpoint, input_dim=features.shape[1], expected_dataset_id=dataset_id,
+        )
+    elif candidate_window is None:
+        # Flow comparisons can consume the same windowed cache as the
+        # quasimetric judge. Infer the rule from an existing cache when the
+        # caller does not state it explicitly.
+        if args.candidate_cache.is_file():
+            with np.load(args.candidate_cache, allow_pickle=False) as cache:
+                candidate_window = int(cache["window"].item()) if "window" in cache.files else 1
+        else:
+            candidate_window = 1
+    if candidate_window is None or candidate_window < 1:
+        raise ValueError("candidate window must be a positive integer")
+    if candidate_window > 1:
+        candidate_features_all = (
+            features if args.judge == "quasimetric" and model_window == candidate_window
+            else puzzle_state_windows(
+                frame_features, trans, data.terminal_state_index, window=candidate_window
+            )
+        )
+        embedding_node_ids, _, _ = puzzle_window_candidate_nodes(
+            trans, base.nodes.is_goal, window=candidate_window
+        )
+        if args.candidate_node_limit is not None:
+            limit = int(args.candidate_node_limit)
+            if limit < 1:
+                raise ValueError("candidate node limit must be positive")
+            embedding_node_ids = embedding_node_ids[:limit]
+    else:
+        candidate_features_all = frame_features
+        embedding_node_ids = np.arange(len(frame_features), dtype=np.int64)
     cache_started = time.time()
-    pairs = load_or_build_candidate_pairs(
-        features, episode, base.nodes.is_goal,
-        dataset_id=dataset_id, k=args.knn, cache_path=args.candidate_cache,
-        node_limit=args.candidate_node_limit, progress=True,
-    )
+    if candidate_window > 1:
+        pairs = load_or_build_window_candidate_pairs(
+            candidate_features_all, trans, base.nodes.is_goal,
+            dataset_id=dataset_id, window=candidate_window, k=args.knn,
+            cache_path=args.candidate_cache, node_limit=args.candidate_node_limit,
+            progress=True,
+        )
+        candidate_rule = f"{CANDIDATE_RULE}_boundary_window{candidate_window}"
+        candidate_feature_hash = _array_sha256(candidate_features_all[embedding_node_ids])
+        candidate_episode_ids = np.concatenate((
+            trans.episode_id,
+            trans.episode_id[np.flatnonzero(trans.terminal)],
+        ))[embedding_node_ids]
+        candidate_episode_hash = _array_sha256(candidate_episode_ids)
+        candidate_goal_hash = _array_sha256(base.nodes.is_goal[embedding_node_ids])
+    else:
+        pairs = load_or_build_candidate_pairs(
+            frame_features, episode, base.nodes.is_goal,
+            dataset_id=dataset_id, k=args.knn, cache_path=args.candidate_cache,
+            node_limit=args.candidate_node_limit, progress=True,
+        )
+        candidate_rule = CANDIDATE_RULE
+        candidate_feature_hash = _array_sha256(frame_features)
+        candidate_episode_hash = _array_sha256(episode)
+        candidate_goal_hash = _array_sha256(base.nodes.is_goal)
     stages["candidate_cache_load_seconds"] = time.time() - cache_started
     base_c = step_cost(base.config.gamma)
     temporal = base.edges.kind == 0
@@ -227,18 +313,34 @@ def main(argv: list[str] | None = None) -> int:
         optimistic_pairs = np.empty((0, 2), dtype=np.int64)
         excluded_infinite_destinations = 0
 
+    embedding_report = None
+    judge_pair_batch_size = args.judge_batch_size
+    judge_setup_started = time.time()
     if args.judge == "flow":
         judge = _flow_judge(args, data, features, dataset_id)
         model_meta = json.loads((args.checkpoint / "pi" / "metadata.json").read_text())
     else:
-        model, params, model_meta = load_quasimetric_checkpoint(
-            args.checkpoint, input_dim=features.shape[1], expected_dataset_id=dataset_id,
-        )
         predictor = make_distance_predictor(model, params, batch_size=args.judge_batch_size)
+        predict_node_pairs = None
+        if model_window > 1:
+            judge_pair_batch_size = args.embedding_pair_batch_size
+            node_hash = _array_sha256(embedding_node_ids)
+            embedding_cache_path = args.embedding_cache
+            if embedding_cache_path is None:
+                embedding_cache_path = args.candidate_cache.parent / "embeddings" / (
+                    f"embeddings-{model_meta['params_sha256'][:16]}-{node_hash[:16]}.npy"
+                )
+            predict_node_pairs, embedding_report = make_embedding_cache_predictor(
+                model, params, features[embedding_node_ids], embedding_node_ids,
+                params_sha256=str(model_meta["params_sha256"]), dataset_id=dataset_id,
+                cache_path=embedding_cache_path,
+                pair_batch_size=judge_pair_batch_size,
+            )
         judge = QuasimetricJudge(
             dataset_id, predictor,
             max_distance_steps=args.max_bridge_distance,
-            batch_size=args.judge_batch_size,
+            batch_size=judge_pair_batch_size,
+            predict_node_pairs=predict_node_pairs,
         )
     if int(model_meta.get("data_split_seed", model_meta.get("split_seed", args.seed))) != args.seed:
         raise ValueError("judge checkpoint episode-split seed does not match graph features")
@@ -264,10 +366,14 @@ def main(argv: list[str] | None = None) -> int:
     action_rows = 0
     judge_started = time.time()
     with spool_path.open("wb") as spool:
-        for start in range(0, n_optimistic, args.judge_batch_size):
-            end = min(n_optimistic, start + args.judge_batch_size)
+        for start in range(0, n_optimistic, judge_pair_batch_size):
+            end = min(n_optimistic, start + judge_pair_batch_size)
             chunk_pairs = optimistic_pairs[start:end]
-            result = judge.judge(features[chunk_pairs[:, 0]], features[chunk_pairs[:, 1]])
+            result = (
+                judge.judge_node_pairs(chunk_pairs)
+                if args.judge == "quasimetric" and model_window > 1
+                else judge.judge(features[chunk_pairs[:, 0]], features[chunk_pairs[:, 1]])
+            )
             result.validate(len(chunk_pairs))
             accepted[start:end] = result.accept
             judge_cost[start:end] = result.cost_steps
@@ -288,12 +394,24 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     spool.write(payload.tobytes())
                     action_rows += len(payload)
-            if end == n_optimistic or (start // args.judge_batch_size + 1) % 100 == 0:
+            if end == n_optimistic or (start // judge_pair_batch_size + 1) % 100 == 0:
                 print(
                     f"{args.judge} judge: {end}/{n_optimistic}, accepted={int(np.count_nonzero(accepted[:end]))}",
                     file=sys.stderr, flush=True,
                 )
     stages["judge_seconds"] = time.time() - judge_started
+    if embedding_report is not None:
+        stages["embedding_generation_seconds"] = float(
+            embedding_report["embedding_seconds"]
+        )
+        stages["embedding_pair_distance_seconds"] = float(
+            embedding_report["pair_distance_seconds"]
+        )
+        stages["judge_total_including_embedding_seconds"] = (
+            time.time() - judge_setup_started
+        )
+    else:
+        stages["judge_setup_and_evaluation_seconds"] = time.time() - judge_setup_started
     accepted_indices = np.flatnonzero(accepted).astype(np.int64)
     accepted_pairs = optimistic_pairs[accepted_indices]
     accepted_costs = judge_cost[accepted_indices].astype(np.float64)
@@ -326,8 +444,9 @@ def main(argv: list[str] | None = None) -> int:
         judge_name=args.judge, model_metadata={
             key: value for key, value in model_meta.items()
             if key in {"spec_version", "dataset_id", "params_sha256", "step", "input_dim",
-                       "encoder_widths", "projector_widths", "n_components", "component_dim"}
-        },
+                       "frame_dim", "window", "constraint_horizon", "encoder_widths",
+                       "projector_widths", "n_components", "component_dim"}
+        }, candidate_rule=candidate_rule, window_size=candidate_window,
     )
     graph_hash = save_graph(artifact, args.out / "graph.npz")
     targets = critic_targets(
@@ -395,11 +514,14 @@ def main(argv: list[str] | None = None) -> int:
         "model_checkpoint": str(args.checkpoint),
         "model_checkpoint_sha256": model_meta.get("params_sha256"),
         "candidate_cache": str(args.candidate_cache),
-        "candidate_rule": CANDIDATE_RULE,
+        "candidate_rule": candidate_rule,
+        "window_size": int(candidate_window),
+        "model_window_size": int(model_window),
         "candidate_cache_hashes": {
-            "feature_sha256": _array_sha256(features),
-            "episode_sha256": _array_sha256(episode),
-            "goal_sha256": _array_sha256(base.nodes.is_goal),
+            "feature_sha256": candidate_feature_hash,
+            "episode_sha256": candidate_episode_hash,
+            "goal_sha256": candidate_goal_hash,
+            "node_ids_sha256": _array_sha256(embedding_node_ids),
         },
         "optimistic_candidate_sha256": _array_sha256(optimistic_pairs),
         "n_cached_candidates": int(len(pairs)),
@@ -432,6 +554,7 @@ def main(argv: list[str] | None = None) -> int:
                 "accepted_max": float(np.max(accepted_costs)),
             } if args.judge == "quasimetric" and len(accepted_costs) else None
         ),
+        "embedding_cache": embedding_report,
         "stage_seconds": stages,
         "elapsed_seconds": time.time() - started,
         "simulator_q1": "not run per v0.8 minimum implementation",

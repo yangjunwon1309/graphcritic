@@ -20,6 +20,7 @@ from scipy.stats import binomtest, spearmanr
 from graphcritic.bridges.check import BridgePlan
 from graphcritic.bridges.insert import layered_reverse_dijkstra
 from graphcritic.bridges.models import prepare_puzzle_model_data
+from graphcritic.bridges.windows import puzzle_window_candidate_nodes
 from graphcritic.config import TargetConfig
 from graphcritic.featurize import state_table
 from graphcritic.io import load_graph, load_sim_state, load_transitions, save_graph, save_targets
@@ -368,6 +369,109 @@ def load_or_build_candidate_pairs(
             feature_sha256=np.asarray(_array_sha256(features)),
             episode_sha256=np.asarray(_array_sha256(episode_id)),
             goal_sha256=np.asarray(_array_sha256(is_goal)),
+        )
+    return pairs
+
+
+def load_or_build_window_candidate_pairs(
+    window_features: np.ndarray,
+    trans,
+    is_goal: np.ndarray,
+    *,
+    dataset_id: str,
+    window: int = 5,
+    k: int = 32,
+    cache_path: Path | None,
+    node_limit: int | None = None,
+    batch_size: int = 256,
+    progress: bool = False,
+) -> np.ndarray:
+    """Cache cross-episode kNN pairs over chunk-boundary window nodes.
+
+    Boundary states are the only sources. All boundary nodes and all success
+    nodes are eligible destinations, so a success node remains reachable even
+    when its time is not aligned to the chunk boundary.
+    """
+    features = np.ascontiguousarray(window_features, dtype=np.float32)
+    goals = np.asarray(is_goal, dtype=np.bool_)
+    if features.ndim != 2 or goals.shape != (len(features),):
+        raise ValueError("window features and goal labels must align")
+    node_ids, episodes, source_mask = puzzle_window_candidate_nodes(
+        trans, goals, window=window
+    )
+    if node_limit is not None:
+        limit = int(node_limit)
+        if limit < 1:
+            raise ValueError("node_limit must be positive")
+        node_ids, episodes, source_mask = node_ids[:limit], episodes[:limit], source_mask[:limit]
+    if len(node_ids) <= k:
+        raise ValueError(f"window candidate table has {len(node_ids)} nodes; need more than k={k}")
+    local_features = np.ascontiguousarray(features[node_ids])
+    local_goals = goals[node_ids]
+    node_hash = _array_sha256(node_ids)
+    feature_hash = _array_sha256(local_features)
+    episode_hash = _array_sha256(episodes)
+    goal_hash = _array_sha256(local_goals)
+    rule = f"{CANDIDATE_RULE}_boundary_window{int(window)}"
+
+    if cache_path is not None and cache_path.is_file():
+        with np.load(cache_path, allow_pickle=False) as cached:
+            required = {
+                "pairs", "dataset_id", "k", "window", "candidate_rule",
+                "node_ids_sha256", "feature_sha256", "episode_sha256", "goal_sha256",
+            }
+            if not required.issubset(cached.files):
+                raise ValueError("window candidate cache is missing required metadata")
+            checks = {
+                "dataset_id": (str(cached["dataset_id"].item()), dataset_id),
+                "k": (int(cached["k"].item()), int(k)),
+                "window": (int(cached["window"].item()), int(window)),
+                "candidate_rule": (str(cached["candidate_rule"].item()), rule),
+                "node_ids_sha256": (str(cached["node_ids_sha256"].item()), node_hash),
+                "feature_sha256": (str(cached["feature_sha256"].item()), feature_hash),
+                "episode_sha256": (str(cached["episode_sha256"].item()), episode_hash),
+                "goal_sha256": (str(cached["goal_sha256"].item()), goal_hash),
+            }
+            for name, (actual, expected) in checks.items():
+                if actual != expected:
+                    raise ValueError(
+                        f"window candidate cache {name} mismatch: "
+                        f"cached={actual!r}, expected={expected!r}"
+                    )
+            pairs = np.asarray(cached["pairs"], dtype=np.int32)
+        if pairs.ndim != 2 or pairs.shape[1] != 2:
+            raise ValueError("window candidate pairs must have shape (N,2)")
+        if pairs.size:
+            src_local = np.searchsorted(node_ids, pairs[:, 0])
+            dst_local = np.searchsorted(node_ids, pairs[:, 1])
+            src_safe = np.minimum(src_local, len(node_ids) - 1)
+            dst_safe = np.minimum(dst_local, len(node_ids) - 1)
+            invalid = (
+                np.any(pairs < 0) or np.any(pairs >= len(features))
+                or np.any(src_local >= len(node_ids)) or np.any(dst_local >= len(node_ids))
+                or np.any(node_ids[src_safe] != pairs[:, 0])
+                or np.any(node_ids[dst_safe] != pairs[:, 1])
+                or np.any(~source_mask[src_safe])
+            )
+            if invalid:
+                raise ValueError("window candidate cache contains an invalid source or node index")
+        return pairs
+
+    local_pairs = _gpu_cross_episode_topk(
+        local_features, episodes, k=k, batch_size=batch_size, progress=progress,
+    )
+    local_pairs = local_pairs[source_mask[local_pairs[:, 0]]]
+    pairs = node_ids[local_pairs].astype(np.int32, copy=False)
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            cache_path,
+            pairs=pairs,
+            dataset_id=np.asarray(dataset_id), k=np.asarray(k, dtype=np.int64),
+            window=np.asarray(window, dtype=np.int64), candidate_rule=np.asarray(rule),
+            node_ids_sha256=np.asarray(node_hash), feature_sha256=np.asarray(feature_hash),
+            episode_sha256=np.asarray(episode_hash), goal_sha256=np.asarray(goal_hash),
+            node_ids=node_ids.astype(np.int32),
         )
     return pairs
 

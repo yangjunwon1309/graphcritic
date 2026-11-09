@@ -9,7 +9,9 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 import json
+import os
 import subprocess
+import time
 from typing import Any
 
 import numpy as np
@@ -126,16 +128,14 @@ def make_quasimetric_model(
             latent_destination = joined[batch:].reshape(
                 batch, self.n_components, self.component_dim
             )
-            component_distance = _iqe_union_distance(
-                latent_source, latent_destination, jnp
-            )
             raw_alpha = self.param(
                 "raw_alpha", nn.initializers.constant(-1.0), ()
             )
-            alpha = jax.nn.sigmoid(raw_alpha)
-            distance = alpha * jnp.max(component_distance, axis=-1) + (
-                1.0 - alpha
-            ) * jnp.mean(component_distance, axis=-1)
+            distance = iqe_distance_from_embeddings(
+                latent_source, latent_destination, raw_alpha,
+                n_components=self.n_components, component_dim=self.component_dim,
+                jnp=jnp,
+            )
             if return_diagnostics:
                 return {
                     "distance": distance,
@@ -155,6 +155,88 @@ def make_quasimetric_model(
     )
 
 
+def make_quasimetric_embedder(model):
+    """Create a backbone-only module with the model's unchanged parameter names."""
+    jax, _, nn, _, _ = _jax_modules()
+
+    class IQEEmbedder(nn.Module):
+        encoder_widths: tuple[int, ...]
+        projector_widths: tuple[int, ...]
+        n_components: int
+        component_dim: int
+        activation: str
+        layernorm: bool
+
+        @nn.compact
+        def __call__(self, inputs):
+            if inputs.ndim != 2:
+                raise ValueError("quasimetric inputs must be rank-2 arrays")
+            values = inputs
+            for layer, width in enumerate(self.encoder_widths[:-1]):
+                name = f"encoder_{layer}"
+                values = nn.Dense(
+                    width, kernel_init=nn.initializers.xavier_uniform(), name=name
+                )(values)
+                if self.layernorm:
+                    values = nn.LayerNorm(
+                        scale_init=nn.initializers.ones,
+                        bias_init=nn.initializers.zeros,
+                        name=f"{name}_norm",
+                    )(values)
+                values = nn.relu(values) if self.activation == "relu" else jax.nn.gelu(values)
+            values = nn.Dense(
+                self.encoder_widths[-1], kernel_init=nn.initializers.xavier_uniform(),
+                name="encoder_out",
+            )(values)
+            for layer, width in enumerate(self.projector_widths[:-1]):
+                name = f"projector_{layer}"
+                values = nn.Dense(
+                    width, kernel_init=nn.initializers.xavier_uniform(), name=name
+                )(values)
+                if self.layernorm:
+                    values = nn.LayerNorm(
+                        scale_init=nn.initializers.ones,
+                        bias_init=nn.initializers.zeros,
+                        name=f"{name}_norm",
+                    )(values)
+                values = nn.relu(values) if self.activation == "relu" else jax.nn.gelu(values)
+            values = nn.Dense(
+                self.projector_widths[-1],
+                kernel_init=nn.initializers.xavier_uniform(),
+                name="projector_out",
+            )(values)
+            expected = self.n_components * self.component_dim
+            if values.shape[-1] != expected:
+                raise ValueError("projector output width does not match the IQE dimensions")
+            return values
+
+    return IQEEmbedder(
+        encoder_widths=tuple(model.encoder_widths),
+        projector_widths=tuple(model.projector_widths),
+        n_components=int(model.n_components),
+        component_dim=int(model.component_dim),
+        activation=str(model.activation),
+        layernorm=bool(model.layernorm),
+    )
+
+
+def iqe_distance_from_embeddings(source, destination, raw_alpha, *, n_components: int,
+                                 component_dim: int, jnp):
+    """Evaluate the checkpoint's IQE-maxmean head on flattened or shaped embeddings."""
+    if source.ndim == 2:
+        source = source.reshape((-1, n_components, component_dim))
+    if destination.ndim == 2:
+        destination = destination.reshape((-1, n_components, component_dim))
+    if source.shape != destination.shape or source.ndim != 3:
+        raise ValueError("IQE embeddings must be aligned (N,C,D) or flattened arrays")
+    component_distance = _iqe_union_distance(source, destination, jnp)
+    import jax
+    alpha = jax.nn.sigmoid(raw_alpha)
+    return alpha * jnp.max(component_distance, axis=-1) + (
+        1.0 - alpha
+    ) * jnp.mean(component_distance, axis=-1)
+
+
 def _iqe_union_distance(source, destination, jnp):
     """Return one interval-union measure for every IQE component."""
     order = jnp.argsort(source, axis=-1, stable=True)
@@ -169,17 +251,22 @@ def _iqe_union_distance(source, destination, jnp):
     return jnp.sum(jnp.maximum(ends - uncovered, 0.0), axis=-1)
 
 
-def qrl_loss_components(distance_goal, distance_step, lambda_value, *, epsilon: float = 0.25):
-    """QRL primal objective and one-step constraint diagnostics."""
+def qrl_loss_components(
+    distance_goal, distance_step, lambda_value, *,
+    epsilon: float = 0.25, constraint_horizon: float = 1.0,
+):
+    """QRL objective with a configurable frame-step constraint threshold."""
     jax, jnp, _, _, _ = _jax_modules()
     # -E[phi(d)] where phi(d) = -softplus(beta * (500 - d)) / beta.
     distance_maximization_loss = jnp.mean(
         jax.nn.softplus((500.0 - distance_goal) * 0.01) / 0.01
     )
-    one_step_violation = jnp.mean(jnp.square(jax.nn.relu(distance_step - 1.0)))
-    constraint_gap = one_step_violation - epsilon**2
+    violation = jnp.mean(
+        jnp.square(jax.nn.relu(distance_step - float(constraint_horizon)))
+    )
+    constraint_gap = violation - epsilon**2
     total = distance_maximization_loss + lambda_value * constraint_gap
-    return total, distance_maximization_loss, one_step_violation, constraint_gap
+    return total, distance_maximization_loss, violation, constraint_gap
 
 
 def projected_dual_sgd(raw_lambda, constraint_gap, learning_rate, jnp):
@@ -189,7 +276,8 @@ def projected_dual_sgd(raw_lambda, constraint_gap, learning_rate, jnp):
 
 def make_train_step(model, *, batch_size: int = 4096, epsilon: float = 0.25,
                     learning_rate: float = 5e-4, lambda_learning_rate: float = 1e-2,
-                    grad_clip: float = 1.0, dual: str = "adam"):
+                    grad_clip: float = 1.0, dual: str = "adam",
+                    constraint_horizon: float = 1.0):
     """Create the compiled primal/dual QRL update for one training batch."""
     jax, jnp, _, _, optax = _jax_modules()
     if batch_size < 1:
@@ -206,8 +294,9 @@ def make_train_step(model, *, batch_size: int = 4096, epsilon: float = 0.25,
 
     @jax.jit
     def update(params, primal_state, raw_lambda, dual_state, key,
-               states, next_state_index, train_rows):
-        key, state_key, goal_key = jax.random.split(key, 3)
+               states, next_state_index, train_rows, constraint_rows=None,
+               constraint_next_index=None):
+        key, state_key, goal_key, constraint_key = jax.random.split(key, 4)
         sample_positions = jax.random.randint(
             state_key, (batch_size,), 0, train_rows.shape[0]
         )
@@ -216,11 +305,20 @@ def make_train_step(model, *, batch_size: int = 4096, epsilon: float = 0.25,
         )
         rows = train_rows[sample_positions]
         goal_rows = train_rows[goal_positions]
+        valid_constraint_rows = train_rows if constraint_rows is None else constraint_rows
+        constraint_positions = jax.random.randint(
+            constraint_key, (batch_size,), 0, valid_constraint_rows.shape[0]
+        )
+        constraint_source_rows = valid_constraint_rows[constraint_positions]
         current = states[rows]
-        one_step_next = states[next_state_index[rows]]
+        constraint_current = states[constraint_source_rows]
+        constraint_mapping = (
+            next_state_index if constraint_next_index is None else constraint_next_index
+        )
+        constraint_next = states[constraint_mapping[constraint_source_rows]]
         independent_goal = states[next_state_index[goal_rows]]
-        left = jnp.concatenate((current, current), axis=0)
-        right = jnp.concatenate((independent_goal, one_step_next), axis=0)
+        left = jnp.concatenate((current, constraint_current), axis=0)
+        right = jnp.concatenate((independent_goal, constraint_next), axis=0)
         dual_value = jax.lax.stop_gradient(
             jax.nn.softplus(raw_lambda) if dual == "adam" else raw_lambda
         )
@@ -230,7 +328,8 @@ def make_train_step(model, *, batch_size: int = 4096, epsilon: float = 0.25,
             distance_goal = distances[:batch_size]
             distance_step = distances[batch_size:]
             total, distance_loss, violation, constraint_gap = qrl_loss_components(
-                distance_goal, distance_step, dual_value, epsilon=epsilon
+                distance_goal, distance_step, dual_value, epsilon=epsilon,
+                constraint_horizon=constraint_horizon,
             )
             return total, (
                 distance_goal, distance_step, distance_loss, violation, constraint_gap
@@ -261,7 +360,11 @@ def make_train_step(model, *, batch_size: int = 4096, epsilon: float = 0.25,
         metrics = {
             "loss": total,
             "distance_maximization_loss": distance_loss,
+            # Keep the historic key for A1/A2 log compatibility; for windowed
+            # runs this is the h-frame chunk constraint reported below.
             "one_step_violation_squared": violation,
+            "constraint_violation_squared": violation,
+            "constraint_horizon_steps": jnp.asarray(float(constraint_horizon)),
             "constraint_gap": constraint_gap,
             "lambda": jax.nn.softplus(raw_lambda) if dual == "adam" else raw_lambda,
             "distance_goal_mean": jnp.mean(distance_goal),
@@ -378,6 +481,142 @@ def make_distance_predictor(model, params, *, batch_size: int = 8192):
         return out
 
     return predict
+
+
+def _array_sha256(array: np.ndarray) -> str:
+    value = np.ascontiguousarray(array)
+    digest = hashlib.sha256()
+    digest.update(value.dtype.str.encode("ascii"))
+    digest.update(np.asarray(value.shape, dtype="<i8").tobytes())
+    digest.update(memoryview(value).cast("B"))
+    return digest.hexdigest()
+
+
+def make_embedding_cache_predictor(
+    model,
+    params,
+    node_features: np.ndarray,
+    node_ids: np.ndarray,
+    *,
+    params_sha256: str,
+    dataset_id: str,
+    cache_path: str | Path,
+    embed_batch_size: int = 8192,
+    pair_batch_size: int = 262_144,
+):
+    """Encode each candidate node once and expose cached node-pair distances.
+
+    The on-disk cache is float32 and keyed by checkpoint hash, ordered node-ID
+    hash, feature hash, and dataset ID. Returned pair predictions use a
+    GPU-resident embedding table; no model half-precision conversion occurs.
+    """
+    jax, jnp, _, _, _ = _jax_modules()
+    features = np.ascontiguousarray(node_features, dtype=np.float32)
+    ids = np.ascontiguousarray(node_ids, dtype=np.int64)
+    if features.ndim != 2 or len(features) != len(ids) or len(ids) == 0:
+        raise ValueError("node_features and node_ids must be non-empty and aligned")
+    if np.any(ids < 0) or np.unique(ids).size != len(ids):
+        raise ValueError("node_ids must be unique and non-negative")
+    if ids.size > 1 and np.any(ids[1:] < ids[:-1]):
+        raise ValueError("node_ids must be sorted for pair-index lookup")
+    if embed_batch_size < 1 or pair_batch_size < 1:
+        raise ValueError("embedding and pair batch sizes must be positive")
+    if not params_sha256 or not dataset_id:
+        raise ValueError("checkpoint hash and dataset ID are required for cache keys")
+    try:
+        device = jax.devices("gpu")[0]
+    except (IndexError, RuntimeError) as exc:  # pragma: no cover - hardware-specific
+        raise RuntimeError("v0.8 embedding cache requires an available JAX GPU") from exc
+
+    embedder = make_quasimetric_embedder(model)
+    embed_jit = jax.jit(
+        lambda batch: embedder.apply({"params": params}, batch)
+    )
+    latent_dim = int(model.n_components * model.component_dim)
+    embeddings_path = Path(cache_path)
+    sidecar_path = embeddings_path.with_suffix(embeddings_path.suffix + ".json")
+    embeddings_path.parent.mkdir(parents=True, exist_ok=True)
+    key = {
+        "schema": "v0.8-embedding-cache-v1",
+        "params_sha256": str(params_sha256),
+        "node_ids_sha256": _array_sha256(ids),
+        "node_features_sha256": _array_sha256(features),
+        "dataset_id": str(dataset_id),
+        "dtype": "float32",
+        "shape": [int(len(ids)), latent_dim],
+    }
+    embedding_started = time.perf_counter()
+    cache_hit = False
+    if embeddings_path.is_file() and sidecar_path.is_file():
+        try:
+            saved_key = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            saved = np.load(embeddings_path, mmap_mode="r", allow_pickle=False)
+            cache_hit = saved_key == key and saved.shape == tuple(key["shape"]) and saved.dtype == np.float32
+        except (OSError, ValueError, json.JSONDecodeError):
+            cache_hit = False
+    if not cache_hit:
+        temporary_path = embeddings_path.with_name(embeddings_path.name + ".tmp.npy")
+        output = np.lib.format.open_memmap(
+            temporary_path, mode="w+", dtype=np.float32, shape=tuple(key["shape"])
+        )
+        for start in range(0, len(features), embed_batch_size):
+            end = min(start + embed_batch_size, len(features))
+            count = end - start
+            batch = np.zeros((embed_batch_size, features.shape[1]), dtype=np.float32)
+            batch[:count] = features[start:end]
+            encoded = np.asarray(jax.device_get(embed_jit(jax.device_put(batch, device))))
+            output[start:end] = encoded[:count].reshape(count, latent_dim)
+        output.flush()
+        del output
+        os.replace(temporary_path, embeddings_path)
+        sidecar_tmp = sidecar_path.with_name(sidecar_path.name + ".tmp")
+        sidecar_tmp.write_text(json.dumps(key, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(sidecar_tmp, sidecar_path)
+    host_embeddings = np.load(embeddings_path, mmap_mode="r", allow_pickle=False)
+    if host_embeddings.shape != tuple(key["shape"]) or host_embeddings.dtype != np.float32:
+        raise ValueError("embedding cache has an invalid array shape or dtype")
+    embeddings = jax.device_put(jnp.asarray(host_embeddings), device)
+    embedding_seconds = float(time.perf_counter() - embedding_started)
+
+    distance_jit = jax.jit(lambda source, target: iqe_distance_from_embeddings(
+        source, target, params["raw_alpha"], n_components=model.n_components,
+        component_dim=model.component_dim, jnp=jnp,
+    ))
+    distance_seconds = [0.0]
+    report = {
+        "cache_path": str(embeddings_path),
+        "cache_hit": bool(cache_hit),
+        "node_count": int(len(ids)),
+        "embedding_dim": latent_dim,
+        "dtype": "float32",
+        "embedding_bytes": int(len(ids) * latent_dim * np.dtype(np.float32).itemsize),
+        "embedding_seconds": embedding_seconds,
+        "pair_distance_seconds": 0.0,
+    }
+
+    def predict_pairs(pairs: np.ndarray) -> np.ndarray:
+        pair_array = np.asarray(pairs, dtype=np.int64)
+        if pair_array.ndim != 2 or pair_array.shape[1] != 2:
+            raise ValueError("node pairs must have shape (N,2)")
+        if not len(pair_array):
+            return np.empty(0, dtype=np.float32)
+        source_local = np.searchsorted(ids, pair_array[:, 0])
+        target_local = np.searchsorted(ids, pair_array[:, 1])
+        if (np.any(source_local >= len(ids)) or np.any(target_local >= len(ids))
+                or np.any(ids[source_local] != pair_array[:, 0])
+                or np.any(ids[target_local] != pair_array[:, 1])):
+            raise ValueError("pair references a node absent from the embedding cache")
+        result = np.empty(len(pair_array), dtype=np.float32)
+        started = time.perf_counter()
+        for start in range(0, len(pair_array), pair_batch_size):
+            end = min(start + pair_batch_size, len(pair_array))
+            src = embeddings[jnp.asarray(source_local[start:end], dtype=jnp.int32)]
+            dst = embeddings[jnp.asarray(target_local[start:end], dtype=jnp.int32)]
+            result[start:end] = np.asarray(jax.device_get(distance_jit(src, dst)), dtype=np.float32)
+        distance_seconds[0] += time.perf_counter() - started
+        report["pair_distance_seconds"] = float(distance_seconds[0])
+        return result
+    return predict_pairs, report
 
 
 def next_state_indices(terminal: np.ndarray) -> np.ndarray:

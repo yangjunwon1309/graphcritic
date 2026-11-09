@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
 import numpy as np
 
 from graphcritic.bridges.models import prepare_puzzle_model_data
+from graphcritic.bridges.windows import puzzle_state_windows
 from graphcritic.io import load_sim_state, load_transitions
 from experiments.v08_runtime import (
     DEFAULT_COMPONENT_DIM,
@@ -64,7 +65,8 @@ def _batched_distances(predict, source: np.ndarray, destination: np.ndarray,
 
 def heldout_metrics(data, states: np.ndarray, next_index: np.ndarray, predict,
                     *, step: int, seed: int, triangle_count: int = 100_000,
-                    eval_batch_size: int = 8192) -> dict:
+                    eval_batch_size: int = 8192, constraint_horizon: int = 1,
+                    epsilon: float = 0.25) -> dict:
     """Evaluate time calibration, button-conditioned errors, and triangles."""
     heldout = np.asarray(data.heldout_rows, dtype=np.int64)
     result: dict[str, object] = {
@@ -87,39 +89,66 @@ def heldout_metrics(data, states: np.ndarray, next_index: np.ndarray, predict,
             ),
         }
 
-    next_rows = next_index[heldout]
-    one_step_distance = _batched_distances(
-        predict, states[heldout], states[next_rows], eval_batch_size
+    constraint_src_rows, next_rows = _targets_at_offset(
+        heldout, data, constraint_horizon
     )
-    button_start = states[heldout, -16:] > 0.5
-    button_end = states[next_rows, -16:] > 0.5
-    changed = np.any(button_start != button_end, axis=1)
-    threshold = 1.0 + 0.25
+    one_step_distance = _batched_distances(
+        predict, states[constraint_src_rows], states[next_rows], eval_batch_size
+    )
+    # A chunk is button-changing if any recorded transition inside it changes a
+    # bit, including a bit that flips back before the chunk endpoint.
+    one_step_button_change = np.any(
+        data.state_bits[:len(next_index)]
+        != data.state_bits[np.asarray(next_index, dtype=np.int64)],
+        axis=1,
+    )
+    change_prefix = np.concatenate((
+        np.zeros(1, dtype=np.int64),
+        np.cumsum(one_step_button_change, dtype=np.int64),
+    ))
+    changed = (
+        change_prefix[constraint_src_rows + constraint_horizon]
+        - change_prefix[constraint_src_rows]
+    ) > 0
+    threshold = float(constraint_horizon) + float(epsilon)
     per_button = {}
     for label, mask in (("changed", changed), ("unchanged", ~changed)):
         values = one_step_distance[mask]
-        per_button[label] = {
+        group_report = {
             "n": int(np.count_nonzero(mask)),
             "distance_mean": float(np.mean(values)) if len(values) else None,
             "distance_p90": float(np.quantile(values, 0.90)) if len(values) else None,
-            "constraint_violation_rate_d_gt_1_plus_epsilon": (
+            "constraint_violation_rate_d_gt_limit": (
                 float(np.mean(values > threshold)) if len(values) else None
             ),
             "constraint_violation_squared_mean": (
-                float(np.mean(np.square(np.maximum(values - 1.0, 0.0))))
+                float(np.mean(np.square(np.maximum(values - constraint_horizon, 0.0))))
                 if len(values) else None
             ),
         }
-    result["heldout_one_step_constraint"] = {
+        if constraint_horizon == 1:
+            group_report["constraint_violation_rate_d_gt_1_plus_epsilon"] = (
+                group_report["constraint_violation_rate_d_gt_limit"]
+            )
+        per_button[label] = group_report
+    constraint_report = {
         "n": int(len(one_step_distance)),
-        "epsilon": 0.25,
+        "constraint_horizon": int(constraint_horizon),
+        "epsilon": float(epsilon),
         "threshold": threshold,
-        "overall_violation_rate_d_gt_1_plus_epsilon": (
+        "overall_violation_rate_d_gt_limit": (
             float(np.mean(one_step_distance > threshold))
             if len(one_step_distance) else None
         ),
         "button_change_groups": per_button,
     }
+    if constraint_horizon == 1:
+        constraint_report["overall_violation_rate_d_gt_1_plus_epsilon"] = (
+            constraint_report["overall_violation_rate_d_gt_limit"]
+        )
+        result["heldout_one_step_constraint"] = constraint_report
+    else:
+        result["heldout_chunk_constraint"] = constraint_report
 
     rng = np.random.default_rng(seed + step)
     heldout_terminals = data.terminal_state_index[heldout]
@@ -161,6 +190,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         default=list(DEFAULT_PROJECTOR_WIDTHS))
     parser.add_argument("--n-components", type=int, default=DEFAULT_COMPONENTS)
     parser.add_argument("--component-dim", type=int, default=DEFAULT_COMPONENT_DIM)
+    parser.add_argument("--window", type=int, default=1,
+                        help="number of trailing normalized frames per model input")
+    parser.add_argument("--constraint-horizon", type=int, default=1,
+                        help="frame-step separation used by the quasimetric constraint")
+    parser.add_argument("--epsilon", type=float, default=0.25,
+                        help="constraint slack measured in steps")
     parser.add_argument("--activation", choices=("relu", "gelu"), default="gelu")
     norm = parser.add_mutually_exclusive_group()
     norm.add_argument("--layernorm", dest="layernorm", action="store_true")
@@ -185,6 +220,8 @@ def _source_architecture(metadata: dict) -> dict:
         "layernorm": bool(metadata.get("layernorm", False)),
         "encoder_widths": tuple(metadata["encoder_widths"]),
         "projector_widths": tuple(metadata["projector_widths"]),
+        "window": int(metadata.get("window", 1)),
+        "constraint_horizon": int(metadata.get("constraint_horizon", 1)),
         "n_components": int(metadata["n_components"]),
         "component_dim": int(metadata["component_dim"]),
     }
@@ -237,6 +274,8 @@ def _validate_resume_metadata(metadata: dict, *, args, dual_lr: float) -> None:
         "layernorm": bool(args.layernorm),
         "encoder_widths": tuple(args.encoder_widths),
         "projector_widths": tuple(args.projector_widths),
+        "window": int(args.window),
+        "constraint_horizon": int(args.constraint_horizon),
         "n_components": int(args.n_components),
         "component_dim": int(args.component_dim),
     }
@@ -257,8 +296,8 @@ def _validate_resume_metadata(metadata: dict, *, args, dual_lr: float) -> None:
     source_seed = int(metadata.get("data_split_seed", metadata.get("split_seed", 0)))
     if source_seed != args.seed:
         raise ValueError("--resume-from requires the checkpoint's episode split seed")
-    if not np.isclose(float(metadata.get("epsilon", 0.25)), 0.25):
-        raise ValueError("--resume-from requires epsilon=0.25")
+    if not np.isclose(float(metadata.get("epsilon", 0.25)), args.epsilon):
+        raise ValueError("--resume-from requires the checkpoint's epsilon")
     if int(metadata.get("batch_size", args.batch_size)) != args.batch_size:
         raise ValueError("--resume-from requires the checkpoint's batch size")
 
@@ -273,6 +312,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("steps, save/log intervals, batch sizes, and triangles must be positive")
     if args.grad_clip < 0 or dual_lr <= 0:
         raise SystemExit("grad-clip must be non-negative and dual-lr must be positive")
+    if args.window < 1 or args.constraint_horizon < 1 or args.epsilon < 0:
+        raise SystemExit("window and constraint-horizon must be positive; epsilon non-negative")
     if not 0.0 <= args.collapse_dead_frac <= 1.0 or args.collapse_min_var < 0:
         raise SystemExit("collapse thresholds must be non-negative and dead fraction at most 1")
     if len(args.encoder_widths) < 2 or len(args.projector_widths) < 2:
@@ -283,8 +324,21 @@ def main(argv: list[str] | None = None) -> int:
     sim_state = load_sim_state(args.sim_state)
     data = prepare_puzzle_model_data(trans, sim_state, seed=args.seed)
     next_index = next_state_indices(trans.terminal)
-    states_np = np.concatenate((data.state_cont, data.state_bits), axis=1).astype(np.float32)
+    frame_states_np = np.concatenate((data.state_cont, data.state_bits), axis=1).astype(np.float32)
+    states_np = (
+        puzzle_state_windows(
+            frame_states_np, trans, data.terminal_state_index, window=args.window
+        )
+        if args.window > 1 else frame_states_np
+    )
     train_rows_np = np.asarray(data.train_rows, dtype=np.int32)
+    constraint_rows_np, constraint_targets_np = _targets_at_offset(
+        train_rows_np, data, args.constraint_horizon
+    )
+    if not len(constraint_rows_np):
+        raise ValueError("training split has no valid constraint pairs at the selected horizon")
+    constraint_next_index = np.full(trans.n_rows, -1, dtype=np.int64)
+    constraint_next_index[constraint_rows_np] = constraint_targets_np
     if not len(train_rows_np) or not len(data.heldout_rows):
         raise ValueError("episode split must contain training and held-out transitions")
 
@@ -297,9 +351,10 @@ def main(argv: list[str] | None = None) -> int:
         layernorm=args.layernorm,
     )
     train_update, primal_optimizer, dual_optimizer = make_train_step(
-        model, batch_size=args.batch_size, epsilon=0.25,
+        model, batch_size=args.batch_size, epsilon=args.epsilon,
         learning_rate=5e-4, lambda_learning_rate=dual_lr,
         grad_clip=args.grad_clip, dual=args.dual,
+        constraint_horizon=args.constraint_horizon,
     )
     params, primal_state, raw_lambda, dual_state, key = initialize_train_state(
         model, seed=args.seed, input_dim=states_np.shape[1],
@@ -359,6 +414,9 @@ def main(argv: list[str] | None = None) -> int:
         "spec_version": "v0.8",
         "dataset_id": transition_meta["dataset_id"],
         "input_dim": int(states_np.shape[1]),
+        "frame_dim": int(frame_states_np.shape[1]),
+        "window": int(args.window),
+        "constraint_horizon": int(args.constraint_horizon),
         "continuous_dim": int(data.n_cont),
         "button_dim": int(data.n_bits),
         "data_split_seed": args.seed,
@@ -381,7 +439,7 @@ def main(argv: list[str] | None = None) -> int:
         "lambda_learning_rate": float(dual_lr) if args.dual == "adam" else None,
         "lambda_start_value": lambda_start_value,
         "gradient_clip_global_norm": float(args.grad_clip),
-        "epsilon": 0.25,
+        "epsilon": float(args.epsilon),
         "phi": "-softplus(0.01*(500-d))/0.01",
         "batch_size": int(args.batch_size),
         "optimizer": "Adam",
@@ -411,7 +469,9 @@ def main(argv: list[str] | None = None) -> int:
 
     states = jnp.asarray(states_np)
     next_indices = jnp.asarray(next_index, dtype=jnp.int32)
+    constraint_next_indices = jnp.asarray(constraint_next_index, dtype=jnp.int32)
     train_rows = jnp.asarray(train_rows_np, dtype=jnp.int32)
+    constraint_rows = jnp.asarray(constraint_rows_np, dtype=jnp.int32)
     diag_rng = np.random.default_rng(args.seed + 0x51A7)
     diag_rows = diag_rng.choice(
         data.heldout_rows, size=4096,
@@ -432,7 +492,8 @@ def main(argv: list[str] | None = None) -> int:
             run_step = step - start_step
             params, primal_state, raw_lambda, dual_state, key, metrics = train_update(
                 params, primal_state, raw_lambda, dual_state, key,
-                states, next_indices, train_rows,
+                states, next_indices, train_rows, constraint_rows,
+                constraint_next_indices,
             )
             train_values = {
                 key: float(jax.device_get(value))
@@ -495,6 +556,7 @@ def main(argv: list[str] | None = None) -> int:
                     data, states_np, next_index, predictor,
                     step=step, seed=args.seed, triangle_count=args.triangles,
                     eval_batch_size=args.eval_batch_size,
+                    constraint_horizon=args.constraint_horizon, epsilon=args.epsilon,
                 )
                 row = {
                     **report,

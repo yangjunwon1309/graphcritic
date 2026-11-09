@@ -22,6 +22,7 @@ from experiments.v08_runtime import (
     next_state_indices,
 )
 from graphcritic.bridges.models import prepare_puzzle_model_data
+from graphcritic.bridges.windows import puzzle_state_windows
 from graphcritic.io import load_sim_state, load_transitions
 
 
@@ -41,7 +42,7 @@ def analyze_checkpoints(args: argparse.Namespace) -> list[dict]:
     trans, transition_meta = load_transitions(args.transitions)
     sim_state = load_sim_state(args.sim_state)
     data = prepare_puzzle_model_data(trans, sim_state, seed=args.seed)
-    states = np.concatenate((data.state_cont, data.state_bits), axis=1).astype(np.float32)
+    frame_states = np.concatenate((data.state_cont, data.state_bits), axis=1).astype(np.float32)
     next_index = next_state_indices(trans.terminal)
 
     rng = np.random.default_rng(args.seed + 0x51A7)
@@ -50,9 +51,15 @@ def analyze_checkpoints(args: argparse.Namespace) -> list[dict]:
         size=args.diagnostic_states,
         replace=len(data.heldout_rows) < args.diagnostic_states,
     )
-    diagnostic_states = states[diagnostic_rows]
     reports = []
     for checkpoint in args.ckpt:
+        raw_metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
+        window = int(raw_metadata.get("window", 1))
+        states = (
+            puzzle_state_windows(frame_states, trans, data.terminal_state_index, window=window)
+            if window > 1 else frame_states
+        )
+        diagnostic_states = states[diagnostic_rows]
         model, params, metadata = load_quasimetric_checkpoint(
             checkpoint,
             input_dim=states.shape[1],
@@ -71,6 +78,8 @@ def analyze_checkpoints(args: argparse.Namespace) -> list[dict]:
             data, states, next_index, predictor,
             step=step, seed=args.seed, triangle_count=args.triangles,
             eval_batch_size=args.eval_batch_size,
+            constraint_horizon=int(metadata.get("constraint_horizon", 1)),
+            epsilon=float(metadata.get("epsilon", 0.25)),
         )
         reports.append({
             "checkpoint": str(checkpoint),
@@ -87,16 +96,18 @@ def analyze_checkpoints(args: argparse.Namespace) -> list[dict]:
 def _print_table(reports: list[dict]) -> None:
     print(
         "| step | λ | activation | dead ReLU/GELU units by layer | "
-        "encoder var | projector var | heldout d>1.25 | button changed | "
+        "encoder var | projector var | heldout constraint violation | button changed | "
         "button unchanged | P(d≤5), j=5 | triangle violations |"
     )
     print("|---:|---:|:---:|:---|---:|---:|---:|---:|---:|---:|---:|")
     for report in reports:
         heldout = report["heldout"]
-        constraint = heldout["heldout_one_step_constraint"]
+        constraint = heldout.get("heldout_chunk_constraint") or heldout["heldout_one_step_constraint"]
         groups = constraint["button_change_groups"]
         horizons = heldout["same_episode_distance_by_horizon"]
         h5 = horizons["5"]["fraction_distance_leq_horizon"]
+        violation_key = "overall_violation_rate_d_gt_limit"
+        group_violation_key = "constraint_violation_rate_d_gt_limit"
         dead = ", ".join(
             f"{name}={value:.3f}"
             for name, value in report["diagnostics"]["dead_unit_frac_by_layer"].items()
@@ -105,9 +116,9 @@ def _print_table(reports: list[dict]) -> None:
             f"| {report['step']} | {report['lambda']:.6g} | {report['activation']} | {dead} | "
             f"{report['diagnostics']['encoder_output_mean_variance']:.6g} | "
             f"{report['diagnostics']['projector_output_mean_variance']:.6g} | "
-            f"{constraint['overall_violation_rate_d_gt_1_plus_epsilon']:.4f} | "
-            f"{groups['changed']['constraint_violation_rate_d_gt_1_plus_epsilon']:.4f} | "
-            f"{groups['unchanged']['constraint_violation_rate_d_gt_1_plus_epsilon']:.4f} | "
+            f"{constraint[violation_key]:.4f} | "
+            f"{groups['changed'][group_violation_key]:.4f} | "
+            f"{groups['unchanged'][group_violation_key]:.4f} | "
             f"{h5:.4f} | {heldout['triangle_check']['violation_count']} |"
         )
     print("\nHeld-out distance distributions by same-episode horizon:")

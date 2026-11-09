@@ -1,142 +1,73 @@
-# Graph Critic v0.8 recovery and windowed-bridge runs
+# Graph Critic v0.8 window-5 runbook
 
-**Implementation code commit:** `58423b2faf85a38bab1ca0bb8d9e5b97476cb35c`
+**Implementation code commit:** `808576c7e4670c08ad4e7401a6d99198c16dfd40`
 
-This runbook covers v0.8 §2.1–2.3, §3.1, and the simulator-free part of §4. It contains user-run commands only. Per §5.3, Codex does not run pytest, training, experiments, or cache creation. Q1/Q3 simulator witnesses and QC are not included: the guide leaves the common diagnostic executor pending approval.
+This runbook contains the v0.8 **five-frame window** experiment and its downstream checks only. The quasimetric training and graph judging use window length 5; the constraint horizon is 5 and ε is 1.25. There are no state-input quasimetric runs or comparisons in this procedure.
 
-## Prepare a clean, pinned worktree
+The v0.8.1 focused checks and full test suite were run before commit. Model training, benchmark graph builds, and the board report remain user-run. Simulator witnesses and QC are outside this runbook.
 
-Use the implementation commit so saved metadata records a clean, reproducible source tree. The commands assume the repository is `/home/url/graphcritic`, the benchmark environment is installed there, and `/home/url/gc-run-v08` is reserved for the run.
+## 1. Prepare the pinned worktree
+
+The CLI error `unrecognized arguments: --window --constraint-horizon --epsilon` occurs when running an older checkout. The implementation at the code commit above defines all three options. Update an existing run worktree as well as creating one when it is absent:
 
 ```bash
 cd /home/url/graphcritic
-git worktree add --detach /home/url/gc-run-v08 quasi_develop   # only if this worktree does not already exist
-git -C /home/url/gc-run-v08 checkout --detach 58423b2faf85a38bab1ca0bb8d9e5b97476cb35c
-git -C /home/url/gc-run-v08 status --short                    # should print nothing
-cd /home/url/gc-run-v08
+# Run this only if /home/url/gc-run-v08 is not already a worktree:
+git worktree add --detach /home/url/gc-run-v08 quasi_develop
+git fetch origin quasi_develop
+git -C /home/url/gc-run-v08 checkout --detach origin/quasi_develop
+git -C /home/url/gc-run-v08 rev-parse HEAD                    # record the pushed run commit
+git -C /home/url/gc-run-v08 status --short
+```
 
+`status --short` should print nothing. The detached worktree uses the latest commit pushed to `quasi_develop`, including the runbook update. Then set the run paths:
+
+```bash
+cd /home/url/gc-run-v08
 ROOT=/home/url/graphcritic
 PY=$ROOT/.pixi/envs/bench/bin/python
 D=$ROOT/outputs/puzzle/p13-4x4-task2-100-generated
-CK=$D/v08/quasimetric
 COMMON="--transitions $D/g0/transitions.npz --sim-state $D/g0/sim_state.npz"
 ```
 
-All generated data, checkpoints, embedding arrays, and candidate caches below stay under ignored `outputs/`. The interrupted run has P13 state-input checkpoints under `$CK/`; it has no standard-task checkpoint.
+All generated data, checkpoints, embedding arrays, and candidate caches below stay under ignored `outputs/`.
 
-## 0. Unit tests
+## 2. Run the code checks
 
 ```bash
 $PY -m pytest tests/test_quasimetric_v08.py -q
 ```
 
-**Expected time:** a few minutes, depending on GPU availability for the optional integration checks.
+The suite checks chunk-horizon loss, window padding and boundary-node selection, batched cached-node judging, IQE embedding/head equivalence (maximum absolute error `≤1e-5`), and—when a GPU is available—float32 cache reuse and cached/direct pair agreement (`≤1e-4`). Stop and report the failure output if a check fails.
 
-**Check:** all tests pass. The suite checks chunk-horizon loss, window padding and boundary-node selection, batched cached-node judging, IQE embedding/head equivalence (maximum absolute error `≤1e-5`), and—when a GPU is available—float32 cache reuse and cached/direct pair agreement (`≤1e-4`). Stop and send the failure output if any test fails. This command is for the user to run.
+## 3. Train the five-frame quasimetric
 
-## A0. Inspect the existing P13 checkpoints
-
-```bash
-$PY experiments/analyze_quasimetric_ckpt.py \
-  --ckpt $CK/step_050000 $CK/step_100000 $CK/step_150000 $COMMON
-```
-
-**Expected time:** a few minutes. This reads checkpoints and prints held-out diagnostics; it does not train or simulate.
-
-**Check:** inspect `projector_1` dead-unit fraction at step 50k. If it is **greater than 0.95**, run A2/A3 from scratch without `--init-from $CK/step_050000`. Otherwise use the warm-start form below. Record per-layer dead fractions, encoder/projector variances, λ, held-out constraint rates, `P(d≤5 | j=5)`, and triangle violations.
-
-## A1. Reproduce the old setup with collapse monitoring
-
-```bash
-$PY experiments/train_quasimetric.py $COMMON --resume-from $CK/step_100000 \
-  --activation relu --no-layernorm --grad-clip 0 --dual adam \
-  --steps 20000 --log-every 1000 --save-every 10000 --out $D/v08/check/a1_reproduce
-```
-
-**Expected time:** about 12 minutes. Training metrics go to `$D/v08/check/a1_reproduce/train_metrics.jsonl`; checkpoints and held-out reports go to the same directory. Exit code `3` means F3 saved an alarm checkpoint and stopped because a collapse gate fired.
-
-**Check:** summarize the 5k rows and alarm step with the command in “Compare A1–A3 logs.” This checks that F3 makes the collapse visible during training.
-
-## A2. GELU, LayerNorm, clipping, Adam dual
-
-If A0 found the step-50k projector dead fraction at or below 0.95:
-
-```bash
-$PY experiments/train_quasimetric.py $COMMON --init-from $CK/step_050000 \
-  --activation gelu --layernorm --grad-clip 1.0 --dual adam \
-  --steps 20000 --log-every 1000 --save-every 10000 --out $D/v08/check/a2_fix123
-```
-
-If it was above 0.95, use the same command without `--init-from $CK/step_050000`.
-
-**Expected time:** about 12 minutes. Warm start copies Dense weights, IQE α, and λ; LayerNorm starts as identity and optimizer state is fresh. Exit code `3` means F3 saved an alarm checkpoint and stopped.
-
-## A3. Add projected-SGD dual update
-
-Use the same warm-start decision as A2:
-
-```bash
-$PY experiments/train_quasimetric.py $COMMON --init-from $CK/step_050000 \
-  --activation gelu --layernorm --grad-clip 1.0 --dual sgd --dual-lr 1.0 \
-  --steps 20000 --log-every 1000 --save-every 10000 --out $D/v08/check/a3_fix1234
-```
-
-If A0 found the projector dead fraction above 0.95, omit `--init-from $CK/step_050000`.
-
-**Expected time:** about 12 minutes. This adds `λ ← max(0, λ + gap)` with η=1. Exit code `3` has the same F3 meaning.
-
-## Compare A1–A3 logs
-
-```bash
-$PY experiments/summarize_qrl_log.py --log $D/v08/check/a2_fix123/train_metrics.jsonl \
-  --compare $D/v08/check/a3_fix1234/train_metrics.jsonl $D/v08/check/a1_reproduce/train_metrics.jsonl
-```
-
-The command prints 5k-step rows and alarm steps. Send this output, the three `train_metrics.jsonl` files, and the `training.jsonl` held-out reports for interpretation.
-
-### A2/A3 gate
-
-At step 20k a setting passes only if all conditions hold:
-
-- No F3 alarm occurred.
-- Random-pair mean `d(s,g)` is not trending downward in the 5k summary.
-- Held-out one-step violation `d(s,s′) > 1.25` is at most **0.223**.
-- Held-out `P(d≤5 | same-episode j=5)` is at least **0.623**.
-
-If neither A2 nor A3 passes, stop and return the logs. If either passes, report the metrics; the full-run setting is selected after review. A2/A3 results are one-frame measurements and must not be treated as the window/chunk result.
-
-## A5. Five-frame window with a five-step constraint
-
-This is a fresh 20k-step run with F1–F3, a five-frame input window, and the chunk constraint from v0.8 §2.3. It deliberately does not warm-start from the 35D state-input checkpoints.
+This is a fresh 20k-step run with F1–F3, a five-frame input window, a five-step constraint horizon, and ε=1.25:
 
 ```bash
 $PY experiments/train_quasimetric.py $COMMON \
   --window 5 --constraint-horizon 5 --epsilon 1.25 \
   --activation gelu --layernorm --grad-clip 1.0 --dual adam \
-  --steps 20000 --log-every 1000 --save-every 10000 --out $D/v08/check/a5_window_chunk
+  --steps 20000 --log-every 1000 --save-every 10000 \
+  --out $D/v08/check/window5_chunk
 ```
 
-**Expected time:** approximately 12–20 minutes on the configured GPU; actual time depends on GPU throughput. Outputs are under `$D/v08/check/a5_window_chunk/`. Exit code `3` means F3 saved a checkpoint and stopped.
+**Expected time:** approximately 12–20 minutes on the configured GPU. Outputs are under `$D/v08/check/window5_chunk/`. Exit code `3` means F3 saved a checkpoint and stopped after a collapse gate fired.
 
-**Check:** proceed to the shared-metric comparison only if the A5 run completed without an F3 alarm and wrote `step_020000`. Review `train_metrics.jsonl` for random-pair distance, λ, constraint gap, pre-clip gradient norm, per-layer dead-unit fraction, and projector variance.
+**Check:** continue only if the run completed without an F3 alarm and wrote `step_020000`. Review `train_metrics.jsonl` for random-pair distance, λ, constraint gap, pre-clip gradient norm, per-layer dead-unit fraction, and projector variance.
 
-### Compare A2 and A5 with the same chunk metrics
-
-Run only if A2 and A5 both have `step_020000` checkpoints:
+Evaluate the completed checkpoint on the common five-step chunk metrics:
 
 ```bash
 $PY experiments/eval_quasimetric_chunk.py \
-  --ckpt $D/v08/check/a2_fix123/step_020000 \
-        $D/v08/check/a5_window_chunk/step_020000 $COMMON
+  --ckpt $D/v08/check/window5_chunk/step_020000 $COMMON
 ```
 
-**Expected time:** several minutes, depending on GPU throughput. The report is printed to stdout; no cache or simulator is used.
+The report includes chunk violation `d(x_t,x_{t+5}) > 6.25`, split by chunks with and without internal button changes; `P(d≤j)` for `j=5,10,15,20,40,80`; projector variance; F3 indicators; and triangle violations. Review the output before starting a longer run.
 
-**Check:** compare chunk violation `d(x_t,x_{t+5}) > 6.25`, separately for chunks with any internal button change and chunks without one; compare `P(d≤j)` for `j=5,10,15,20,40,80`, projector variance, F3 indicators, and triangle violations. This is a diagnostic comparison; the guide does not assign a numeric A5 selection threshold beyond the F3 stability gates. Send the output before starting a full 200k run.
+## 4. Build the shared window-5 candidate cache
 
-## Window-5 candidate cache
-
-Build the shared boundary-window candidate cache after the windowed features are selected for evaluation. Candidate pairs use k=32, cross-episode 175D window features, boundary sources, and success states as eligible destinations.
+Build this cache after the five-frame checkpoint has passed the checks above. Candidate pairs use k=32, cross-episode 175D window features, boundary sources, and success states as eligible destinations.
 
 ```bash
 $PY experiments/build_candidate_cache.py \
@@ -146,39 +77,39 @@ $PY experiments/build_candidate_cache.py \
   --window 5 --knn 32 --parity-size 50000 --seed 0
 ```
 
-**Expected time:** several minutes to tens of minutes, depending on GPU and CPU kNN parity throughput. The compressed cache and JSON report are `$D/v08/candidates_window5.npz` and `$D/v08/candidates_window5.json`.
+The compressed cache and JSON report are `$D/v08/candidates_window5.npz` and `$D/v08/candidates_window5.json`. Candidate generation may take several minutes to tens of minutes depending on CPU/GPU throughput. Check that `knn_parity.mismatched_rows` is `0`; record actual source, destination, and success-destination counts. Stop if parity fails.
 
-**Check:** `knn_parity.mismatched_rows` must be `0`; candidate nodes should be around 200k and pair count around 6.4m for this dataset. Record the actual source, destination, and success-destination counts. Stop if the parity check fails.
+## 5. Check embedding-cache equivalence
 
-## §3.1 Embedding-cache equivalence check
-
-Run this on a completed window-5 checkpoint. The command below is the guide’s random cross-episode pair check. To check actual kNN candidates from the cache above, add `--candidate-cache $D/v08/candidates_window5.npz`.
+Run this on the completed five-frame checkpoint. Add `--candidate-cache` to check the actual kNN pairs from section 4 instead of random cross-episode pairs.
 
 ```bash
 $PY experiments/check_embedding_cache.py \
-  --ckpt $D/v08/check/a5_window_chunk/step_020000 $COMMON --pairs 10000
+  --ckpt $D/v08/check/window5_chunk/step_020000 $COMMON --pairs 10000 \
+  --candidate-cache $D/v08/candidates_window5.npz
 ```
 
-**Expected time:** several minutes on GPU for a first cache build; a repeated run reuses the on-disk cache. The embedding table is float32 and is approximately 1.6 GB for 200k nodes × 2048 values. The default cache path is beside the checkpoint under `embedding_cache/`; pass `--embedding-cache PATH` to choose another ignored output path.
+The first cache build takes several minutes on GPU. The float32 embedding table uses `4 × node_count × 2048` bytes: about 1.6 GB for 200k nodes. This dataset produced 235,437 cache nodes, or about 1.93 GB. The default cache path is beside the checkpoint under `embedding_cache/`; use `--embedding-cache PATH` to choose another ignored output path.
 
-**Check:** `max_absolute_distance_difference ≤ 1e-4`, `bridge_decision_mismatches_at_K20 = 0`, and `pass = true`. Record `embedding_seconds`, `cached_pair_seconds`, and direct pair time. The test also records cache hit status and bytes. Do not build a quasimetric graph if this check fails.
+**Pass criteria:** `max_absolute_distance_difference ≤1e-4`, `bridge_decision_mismatches_at_K20 = 0`, and `pass = true`. Record `embedding_seconds`, `cached_pair_seconds`, and direct pair time. Do not build a quasimetric graph if this check fails.
 
-## Later simulator-free graph comparison
+## 6. Build and compare judged graphs
 
-The full P13 and standard-task training commands are added after A2/A3/A5 outputs are reviewed, as required by v0.8 §6. Once the selected window-5 checkpoint and corresponding G0/reference graphs are available, the builder accepts the same window-5 cache for both judges. Flow consumes the original 35D frame endpoints; quasimetric consumes the corresponding 175D windows. `--candidate-window 5` explicitly makes the flow run use the same cached boundary pairs.
-
-Example quasimetric build:
+After the five-frame checkpoint and cache checks pass, build the quasimetric graph using the shared five-frame candidate cache and the prescribed G-R reference graph:
 
 ```bash
 $PY experiments/build_judged_graph.py --judge quasimetric \
   --g0-graph $D/g0/graph.npz --reference-graph $D/gr-rho09/graph.npz \
   --transitions $D/g0/transitions.npz --sim-state $D/g0/sim_state.npz \
-  --checkpoint <SELECTED_WINDOW5_CHECKPOINT> \
+  --checkpoint $D/v08/check/window5_chunk/step_020000 \
   --candidate-cache $D/v08/candidates_window5.npz \
+  --embedding-pair-batch-size 4096 \
   --out $D/v08/quasimetric
 ```
 
-If a compatible v0.7 flow checkpoint is available, build it from the exact same candidate cache:
+The 4,096-pair batch bounds the GPU gathers to about 32 MiB per endpoint for 2,048D float32 embeddings. Reduce it further if the GPU still runs out of memory; the existing embedding cache is reused.
+
+If the compatible v0.7 flow checkpoint is available, evaluate it on the same candidate cache for the judge comparison:
 
 ```bash
 $PY experiments/build_judged_graph.py --judge flow --candidate-window 5 \
@@ -194,6 +125,57 @@ $PY experiments/compare_judges.py \
   --out $D/v08/judge_decision_comparison.json
 ```
 
-**Expected time:** not established; judging millions of pairs is GPU- and checkpoint-dependent. These commands write graph/target artifacts and `result.json` under the two judge-specific directories. The result reports candidate and bridge counts, reachability against G0/reference, bridge-count distribution, cost improvements, judge/embedding timing, and target validity. `compare_judges.py` reports the four agreement cells split by whether endpoint board states differ.
+Judging millions of pairs is GPU- and checkpoint-dependent. Each graph build writes graph/target artifacts and `result.json` under its output directory. The report includes candidate and bridge counts, reachability against G0/reference, bridge-count distribution, cost improvements, judge/embedding timing, and target validity. `compare_judges.py` reports agreement cells split by whether endpoint board states differ.
 
-**Gate:** confirm both `optimistic_candidate_sha256` values match before interpreting decision agreement. Q1 must be at least 0.8 for both judges before comparing Q3; the v0.8 guide does not authorize the simulator witness yet, so neither command above steps a simulator. QC is not part of this run.
+Before interpreting agreement, confirm both `optimistic_candidate_sha256` values match. Q1 must be at least 0.8 for both judges before comparing Q3. These commands do not step a simulator; simulator witnesses and QC require a separate approved procedure.
+
+## 7. v0.8.1: bridge Λ and temporary board check
+
+The per-bridge penalty is applied to accepted bridge costs before layered reverse Dijkstra. It does not affect the quasimetric acceptance rule (`dθ ≤ 20`), optimistic candidate filtering, or the stored bridge distance `dist`, which remains `dθ`. Λ is recorded as `bridge_lambda_steps` in graph metadata. The zero setting preserves the v0.8 graph hash; the focused unit test checks the invariant and checks that a positive Λ changes edge cost while retaining raw distance.
+
+Run the focused implementation checks:
+
+```bash
+$PY -m pytest tests/test_v08_1.py tests/test_puzzle.py tests/test_quasimetric_v08.py -q
+```
+
+Implementation verification: focused tests **32 passed**; the full repository suite **163 passed** with three existing upstream/runtime warnings. The benchmark graph builds and board audit below were not run by Codex.
+
+Then build both requested graphs. Each run should take about 1–2 minutes. The 4,096-pair embedding batch limits GPU memory use; reduce it to 1,024 if needed.
+
+```bash
+for LAM in 0 10.5; do
+  $PY experiments/build_judged_graph.py --judge quasimetric \
+    --g0-graph $D/g0/graph.npz --reference-graph $D/gr-rho09/graph.npz \
+    --transitions $D/g0/transitions.npz --sim-state $D/g0/sim_state.npz \
+    --checkpoint $D/v08/check/window5_chunk/step_020000 \
+    --candidate-cache $D/v08/candidates_window5.npz \
+    --embedding-pair-batch-size 4096 \
+    --bridge-lambda-steps "$LAM" \
+    --out "$D/v08/quasimetric_lam$LAM"
+done
+```
+
+The board check is puzzle-specific, offline, and does not step a simulator. It reads each graph's retained `kind == 1` edges and raw `dist`, maps node representatives through `rep_ref`, and uses the existing GF(2) minimum-press solver. The data-derived lower bound is `L(0)=0` and `L(n_p)=(n_p−1)m+1` for `n_p≥1`, where `m` is the p1 interval between consecutive within-episode board changes. A bridge is flagged when `dθ < L(n_p)` or the board difference has no GF(2) solution. A pass is not evidence that a bridge is executable; the check is only a lower-bound rejection test.
+
+```bash
+$PY experiments/tmp_board_check.py \
+  --graph $D/v08/quasimetric_lam0/graph.npz \
+          $D/v08/quasimetric_lam10.5/graph.npz \
+  --transitions $D/g0/transitions.npz --sim-state $D/g0/sim_state.npz \
+  --out $D/v08/board_check.json
+```
+
+Report these values side by side. The previous Λ=0 result is included for comparison; fill the rerun and Λ=10.5 columns from each graph's `result.json` and `board_check.json`.
+
+| Measure | Λ=0, previous | Λ=0, rerun | Λ=10.5 |
+|---|---:|---:|---:|
+| Shortest-path bridge count distribution (0 / 1 / 2) | 10.3% / 16.5% / 73.1% | — | — |
+| Retained bridge count | 124,147 | — | — |
+| Reachable-state fraction | 99.9% | — | — |
+| Originally reachable states with lower `C` | 85.6% | — | — |
+| Retained bridges to success states | 2,669 | — | — |
+| Board effort `n_p` distribution (0 / 1 / 2 / 3 / ≥4 / ∞) | — | — | — |
+| Impossible bridge count / fraction | — | — | — |
+
+Also report the board-change interval sample count and its minimum, p1, and p5, plus impossible rates by `n_p`. Expected direction: Λ=10.5 reduces the two-bridge path share and the fraction of originally reachable states with lower `C`, while keeping reachability close to Λ=0. A high board-impossibility rate indicates that the quasimetric judge itself needs further review, regardless of Λ.

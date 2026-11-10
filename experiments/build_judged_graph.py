@@ -136,7 +136,9 @@ def _make_artifact(
     )
     cost_cfg = replace(
         base.config.bridge.cost,
-        policy="time", tau_max_steps=20, lambda0_steps=0.0, lambda1_steps=0.0,
+        policy="time",
+        tau_max_steps=int(math.ceil(20.0 + bridge_lambda_steps)),
+        lambda0_steps=0.0, lambda1_steps=0.0,
     )
     bridge_cfg = replace(
         base.config.bridge, enabled=True, strategy="puzzle_r",

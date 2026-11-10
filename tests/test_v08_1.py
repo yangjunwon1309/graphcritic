@@ -85,6 +85,14 @@ def test_positive_lambda_penalizes_cost_but_leaves_quasimetric_distance_raw():
     assert artifact.weights[-1] == pytest.approx(13.0 * step_cost(artifact.config.gamma))
 
 
+def test_lambda_cost_ceiling_is_allowed_by_graph_time_policy_cap():
+    artifact = _make_test_artifact(30.5, 20.0, 10.5)
+    assert artifact.edges.kappa[-1] == 31
+    assert artifact.config.bridge.cost.tau_max_steps == 31
+    assert artifact.edges.dist[-1] == pytest.approx(20.0)
+    assert artifact.weights[-1] == pytest.approx(30.5 * step_cost(artifact.config.gamma))
+
+
 @pytest.mark.parametrize("lam", [-0.1, float("nan"), float("inf")])
 def test_bridge_lambda_rejects_negative_or_non_finite_values(lam):
     with pytest.raises(ValueError, match="finite and non-negative"):

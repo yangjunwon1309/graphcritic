@@ -33,16 +33,21 @@ from experiments.v08_runtime import (
     make_embedding_cache_predictor,
     provenance,
 )
+from graphcritic.bridges.object_state import frame_object_features_from_checkpoint
 from graphcritic.bridges.insert import layered_reverse_dijkstra
 from graphcritic.bridges.judge_flow import FlowJudge
-from graphcritic.bridges.judge_quasimetric import QuasimetricJudge
+from graphcritic.bridges.judge_quasimetric import (
+    QuasimetricJudge,
+    intersect_quasimetric_judges,
+)
 from graphcritic.bridges.models import prepare_puzzle_model_data
 from graphcritic.bridges.windows import puzzle_state_windows, puzzle_window_candidate_nodes
 from graphcritic.config import TargetConfig
 from graphcritic.io import load_graph, load_sim_state, load_transitions, save_graph, save_targets
 from graphcritic.modes import state_episode_time
+from graphcritic.puzzle import minimum_press_solution, toggle_matrix
 from graphcritic.targets import critic_targets
-from graphcritic.types import EdgeSet, GraphArtifact
+from graphcritic.types import EdgeSet, GraphArtifact, SchemaError
 from graphcritic.weights import step_cost
 from experiments.v07_runtime import load_model_pair, make_bridge_evaluator
 
@@ -210,7 +215,118 @@ def _parse(argv: list[str] | None = None):
         "--embedding-pair-batch-size", type=int, default=4096,
         help="node pairs per GPU embedding lookup; lower this if GPU memory is limited",
     )
+    parser.add_argument("--object-event-checkpoint", type=Path,
+                        help="optional object event-count quasimetric checkpoint")
+    parser.add_argument("--object-motion-checkpoint", type=Path,
+                        help="optional object motion-time quasimetric checkpoint")
+    parser.add_argument("--event-max", default="auto",
+                        help="event limit: auto=ceil(K/T_I) from event metadata, or a non-negative integer")
+    parser.add_argument("--diagnostic-oracle-np-max", type=int,
+                        help="Puzzle-only exact GF(2) press-count filter; diagnostic graph, never a QC target")
+    parser.add_argument("--oracle-reference-candidates", type=Path,
+                        help="D1 judge_candidates.npz used to measure D3 recall on the n_p<=limit, d_theta<=K subset")
     return parser.parse_args(argv)
+
+
+def _load_object_judge(
+    checkpoint: Path,
+    *,
+    expected_dataset_id: str,
+    expected_cost: str,
+    expected_window: int,
+    expected_seed: int,
+    trans,
+    sim_state,
+    node_ids: np.ndarray,
+    candidate_cache: Path,
+    pair_batch_size: int,
+):
+    """Load and cache one object model after validating its data contract."""
+    metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
+    if metadata.get("model_kind") != "object-quasimetric-v0.8.2":
+        raise ValueError(f"{checkpoint} is not a v0.8.2 object quasimetric checkpoint")
+    if metadata.get("object_cost") != expected_cost:
+        raise ValueError(f"{expected_cost} judge requires an object_cost={expected_cost!r} checkpoint")
+    if int(metadata.get("window", -1)) != expected_window:
+        raise ValueError("object checkpoint window does not match candidate window")
+    if metadata.get("object_state_schema") != "puzzle-button-onehot-depth-velocity-v1":
+        raise ValueError("object checkpoint uses an unknown object-state schema")
+    if metadata.get("dataset_id") != expected_dataset_id:
+        raise ValueError("object checkpoint dataset ID does not match graph-build data")
+    if int(metadata.get("data_split_seed", metadata.get("split_seed", -1))) != expected_seed:
+        raise ValueError("object checkpoint episode-split seed does not match graph features")
+    feature_all = frame_object_features_from_checkpoint(
+        trans, sim_state,
+        continuous_mean=np.asarray(metadata["continuous_mean"], dtype=np.float32),
+        continuous_std=np.asarray(metadata["continuous_std"], dtype=np.float32),
+        window=expected_window,
+    )
+    if feature_all.shape[1] != int(metadata.get("input_dim", -1)):
+        raise ValueError("object checkpoint input dimension does not match object features")
+    model, params, metadata = load_quasimetric_checkpoint(
+        checkpoint, input_dim=feature_all.shape[1],
+        expected_dataset_id=expected_dataset_id,
+    )
+    cache_path = candidate_cache.parent / "embeddings" / (
+        f"object-{expected_cost}-{metadata['params_sha256'][:16]}-"
+        f"{_array_sha256(node_ids)[:16]}.npy"
+    )
+    predict_pairs, report = make_embedding_cache_predictor(
+        model, params, feature_all[node_ids], node_ids,
+        params_sha256=str(metadata["params_sha256"]), dataset_id=expected_dataset_id,
+        cache_path=cache_path, pair_batch_size=pair_batch_size,
+    )
+    return predict_pairs, metadata, report
+
+
+def _oracle_press_counts(pairs: np.ndarray, boards: np.ndarray) -> np.ndarray:
+    """Exact minimum GF(2) press count for each graph-node pair."""
+    button_count = int(boards.shape[1])
+    layout = {9: (3, 3), 16: (4, 4), 20: (4, 5)}
+    if button_count not in layout:
+        raise SchemaError("oracle press-count filter supports 3x3, 4x4, and 4x5 boards")
+    toggle = toggle_matrix(*layout[button_count])
+    memo: dict[int, int] = {}
+    result = np.empty(len(pairs), dtype=np.int16)
+    for i, (src, dst) in enumerate(np.asarray(pairs, dtype=np.int64)):
+        difference = np.asarray(boards[int(src)] ^ boards[int(dst)], dtype=np.uint8)
+        key = sum(int(bit) << j for j, bit in enumerate(difference))
+        count = memo.get(key)
+        if count is None:
+            try:
+                solution = minimum_press_solution(toggle, difference)
+            except SchemaError:
+                count = -1
+            else:
+                count = int(np.count_nonzero(solution))
+            memo[key] = count
+        result[i] = count
+    return result
+
+
+def _oracle_candidate_recall(
+    oracle_press_count: np.ndarray,
+    oracle_distance: np.ndarray,
+    judged_accept: np.ndarray,
+    *,
+    max_press_count: int,
+    max_distance_steps: float = 20.0,
+) -> dict:
+    """Measure D3 acceptance recall on D1's exact feasible-candidate subset."""
+    counts = np.asarray(oracle_press_count, dtype=np.int64)
+    distance = np.asarray(oracle_distance, dtype=np.float32)
+    accept = np.asarray(judged_accept, dtype=np.bool_)
+    if counts.ndim != 1 or distance.shape != counts.shape or accept.shape != counts.shape:
+        raise ValueError("D1 oracle counts/distances and D3 acceptance must align")
+    eligible = (counts >= 0) & (counts <= int(max_press_count)) & (distance <= float(max_distance_steps))
+    denominator = int(np.count_nonzero(eligible))
+    retained = int(np.count_nonzero(eligible & accept))
+    return {
+        "eligible_d1_candidate_count": denominator,
+        "retained_by_d3_count": retained,
+        "recall": float(retained / denominator) if denominator else None,
+        "definition": "D1 n_p<=max_press_count and d_theta<=K, retained by D3",
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -222,6 +338,40 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("v0.8 fixes K=20 and at most four flow chunks")
     if not math.isfinite(args.bridge_lambda_steps) or args.bridge_lambda_steps < 0:
         raise SystemExit("--bridge-lambda-steps must be finite and non-negative")
+    if args.diagnostic_oracle_np_max is not None and args.diagnostic_oracle_np_max < 0:
+        raise SystemExit("--diagnostic-oracle-np-max must be non-negative")
+    if args.object_event_checkpoint is not None or args.object_motion_checkpoint is not None:
+        if args.judge != "quasimetric":
+            raise SystemExit("object-state filters are only supported with --judge quasimetric")
+    if args.diagnostic_oracle_np_max is not None and args.judge != "quasimetric":
+        raise SystemExit("--diagnostic-oracle-np-max requires --judge quasimetric")
+    if args.diagnostic_oracle_np_max is not None and args.object_event_checkpoint is not None:
+        raise SystemExit("diagnostic oracle replaces --object-event-checkpoint")
+    if args.event_max != "auto":
+        try:
+            parsed_event_max = int(args.event_max)
+        except (TypeError, ValueError) as exc:
+            raise SystemExit("--event-max must be 'auto' or a non-negative integer") from exc
+        if parsed_event_max < 0:
+            raise SystemExit("--event-max must be 'auto' or a non-negative integer")
+    else:
+        parsed_event_max = None
+    if (parsed_event_max is not None and args.object_event_checkpoint is None
+            and args.diagnostic_oracle_np_max is None):
+        raise SystemExit("an explicit --event-max requires an event checkpoint or oracle filter")
+    if args.diagnostic_oracle_np_max is not None:
+        stale_targets = [
+            args.out / "targets.npz", args.out / "targets.json",
+            args.out / "targets_source.npy",
+        ]
+        if any(path.exists() for path in stale_targets):
+            raise SystemExit(
+                "oracle diagnostic output already contains QC targets; choose a fresh --out directory"
+            )
+    if args.oracle_reference_candidates is not None and (
+        args.object_event_checkpoint is None and args.object_motion_checkpoint is None
+    ):
+        raise SystemExit("--oracle-reference-candidates is for measuring an object-filtered D3 run")
     started = time.time()
     stages: dict[str, float] = {}
     trans, trans_meta = load_transitions(args.transitions)
@@ -271,6 +421,9 @@ def main(argv: list[str] | None = None) -> int:
             candidate_window = 1
     if candidate_window is None or candidate_window < 1:
         raise ValueError("candidate window must be a positive integer")
+    if ((args.object_event_checkpoint is not None or args.object_motion_checkpoint is not None)
+            and candidate_window != 5):
+        raise ValueError("v0.8.2 object checkpoints require the five-frame candidate window")
     if candidate_window > 1:
         candidate_features_all = (
             features if args.judge == "quasimetric" and model_window == candidate_window
@@ -372,6 +525,37 @@ def main(argv: list[str] | None = None) -> int:
             batch_size=judge_pair_batch_size,
             predict_node_pairs=predict_node_pairs,
         )
+    object_event_predict = object_motion_predict = None
+    event_model_meta = motion_model_meta = None
+    object_embedding_reports: dict[str, dict] = {}
+    if args.object_event_checkpoint is not None:
+        object_event_predict, event_model_meta, object_embedding_reports["events"] = _load_object_judge(
+            args.object_event_checkpoint,
+            expected_dataset_id=dataset_id, expected_cost="events",
+            expected_window=candidate_window, expected_seed=args.seed,
+            trans=trans, sim_state=sim_state,
+            node_ids=embedding_node_ids, candidate_cache=args.candidate_cache,
+            pair_batch_size=judge_pair_batch_size,
+        )
+        if parsed_event_max is None:
+            onset_meta = event_model_meta.get("onset_interval", {})
+            interval_p1 = onset_meta.get("p1_frames", event_model_meta.get("T_I"))
+            if interval_p1 is None or not math.isfinite(float(interval_p1)) or float(interval_p1) <= 0:
+                raise ValueError("event checkpoint lacks a positive T_I p1 interval for --event-max auto")
+            event_max = int(math.ceil(args.max_bridge_distance / float(interval_p1)))
+        else:
+            event_max = parsed_event_max
+    else:
+        event_max = parsed_event_max
+    if args.object_motion_checkpoint is not None:
+        object_motion_predict, motion_model_meta, object_embedding_reports["motion"] = _load_object_judge(
+            args.object_motion_checkpoint,
+            expected_dataset_id=dataset_id, expected_cost="motion",
+            expected_window=candidate_window, expected_seed=args.seed,
+            trans=trans, sim_state=sim_state,
+            node_ids=embedding_node_ids, candidate_cache=args.candidate_cache,
+            pair_batch_size=judge_pair_batch_size,
+        )
     if int(model_meta.get("data_split_seed", model_meta.get("split_seed", args.seed))) != args.seed:
         raise ValueError("judge checkpoint episode-split seed does not match graph features")
     if "state_mean" in model_meta and not np.allclose(
@@ -387,6 +571,8 @@ def main(argv: list[str] | None = None) -> int:
     accepted = np.zeros(n_optimistic, dtype=np.bool_)
     judge_cost = np.full(n_optimistic, np.nan, dtype=np.float32)
     judge_distance = np.full(n_optimistic, np.nan, dtype=np.float32)
+    event_scores = np.full(n_optimistic, np.nan, dtype=np.float32)
+    motion_scores = np.full(n_optimistic, np.nan, dtype=np.float32)
     flow_chunk_count = np.zeros(n_optimistic, dtype=np.uint8)
     flow_sample_index = np.full(n_optimistic, -1, dtype=np.int16)
     flow_endpoint_error = np.full(n_optimistic, np.nan, dtype=np.float32)
@@ -409,6 +595,10 @@ def main(argv: list[str] | None = None) -> int:
             judge_cost[start:end] = result.cost_steps
             if args.judge == "quasimetric":
                 judge_distance[start:end] = result.extras["distance_steps"]
+                if object_event_predict is not None:
+                    event_scores[start:end] = object_event_predict(chunk_pairs)
+                if object_motion_predict is not None:
+                    motion_scores[start:end] = object_motion_predict(chunk_pairs)
             else:
                 flow_chunk_count[start:end] = result.extras["chunk_count"]
                 flow_sample_index[start:end] = result.extras["sample_index"]
@@ -442,6 +632,50 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         stages["judge_setup_and_evaluation_seconds"] = time.time() - judge_setup_started
+    oracle_counts = None
+    rejection_report = None
+    object_filters_active = (
+        args.object_event_checkpoint is not None
+        or args.object_motion_checkpoint is not None
+        or args.diagnostic_oracle_np_max is not None
+    )
+    if args.judge == "quasimetric" and object_filters_active:
+        if args.diagnostic_oracle_np_max is not None:
+            if sim_state.button_states is None:
+                raise SchemaError("diagnostic oracle requires the puzzle button_states sidecar")
+            oracle_counts = _oracle_press_counts(optimistic_pairs, sim_state.button_states)
+        rejection_report = intersect_quasimetric_judges(
+            judge_distance,
+            max_distance_steps=args.max_bridge_distance,
+            m_psi=motion_scores if object_motion_predict is not None else None,
+            e_phi=event_scores if object_event_predict is not None else None,
+            max_events=event_max if object_event_predict is not None else None,
+            oracle_press_count=oracle_counts,
+            oracle_max_press_count=args.diagnostic_oracle_np_max,
+        )
+        accepted = np.asarray(rejection_report["accept"], dtype=np.bool_)
+        judge_cost = np.where(accepted, judge_distance, np.nan).astype(np.float32)
+    oracle_reference_recall = None
+    if args.oracle_reference_candidates is not None:
+        with np.load(args.oracle_reference_candidates, allow_pickle=False) as reference_candidates:
+            if not {"pairs", "oracle_n_p", "distance_steps", "candidate_sha256"}.issubset(reference_candidates.files):
+                raise ValueError("oracle reference file is not a D1 judge_candidates.npz")
+            reference_pairs = np.asarray(reference_candidates["pairs"], dtype=np.int64)
+            if not np.array_equal(reference_pairs, optimistic_pairs):
+                raise ValueError("D1 and D3 optimistic candidate pair arrays differ")
+            reference_hash = str(reference_candidates["candidate_sha256"].item())
+            if reference_hash != _array_sha256(optimistic_pairs):
+                raise ValueError("D1 oracle candidate hash does not match the current candidate cache")
+            oracle_reference_recall = _oracle_candidate_recall(
+                reference_candidates["oracle_n_p"],
+                reference_candidates["distance_steps"],
+                accepted,
+                max_press_count=(
+                    int(reference_candidates["oracle_n_p_max"].item())
+                    if "oracle_n_p_max" in reference_candidates.files else 1
+                ),
+                max_distance_steps=args.max_bridge_distance,
+            )
     accepted_indices = np.flatnonzero(accepted).astype(np.int64)
     accepted_pairs = optimistic_pairs[accepted_indices]
     accepted_costs = _apply_bridge_lambda(
@@ -481,27 +715,62 @@ def main(argv: list[str] | None = None) -> int:
         }, candidate_rule=candidate_rule, window_size=candidate_window,
         bridge_lambda_steps=args.bridge_lambda_steps,
     )
+    if object_filters_active:
+        artifact.meta["spec_version"] = "v0.8.2"
+        if args.diagnostic_oracle_np_max is not None:
+            artifact.meta["oracle_filter"] = {
+                "name": "minimum_gf2_press_count",
+                "max_press_count": int(args.diagnostic_oracle_np_max),
+                "diagnostic_only": True,
+            }
+            artifact.meta["qc_eligible"] = False
+        if args.object_event_checkpoint is not None or args.object_motion_checkpoint is not None:
+            artifact.meta["object_judge_rule"] = {
+                "acceptance": "d_theta<=K AND m_psi<=K AND e_phi<=E_max+0.5 for enabled judges",
+                "K_steps": float(args.max_bridge_distance),
+                "event_max": int(event_max) if object_event_predict is not None else None,
+                "event_threshold": float(event_max + 0.5) if object_event_predict is not None else None,
+                "event_checkpoint_sha256": (
+                    event_model_meta.get("params_sha256") if event_model_meta else None
+                ),
+                "motion_checkpoint_sha256": (
+                    motion_model_meta.get("params_sha256") if motion_model_meta else None
+                ),
+                "event_embedding_cache": object_embedding_reports.get("events"),
+                "motion_embedding_cache": object_embedding_reports.get("motion"),
+            }
     graph_hash = save_graph(artifact, args.out / "graph.npz")
-    targets = critic_targets(
-        trans, artifact, TargetConfig(h=5, unit="steps", kind="regret")
-    )
-    save_targets(targets, args.out / "targets")
+    targets = None
+    if args.diagnostic_oracle_np_max is None:
+        targets = critic_targets(
+            trans, artifact, TargetConfig(h=5, unit="steps", kind="regret")
+        )
+        save_targets(targets, args.out / "targets")
     np.savez_compressed(
         args.out / "layered_paths.npz",
         cost_steps=paths.cost_steps, successor=paths.successor,
         bridge_count=paths.bridge_count, b_max=np.asarray(2, dtype=np.int64),
         graph_hash=np.asarray(graph_hash),
     )
-    np.savez_compressed(
-        args.out / "judge_candidates.npz",
-        pairs=optimistic_pairs.astype(np.int32), accept=accepted,
-        cost_steps=judge_cost, distance_steps=judge_distance,
-        board_changed=np.any(
+    candidate_artifact = {
+        "pairs": optimistic_pairs.astype(np.int32), "accept": accepted,
+        "cost_steps": judge_cost, "distance_steps": judge_distance,
+        "board_changed": np.any(
             data.state_bits[optimistic_pairs[:, 0]] != data.state_bits[optimistic_pairs[:, 1]], axis=1
         ) if n_optimistic else np.empty(0, dtype=np.bool_),
-        candidate_sha256=np.asarray(_array_sha256(optimistic_pairs)),
-        dataset_id=np.asarray(dataset_id), judge=np.asarray(args.judge),
-    )
+        "candidate_sha256": np.asarray(_array_sha256(optimistic_pairs)),
+        "dataset_id": np.asarray(dataset_id), "judge": np.asarray(args.judge),
+    }
+    if object_event_predict is not None:
+        candidate_artifact["e_phi"] = event_scores
+    if object_motion_predict is not None:
+        candidate_artifact["m_psi"] = motion_scores
+    if oracle_counts is not None:
+        candidate_artifact["oracle_n_p"] = oracle_counts
+        candidate_artifact["oracle_n_p_max"] = np.asarray(
+            int(args.diagnostic_oracle_np_max), dtype=np.int16
+        )
+    np.savez_compressed(args.out / "judge_candidates.npz", **candidate_artifact)
     if args.judge == "flow":
         retained_indices = accepted_indices[retained_mask]
         retained_lengths = flow_chunk_count[retained_indices].astype(np.int64)
@@ -539,7 +808,7 @@ def main(argv: list[str] | None = None) -> int:
     bridge_counts, bridge_frequencies = np.unique(paths.bridge_count[2], return_counts=True)
     result = {
         **provenance(ROOT),
-        "spec_version": "v0.8",
+        "spec_version": "v0.8.2" if object_filters_active else "v0.8",
         "dataset_id": dataset_id,
         "judge": args.judge,
         "bridge_lambda_steps": float(args.bridge_lambda_steps),
@@ -580,7 +849,9 @@ def main(argv: list[str] | None = None) -> int:
         "bridge_count_distribution": {
             str(int(count)): int(n) for count, n in zip(bridge_counts, bridge_frequencies, strict=True)
         },
-        "h5_regret_valid_fraction": float(np.mean(targets.valid)),
+        "h5_regret_valid_fraction": (
+            float(np.mean(targets.valid)) if targets is not None else None
+        ),
         "quasimetric_distance_summary": (
             {
                 "accepted_p50": float(np.quantile(accepted_distances, 0.5)),
@@ -596,11 +867,31 @@ def main(argv: list[str] | None = None) -> int:
             } if len(accepted_costs) else None
         ),
         "embedding_cache": embedding_report,
+        "object_embedding_caches": object_embedding_reports if object_embedding_reports else None,
         "stage_seconds": stages,
         "elapsed_seconds": time.time() - started,
         "simulator_q1": "not run per v0.8 minimum implementation",
         "path_q3": "not run per v0.8 minimum implementation",
     }
+    if object_filters_active:
+        result["condition_rejection_counts"] = rejection_report["individual_rejections"]
+        result["condition_rejection_combinations"] = rejection_report["categories"]
+        result["object_event_max"] = int(event_max) if object_event_predict is not None else None
+        result["object_event_threshold"] = (
+            float(event_max + 0.5) if object_event_predict is not None else None
+        )
+    if oracle_reference_recall is not None:
+        result["d3_recall_against_oracle_candidates"] = oracle_reference_recall
+        result["oracle_reference_candidates"] = str(args.oracle_reference_candidates)
+    if args.diagnostic_oracle_np_max is not None:
+        result["oracle_filter"] = {
+            "name": "minimum_gf2_press_count",
+            "max_press_count": int(args.diagnostic_oracle_np_max),
+            "diagnostic_only": True,
+            "qc_eligible": False,
+            "n_p_rejected": int(np.count_nonzero(oracle_counts > args.diagnostic_oracle_np_max)),
+            "n_unsolvable_rejected": int(np.count_nonzero(oracle_counts < 0)),
+        }
     (args.out / "result.json").write_text(
         json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8"
     )

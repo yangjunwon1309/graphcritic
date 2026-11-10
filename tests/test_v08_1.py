@@ -144,6 +144,7 @@ def test_board_check_uses_within_episode_event_gaps_and_reports_impossible_bridg
         episode=np.array([10, 10, 10, 20, 20, 20, 10, 20]),
         times=np.array([0, 1, 2, 0, 1, 2, 3, 3]),
         min_button_interval=2.0, toggle=matrix,
+        event_scores=np.asarray([0.8, 1.1, 2.0]),
     )
     assert report["bridge_count"] == 3
     assert report["n_p_distribution"]["0"]["count"] == 1
@@ -153,6 +154,11 @@ def test_board_check_uses_within_episode_event_gaps_and_reports_impossible_bridg
     assert report["impossible_by_n_p"]["1"]["count"] == 1
     assert report["impossible_by_n_p"]["∞"]["count"] == 1
     assert report["worst_20_impossible"][0]["n_p"] == "infinity"
+    assert report["e_phi_le_1_5_vs_n_p_le_1"] == {
+        "true_positive": 2, "false_positive": 0,
+        "false_negative": 0, "true_negative": 1,
+    }
+    assert report["e_phi_by_n_p"]["∞"]["p50"] == pytest.approx(2.0)
 
 
 def test_graph_representatives_map_to_current_next_and_terminal_state_occurrences():

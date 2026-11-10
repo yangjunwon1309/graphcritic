@@ -9,6 +9,87 @@ import numpy as np
 from graphcritic.bridges.judge import JudgeResult
 
 
+def intersect_quasimetric_judges(
+    d_theta: np.ndarray,
+    *,
+    max_distance_steps: float = 20.0,
+    m_psi: np.ndarray | None = None,
+    e_phi: np.ndarray | None = None,
+    max_events: int | None = None,
+    oracle_press_count: np.ndarray | None = None,
+    oracle_max_press_count: int | None = None,
+) -> dict[str, np.ndarray | dict[str, int]]:
+    """Apply the v0.8.2 AND rule and explain rejected candidate combinations.
+
+    ``d_theta`` remains the sole bridge cost/distance. Optional object scores
+    are lower-bound acceptance checks only. The oracle replaces the event
+    judge when requested and is intended for diagnostic graphs only.
+    """
+    theta = np.asarray(d_theta, dtype=np.float32)
+    if theta.ndim != 1 or np.any(~np.isfinite(theta)) or np.any(theta < -1e-6):
+        raise ValueError("d_theta must be a finite non-negative vector")
+    if not np.isfinite(max_distance_steps) or max_distance_steps <= 0:
+        raise ValueError("max_distance_steps must be positive and finite")
+    n = len(theta)
+    fail_theta = np.maximum(theta, 0.0) > float(max_distance_steps)
+
+    def _optional_scores(name: str, values: np.ndarray | None) -> np.ndarray:
+        if values is None:
+            return np.zeros(n, dtype=np.bool_)
+        score = np.asarray(values, dtype=np.float32)
+        if score.shape != (n,) or np.any(~np.isfinite(score)) or np.any(score < -1e-6):
+            raise ValueError(f"{name} must be a finite non-negative vector aligned with d_theta")
+        return score
+
+    fail_motion = np.zeros(n, dtype=np.bool_)
+    if m_psi is not None:
+        motion = _optional_scores("m_psi", m_psi)
+        fail_motion = motion > float(max_distance_steps)
+
+    fail_event = np.zeros(n, dtype=np.bool_)
+    if oracle_press_count is not None:
+        counts = np.asarray(oracle_press_count, dtype=np.int64)
+        if counts.shape != (n,) or oracle_max_press_count is None or oracle_max_press_count < 0:
+            raise ValueError("oracle press counts and a non-negative maximum must align")
+        fail_event = (counts < 0) | (counts > int(oracle_max_press_count))
+    elif e_phi is not None:
+        if max_events is None or max_events < 0:
+            raise ValueError("max_events must be non-negative when e_phi is enabled")
+        events = _optional_scores("e_phi", e_phi)
+        fail_event = events > (float(max_events) + 0.5)
+    elif max_events is not None:
+        raise ValueError("max_events requires e_phi")
+    if oracle_press_count is not None and e_phi is not None:
+        raise ValueError("oracle event filtering replaces e_phi; they cannot both be active")
+
+    fails = np.stack((fail_theta, fail_motion, fail_event), axis=1)
+    combination_names = {
+        "d_theta_only": (1, 0, 0),
+        "m_psi_only": (0, 1, 0),
+        "e_phi_or_oracle_only": (0, 0, 1),
+        "d_theta_and_m_psi": (1, 1, 0),
+        "d_theta_and_e_phi_or_oracle": (1, 0, 1),
+        "m_psi_and_e_phi_or_oracle": (0, 1, 1),
+        "all_three": (1, 1, 1),
+    }
+    categories = {
+        name: int(np.count_nonzero(np.all(fails == np.asarray(pattern, dtype=np.bool_), axis=1)))
+        for name, pattern in combination_names.items()
+    }
+    return {
+        "accept": ~np.any(fails, axis=1),
+        "fail_d_theta": fail_theta,
+        "fail_m_psi": fail_motion,
+        "fail_e_phi_or_oracle": fail_event,
+        "categories": categories,
+        "individual_rejections": {
+            "d_theta": int(np.count_nonzero(fail_theta)),
+            "m_psi": int(np.count_nonzero(fail_motion)),
+            "e_phi_or_oracle": int(np.count_nonzero(fail_event)),
+        },
+    }
+
+
 class QuasimetricJudge:
     """Accept a candidate iff its learned directed time distance is <= K."""
 

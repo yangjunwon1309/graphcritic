@@ -20,6 +20,7 @@ import numpy as np
 
 from graphcritic.io import load_graph, load_sim_state, load_transitions
 from graphcritic.modes import state_episode_time
+from graphcritic.bridges.object_state import frame_object_features_from_checkpoint
 from graphcritic.puzzle import minimum_press_solution, toggle_matrix
 from graphcritic.types import GraphArtifact, SchemaError, TransitionSet
 
@@ -132,6 +133,7 @@ def analyze_bridge_arrays(
     times: np.ndarray,
     min_button_interval: float,
     toggle: np.ndarray,
+    event_scores: np.ndarray | None = None,
 ) -> dict:
     """Summarize GF(2) button effort and distance lower-bound violations."""
     src = np.asarray(bridge_src, dtype=np.int64)
@@ -150,6 +152,10 @@ def analyze_bridge_arrays(
         raise ValueError("button-board width must match the square toggle matrix")
     if np.any(src < 0) or np.any(dst < 0) or np.any(src >= len(node_states)) or np.any(dst >= len(node_states)):
         raise SchemaError("bridge endpoint lies outside the graph node table")
+    if event_scores is not None:
+        event_scores = np.asarray(event_scores, dtype=np.float32)
+        if event_scores.shape != src.shape or np.any(~np.isfinite(event_scores)) or np.any(event_scores < -1e-6):
+            raise SchemaError("event scores must be finite non-negative values aligned with bridges")
     source_state = node_states[src]
     destination_state = node_states[dst]
     if (np.any(source_state < 0) or np.any(destination_state < 0)
@@ -215,7 +221,7 @@ def analyze_bridge_arrays(
         })
 
     impossible_count = int(np.count_nonzero(impossible))
-    return {
+    result = {
         "bridge_count": int(count_total),
         "n_p_distribution": distribution,
         "d_theta_by_n_p": distance_by_group,
@@ -226,6 +232,23 @@ def analyze_bridge_arrays(
         "impossible_by_n_p": impossible_by_group,
         "worst_20_impossible": worst,
     }
+    if event_scores is not None:
+        predicted_one_event = event_scores <= 1.5
+        actual_at_most_one = (press_counts >= 0) & (press_counts <= 1)
+        result["e_phi_by_n_p"] = {
+            label: {
+                "count": int(np.count_nonzero(mask)),
+                **(_quantiles(event_scores[mask]) or {"p10": None, "p50": None, "p90": None}),
+            }
+            for label, mask in groups.items()
+        }
+        result["e_phi_le_1_5_vs_n_p_le_1"] = {
+            "true_positive": int(np.count_nonzero(predicted_one_event & actual_at_most_one)),
+            "false_positive": int(np.count_nonzero(predicted_one_event & ~actual_at_most_one)),
+            "false_negative": int(np.count_nonzero(~predicted_one_event & actual_at_most_one)),
+            "true_negative": int(np.count_nonzero(~predicted_one_event & ~actual_at_most_one)),
+        }
+    return result
 
 
 def _parse(argv: list[str] | None = None) -> argparse.Namespace:
@@ -234,12 +257,14 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--transitions", type=Path, required=True)
     parser.add_argument("--sim-state", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True, help="output JSON report")
+    parser.add_argument("--object-event-checkpoint", type=Path,
+                        help="optional v0.8.2 e_phi checkpoint for retained-edge comparison")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
-    trans, _ = load_transitions(args.transitions)
+    trans, trans_meta = load_transitions(args.transitions)
     sim_state = load_sim_state(args.sim_state)
     sim_state.validate(trans.n_rows + int(np.count_nonzero(trans.terminal)))
     if sim_state.button_states is None:
@@ -261,31 +286,96 @@ def main(argv: list[str] | None = None) -> int:
         "p5_frames": float(np.quantile(intervals, 0.05)),
     }
 
-    graph_reports = []
+    loaded_graphs = []
     for graph_path in args.graph:
         graph = load_graph(graph_path, trans=trans)
         if graph.meta.get("bridge_judge") != "quasimetric":
             raise SchemaError(f"{graph_path} is not a quasimetric-judged puzzle graph")
         node_states = _node_state_indices(graph, trans)
         bridge_ids = np.flatnonzero(graph.edges.kind == 1)
+        loaded_graphs.append((graph_path, graph, node_states, bridge_ids))
+
+    event_predict = None
+    event_meta = None
+    event_cache_report = None
+    if args.object_event_checkpoint is not None:
+        from experiments.v08_runtime import (
+            load_quasimetric_checkpoint,
+            make_embedding_cache_predictor,
+        )
+
+        checkpoint = args.object_event_checkpoint
+        event_meta = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
+        if event_meta.get("model_kind") != "object-quasimetric-v0.8.2" or event_meta.get("object_cost") != "events":
+            raise ValueError("--object-event-checkpoint must name a v0.8.2 event-count model")
+        if event_meta.get("dataset_id") is None:
+            raise ValueError("event checkpoint lacks a dataset ID")
+        if int(event_meta.get("window", -1)) != 5:
+            raise ValueError("event checkpoint must use a five-frame window")
+        expected_dataset_ids = {graph.meta.get("dataset_id") for _, graph, _, _ in loaded_graphs}
+        if expected_dataset_ids != {event_meta["dataset_id"]} or event_meta["dataset_id"] != trans_meta["dataset_id"]:
+            raise ValueError("event checkpoint dataset ID does not match the graph inputs")
+        node_ids = np.unique(np.concatenate([
+            np.concatenate((graph.edges.src[bridge_ids], graph.edges.dst[bridge_ids]))
+            for _, graph, _, bridge_ids in loaded_graphs if len(bridge_ids)
+        ])) if any(len(item[3]) for item in loaded_graphs) else np.empty(0, dtype=np.int64)
+        if len(node_ids):
+            features = frame_object_features_from_checkpoint(
+                trans, sim_state,
+                continuous_mean=np.asarray(event_meta["continuous_mean"], dtype=np.float32),
+                continuous_std=np.asarray(event_meta["continuous_std"], dtype=np.float32),
+                window=5,
+            )
+            if any(len(node_states) != len(features) for _, _, node_states, _ in loaded_graphs):
+                raise SchemaError("event model node table does not align with the puzzle state table")
+            reference_node_states = loaded_graphs[0][2]
+            if any(not np.array_equal(node_states, reference_node_states)
+                   for _, _, node_states, _ in loaded_graphs[1:]):
+                raise SchemaError("graphs have different node-to-state mappings")
+            model, params, event_meta = load_quasimetric_checkpoint(
+                checkpoint, input_dim=features.shape[1],
+                expected_dataset_id=event_meta["dataset_id"],
+            )
+            cache_path = args.out.parent / (
+                f"{args.out.stem}-event-embeddings-{event_meta['params_sha256'][:16]}.npy"
+            )
+            event_predict, event_cache_report = make_embedding_cache_predictor(
+                model, params, features[reference_node_states[node_ids]], node_ids,
+                params_sha256=str(event_meta["params_sha256"]),
+                dataset_id=str(event_meta["dataset_id"]), cache_path=cache_path,
+            )
+
+    graph_reports = []
+    for graph_path, graph, node_states, bridge_ids in loaded_graphs:
+        bridge_src = graph.edges.src[bridge_ids]
+        bridge_dst = graph.edges.dst[bridge_ids]
+        event_scores = (
+            event_predict(np.column_stack((bridge_src, bridge_dst)))
+            if event_predict is not None and len(bridge_ids) else
+            (np.empty(0, dtype=np.float32) if event_predict is not None else None)
+        )
         report = analyze_bridge_arrays(
-            graph.edges.src[bridge_ids], graph.edges.dst[bridge_ids],
+            bridge_src, bridge_dst,
             graph.edges.dist[bridge_ids], node_state_indices=node_states,
             button_states=boards, episode=episode, times=times,
             min_button_interval=min_button_interval, toggle=toggle,
+            event_scores=event_scores,
         )
         graph_reports.append({
             "graph": str(graph_path),
             "graph_hash": graph.content_hash,
             "bridge_lambda_steps": graph.meta.get("bridge_lambda_steps", 0.0),
+            "object_event_checkpoint_sha256": event_meta.get("params_sha256") if event_meta else None,
             "button_interval_frames": interval_report,
             **report,
         })
 
     result = {
-        "diagnostic": "temporary_puzzle_board_lower_bound_v0.8.1",
+        "diagnostic": "temporary_puzzle_board_lower_bound_v0.8.2",
         "transitions": str(args.transitions),
         "sim_state": str(args.sim_state),
+        "object_event_checkpoint": str(args.object_event_checkpoint) if args.object_event_checkpoint else None,
+        "object_event_embedding_cache": event_cache_report,
         "limitations": [
             "This is an offline lower-bound check, not a simulator reachability test.",
             "n_p <= 1 bridges generally cannot be ruled out by this timing bound.",

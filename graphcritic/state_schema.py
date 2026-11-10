@@ -394,10 +394,30 @@ class OGBenchPuzzleStateSchema:
         return np.asarray(np.concatenate((qpos[:, :14], self.action_coordinates(x, aux)), axis=1), dtype=np.float32)
 
     def objects(self, obs: NDArray, aux: Mapping[str, NDArray] | None = None) -> NDArray:
-        _, _, buttons = self._inputs(obs, aux)
-        bits = np.left_shift(np.ones(buttons.shape[1], dtype=np.int64), np.arange(buttons.shape[1], dtype=np.int64))
-        code = buttons @ bits
-        return code.astype(np.float32)[:, None]
+        """Return button one-hot states, press depth, and button velocity.
+
+        For ``B`` buttons this is a ``4B`` vector: two one-hot values per
+        button followed by its physical joint position and velocity. The
+        quasimetric trainer fits normalization for the continuous half from
+        training episodes only. Missing qvel is accepted for legacy schema
+        readouts and represented as zero; model-data preparation requires the
+        aligned qvel sidecar explicitly.
+        """
+        x, qpos, buttons = self._inputs(obs, aux)
+        del x
+        n_buttons = buttons.shape[1]
+        one_hot = np.stack((1 - buttons, buttons), axis=-1).reshape(len(buttons), 2 * n_buttons)
+        depth = qpos[:, 14 : 14 + n_buttons]
+        qvel = _aux_matrix(aux, "qvel", len(buttons))
+        if qvel is None:
+            velocity = np.zeros_like(depth)
+        else:
+            if qvel.shape[1] < 14 + n_buttons:
+                raise SchemaError(
+                    "puzzle qvel must contain 14 robot coordinates and one velocity per button"
+                )
+            velocity = qvel[:, 14 : 14 + n_buttons]
+        return np.asarray(np.concatenate((one_hot, depth, velocity), axis=1), dtype=np.float32)
 
     def relative(self, obs: NDArray, aux: Mapping[str, NDArray] | None = None) -> NDArray:
         x, qpos, buttons = self._inputs(obs, aux)
@@ -420,7 +440,12 @@ class OGBenchPuzzleStateSchema:
 
     def passive(self, obs: NDArray, aux: Mapping[str, NDArray] | None, mode: NDArray) -> NDArray:
         del mode
-        return self.objects(obs, aux)
+        _, _, buttons = self._inputs(obs, aux)
+        bits = np.left_shift(
+            np.ones(buttons.shape[1], dtype=np.int64),
+            np.arange(buttons.shape[1], dtype=np.int64),
+        )
+        return (buttons @ bits).astype(np.float32)[:, None]
 
     def kinematic_steps(self, r_u: NDArray, r_v: NDArray) -> NDArray:
         u, v = np.broadcast_arrays(np.asarray(r_u, dtype=np.float64), np.asarray(r_v, dtype=np.float64))

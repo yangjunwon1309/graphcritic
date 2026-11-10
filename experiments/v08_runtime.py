@@ -261,9 +261,10 @@ def qrl_loss_components(
     distance_maximization_loss = jnp.mean(
         jax.nn.softplus((500.0 - distance_goal) * 0.01) / 0.01
     )
-    violation = jnp.mean(
-        jnp.square(jax.nn.relu(distance_step - float(constraint_horizon)))
-    )
+    # ``constraint_horizon`` may be a scalar horizon (the original v0.8
+    # trainer) or one per sampled chunk (the v0.8.2 object event/motion cost).
+    threshold = jnp.asarray(constraint_horizon, dtype=distance_step.dtype)
+    violation = jnp.mean(jnp.square(jax.nn.relu(distance_step - threshold)))
     constraint_gap = violation - epsilon**2
     total = distance_maximization_loss + lambda_value * constraint_gap
     return total, distance_maximization_loss, violation, constraint_gap
@@ -277,7 +278,8 @@ def projected_dual_sgd(raw_lambda, constraint_gap, learning_rate, jnp):
 def make_train_step(model, *, batch_size: int = 4096, epsilon: float = 0.25,
                     learning_rate: float = 5e-4, lambda_learning_rate: float = 1e-2,
                     grad_clip: float = 1.0, dual: str = "adam",
-                    constraint_horizon: float = 1.0):
+                    constraint_horizon: float = 1.0,
+                    independent_goal_is_next_state: bool = True):
     """Create the compiled primal/dual QRL update for one training batch."""
     jax, jnp, _, _, optax = _jax_modules()
     if batch_size < 1:
@@ -295,7 +297,7 @@ def make_train_step(model, *, batch_size: int = 4096, epsilon: float = 0.25,
     @jax.jit
     def update(params, primal_state, raw_lambda, dual_state, key,
                states, next_state_index, train_rows, constraint_rows=None,
-               constraint_next_index=None):
+               constraint_next_index=None, constraint_cost_values=None):
         key, state_key, goal_key, constraint_key = jax.random.split(key, 4)
         sample_positions = jax.random.randint(
             state_key, (batch_size,), 0, train_rows.shape[0]
@@ -316,7 +318,14 @@ def make_train_step(model, *, batch_size: int = 4096, epsilon: float = 0.25,
             next_state_index if constraint_next_index is None else constraint_next_index
         )
         constraint_next = states[constraint_mapping[constraint_source_rows]]
-        independent_goal = states[next_state_index[goal_rows]]
+        independent_goal = (
+            states[next_state_index[goal_rows]]
+            if independent_goal_is_next_state else states[goal_rows]
+        )
+        constraint_threshold = (
+            constraint_horizon if constraint_cost_values is None
+            else constraint_cost_values[constraint_source_rows]
+        )
         left = jnp.concatenate((current, constraint_current), axis=0)
         right = jnp.concatenate((independent_goal, constraint_next), axis=0)
         dual_value = jax.lax.stop_gradient(
@@ -329,7 +338,7 @@ def make_train_step(model, *, batch_size: int = 4096, epsilon: float = 0.25,
             distance_step = distances[batch_size:]
             total, distance_loss, violation, constraint_gap = qrl_loss_components(
                 distance_goal, distance_step, dual_value, epsilon=epsilon,
-                constraint_horizon=constraint_horizon,
+                constraint_horizon=constraint_threshold,
             )
             return total, (
                 distance_goal, distance_step, distance_loss, violation, constraint_gap
@@ -364,7 +373,7 @@ def make_train_step(model, *, batch_size: int = 4096, epsilon: float = 0.25,
             # runs this is the h-frame chunk constraint reported below.
             "one_step_violation_squared": violation,
             "constraint_violation_squared": violation,
-            "constraint_horizon_steps": jnp.asarray(float(constraint_horizon)),
+            "constraint_horizon_steps": jnp.mean(jnp.asarray(constraint_threshold)),
             "constraint_gap": constraint_gap,
             "lambda": jax.nn.softplus(raw_lambda) if dual == "adam" else raw_lambda,
             "distance_goal_mean": jnp.mean(distance_goal),

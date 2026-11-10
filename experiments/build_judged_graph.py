@@ -193,6 +193,10 @@ def _parse(argv: list[str] | None = None):
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--candidate-cache", type=Path, required=True)
     parser.add_argument(
+        "--target-kind", choices=("regret", "cost"), default="regret",
+        help="critic target representation written for the built graph",
+    )
+    parser.add_argument(
         "--candidate-window", type=int, default=None,
         help="window size used to generate shared candidate pairs (defaults from the quasi checkpoint or cache)",
     )
@@ -225,7 +229,7 @@ def _parse(argv: list[str] | None = None):
                         help="Puzzle-only exact GF(2) press-count filter; diagnostic graph, never a QC target")
     parser.add_argument(
         "--write-oracle-targets", action="store_true",
-        help="explicitly write regret targets for a diagnostic oracle upper-bound experiment",
+        help="explicitly write targets for a diagnostic oracle upper-bound experiment",
     )
     parser.add_argument("--oracle-reference-candidates", type=Path,
                         help="D1 judge_candidates.npz used to measure D3 recall on the n_p<=limit, d_theta<=K subset")
@@ -350,6 +354,7 @@ def _write_graph_targets(
     *,
     diagnostic_oracle_np_max: int | None,
     write_oracle_targets: bool,
+    target_kind: str = "regret",
 ):
     """Write regular targets or explicitly authorized oracle targets."""
     if diagnostic_oracle_np_max is not None and not write_oracle_targets:
@@ -363,7 +368,7 @@ def _write_graph_targets(
         else {"kind": "learned"}
     )
     targets = critic_targets(
-        trans, artifact, TargetConfig(h=5, unit="steps", kind="regret")
+        trans, artifact, TargetConfig(h=5, unit="steps", kind=target_kind)
     )
     if len(targets.y) != trans.n_rows:
         raise ValueError("graph targets must have one row per transition")
@@ -373,8 +378,18 @@ def _write_graph_targets(
     return targets
 
 
-def _target_summary(targets) -> dict[str, float | None]:
+def _target_summary(
+    targets, target_kind: str = "regret"
+) -> dict[str, float | None]:
     if targets is None:
+        if target_kind == "cost":
+            return {
+                "h5_cost_mean": None,
+                "h5_cost_p50": None,
+                "h5_cost_p90": None,
+                "h5_cost_max": None,
+                "h5_cost_capped_loss_mask_fraction": None,
+            }
         return {
             "h5_regret_p90": None,
             "h5_zero_regret_fraction": None,
@@ -382,6 +397,20 @@ def _target_summary(targets) -> dict[str, float | None]:
         }
     included = targets.valid & targets.loss_mask
     values = np.asarray(targets.y[included], dtype=np.float64)
+    if targets.kind == "cost":
+        loss_mask_count = int(np.count_nonzero(targets.loss_mask))
+        capped_count = int(np.count_nonzero(
+            targets.loss_mask & (np.asarray(targets.source) == 2)
+        ))
+        return {
+            "h5_cost_mean": float(np.mean(values)) if values.size else None,
+            "h5_cost_p50": float(np.quantile(values, 0.5)) if values.size else None,
+            "h5_cost_p90": float(np.quantile(values, 0.9)) if values.size else None,
+            "h5_cost_max": float(np.max(values)) if values.size else None,
+            "h5_cost_capped_loss_mask_fraction": (
+                float(capped_count / loss_mask_count) if loss_mask_count else None
+            ),
+        }
     return {
         "h5_regret_p90": float(np.quantile(values, 0.9)) if values.size else None,
         "h5_zero_regret_fraction": (
@@ -819,6 +848,7 @@ def main(argv: list[str] | None = None) -> int:
         args.out,
         diagnostic_oracle_np_max=args.diagnostic_oracle_np_max,
         write_oracle_targets=args.write_oracle_targets,
+        target_kind=args.target_kind,
     )
     np.savez_compressed(
         args.out / "layered_paths.npz",
@@ -947,10 +977,14 @@ def main(argv: list[str] | None = None) -> int:
         "bridge_count_distribution": bridge_distribution,
         "bridge_count_fraction": bridge_distribution_fraction,
         "bridge_count_fraction_reachable": bridge_distribution_reachable_fraction,
-        "h5_regret_valid_fraction": (
+        "target_kind": args.target_kind,
+        f"h5_{args.target_kind}_valid_fraction": (
             float(np.mean(targets.valid)) if targets is not None else None
         ),
-        **_target_summary(targets),
+        f"h5_{args.target_kind}_loss_mask_fraction": (
+            float(np.mean(targets.loss_mask)) if targets is not None else None
+        ),
+        **_target_summary(targets, target_kind=args.target_kind),
         "quasimetric_distance_summary": (
             {
                 "accepted_p50": float(np.quantile(accepted_distances, 0.5)),

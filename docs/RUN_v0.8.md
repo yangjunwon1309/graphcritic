@@ -1,6 +1,6 @@
 # Graph Critic v0.8 window-5 runbook
 
-**Implementation code commit:** `808576c7e4670c08ad4e7401a6d99198c16dfd40`
+**Implementation code commit:** `fffbb6e20de8e4742a919febeb63e41321fa35b0`
 
 This runbook contains the v0.8 **five-frame window** experiment and its downstream checks only. The quasimetric training and graph judging use window length 5; the constraint horizon is 5 and ε is 1.25. There are no state-input quasimetric runs or comparisons in this procedure.
 
@@ -131,7 +131,7 @@ Before interpreting agreement, confirm both `optimistic_candidate_sha256` values
 
 ## 7. v0.8.1: bridge Λ and temporary board check
 
-The per-bridge penalty is applied to accepted bridge costs before layered reverse Dijkstra. It does not affect the quasimetric acceptance rule (`dθ ≤ 20`), optimistic candidate filtering, or the stored bridge distance `dist`, which remains `dθ`. Λ is recorded as `bridge_lambda_steps` in graph metadata. The zero setting preserves the v0.8 graph hash; the focused unit test checks the invariant and checks that a positive Λ changes edge cost while retaining raw distance.
+The per-bridge penalty is applied to accepted bridge costs before layered reverse Dijkstra. It does not affect the quasimetric acceptance rule (`dθ ≤ 20`), optimistic candidate filtering, or the stored bridge distance `dist`, which remains `dθ`. Λ is recorded as `bridge_lambda_steps` in graph metadata. The legacy integer `kappa` stores `ceil(dθ + Λ)`, so the graph's `tau_max_steps` validation cap is `ceil(20 + Λ)` while the judge's distance threshold stays 20. The zero setting preserves the v0.8 graph hash; unit tests check this and the positive-Λ cost/cap behavior.
 
 Run the focused implementation checks:
 
@@ -139,7 +139,7 @@ Run the focused implementation checks:
 $PY -m pytest tests/test_v08_1.py tests/test_puzzle.py tests/test_quasimetric_v08.py -q
 ```
 
-Implementation verification: focused tests **32 passed**; the full repository suite **163 passed** with three existing upstream/runtime warnings. The benchmark graph builds and board audit below were not run by Codex.
+Implementation verification after the Λ cap fix: v0.8.1 regression tests **10 passed**; the full repository suite **164 passed** with three existing upstream/runtime warnings. The benchmark graph builds and board audit below were not run by Codex.
 
 Then build both requested graphs. Each run should take about 1–2 minutes. The 4,096-pair embedding batch limits GPU memory use; reduce it to 1,024 if needed.
 

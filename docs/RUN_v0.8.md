@@ -235,7 +235,7 @@ $PY experiments/build_judged_graph.py $BUILD \
   --out $D/v08/obj_learned
 ```
 
-When supplied, the builder verifies that D1 and D3 use byte-identical optimistic candidate pairs and reports D3 recall on D1's exact `n_p≤1, dθ≤20` subset in `result.json`.
+When supplied, the builder verifies that D1 and D3 use the same optimistic candidate pairs in the same order and that their candidate hash matches. It reports D3 recall on D1's exact `n_p≤1, dθ≤20` subset in `result.json`.
 
 D4 adds `eφ` diagnostics to the existing offline board audit. It recomputes event scores for retained bridges and reports their distribution by exact `n_p`, plus the `eφ≤1.5` versus `n_p≤1` table. It does not step a simulator.
 

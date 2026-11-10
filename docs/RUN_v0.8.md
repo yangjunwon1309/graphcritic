@@ -1,6 +1,6 @@
 # Graph Critic v0.8 window-5 runbook
 
-**Implementation code commit:** `72c6dca8b40e62fff60c1505f475c5e57b1e3e0d`
+**Implementation code commit:** `5bc998769766e8d244b1256f4b0ede6ce294a1ee`
 
 This runbook contains the v0.8 **five-frame window** experiment and its downstream checks only. The quasimetric training and graph judging use window length 5; the constraint horizon is 5 and ε is 1.25. There are no state-input quasimetric runs or comparisons in this procedure.
 

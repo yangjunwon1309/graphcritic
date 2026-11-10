@@ -208,6 +208,41 @@ def _two_episode_transition_set():
     )
 
 
+def _synthetic_3x3_puzzle():
+    from graphcritic.puzzle import toggle_matrix
+    from graphcritic.types import SimStateSet, TransitionSet
+
+    n_rows, n_buttons = 12, 9
+    episode = np.repeat(np.asarray([10, 20], dtype=np.int64), 6)
+    times = np.tile(np.arange(6, dtype=np.int64), 2)
+    terminal = times == 5
+    feat = np.zeros((n_rows, 19 + 4 * n_buttons), dtype=np.float32)
+    feat[:, 12] = np.arange(n_rows, dtype=np.float32) * 0.01
+    next_feat = feat.copy()
+    next_feat[:-1] = feat[1:]
+    next_feat[5] = feat[5]
+    next_feat[11] = feat[11]
+    trans = TransitionSet(
+        feat=feat, next_feat=next_feat, episode_id=episode, t=times,
+        success=np.zeros(n_rows, dtype=np.bool_), terminal=terminal,
+        row_idx=np.arange(n_rows, dtype=np.int64),
+        action=np.zeros((n_rows, 5), dtype=np.float32),
+    )
+
+    toggle = toggle_matrix(3, 3)
+    one_press = toggle[:, 4]
+    two_presses = toggle[:, 0] ^ toggle[:, 8]
+    boards = np.zeros((n_rows + 2, n_buttons), dtype=np.uint8)
+    boards[2:4] = one_press
+    boards[8:10] = two_presses
+    boards[12] = boards[5]
+    boards[13] = boards[11]
+    qpos = np.zeros((n_rows + 2, 14 + n_buttons), dtype=np.float32)
+    qvel = np.zeros_like(qpos)
+    sim_state = SimStateSet(qpos=qpos, qvel=qvel, button_states=boards)
+    return trans, sim_state, toggle
+
+
 def test_window_features_pad_episode_starts_and_keep_terminal_timeline_separate():
     from graphcritic.bridges.windows import puzzle_state_windows
 
@@ -236,6 +271,82 @@ def test_window_candidate_nodes_use_boundary_sources_and_keep_goals_as_destinati
     assert node_ids.tolist() == [4, 8, 10, 12]
     assert episodes.tolist() == [10, 20, 20, 10]
     assert source_mask.tolist() == [True, False, True, False]
+
+
+def test_3x3_puzzle_model_windows_and_boundary_nodes_use_nine_button_layout():
+    from graphcritic.bridges.models import prepare_puzzle_model_data
+    from graphcritic.bridges.windows import (
+        puzzle_state_windows,
+        puzzle_window_candidate_nodes,
+    )
+
+    trans, sim_state, _ = _synthetic_3x3_puzzle()
+    data = prepare_puzzle_model_data(trans, sim_state, seed=0)
+    assert data.state_raw.shape == (14, 28)
+    assert data.state_cont.shape == (14, 19)
+    assert data.state_bits.shape == (14, 9)
+    assert data.metadata["button_width"] == 9
+
+    frames = np.concatenate((data.state_cont, data.state_bits), axis=1)
+    windows = puzzle_state_windows(
+        frames, trans, data.terminal_state_index, window=5
+    )
+    assert windows.shape == (14, 140)
+
+    goals = np.zeros(14, dtype=np.bool_)
+    goals[[1, 12]] = True
+    node_ids, _, source_mask = puzzle_window_candidate_nodes(
+        trans, goals, window=5
+    )
+    selected = dict(zip(node_ids.tolist(), source_mask.tolist(), strict=True))
+    assert selected == {1: False, 4: True, 10: True, 12: False}
+
+
+def test_3x3_object_features_press_counts_and_board_check_are_supported():
+    from experiments.tmp_board_check import (
+        _board_change_intervals,
+        analyze_bridge_arrays,
+    )
+    from experiments.train_object_quasimetric import _exact_press_counts
+    from graphcritic.bridges.object_state import (
+        normalize_object_state,
+        puzzle_object_state_raw,
+    )
+    from graphcritic.bridges.models import prepare_puzzle_model_data
+    from graphcritic.bridges.windows import puzzle_state_windows
+    from graphcritic.modes import state_episode_time
+
+    trans, sim_state, toggle = _synthetic_3x3_puzzle()
+    raw = puzzle_object_state_raw(trans, sim_state)
+    assert raw.shape == (14, 36)
+    normalized = normalize_object_state(
+        raw, np.zeros(18, dtype=np.float32), np.ones(18, dtype=np.float32)
+    )
+    np.testing.assert_array_equal(normalized[:, :18], raw[:, :18])
+    model_data = prepare_puzzle_model_data(trans, sim_state, seed=0)
+    object_windows = puzzle_state_windows(
+        normalized, trans, model_data.terminal_state_index, window=5
+    )
+    assert object_windows.shape == (14, 180)
+
+    press_counts = _exact_press_counts(
+        np.asarray([[0, 2], [6, 9]], dtype=np.int64), sim_state.button_states
+    )
+    np.testing.assert_array_equal(press_counts, [1, 2])
+
+    episode, times = state_episode_time(trans)
+    intervals = _board_change_intervals(trans, sim_state.button_states)
+    assert intervals.size > 0
+    result = analyze_bridge_arrays(
+        np.asarray([0]), np.asarray([1]), np.asarray([2.0]),
+        node_state_indices=np.asarray([6, 9]),
+        button_states=sim_state.button_states,
+        episode=episode, times=times,
+        min_button_interval=float(np.quantile(intervals, 0.01)),
+        toggle=toggle,
+    )
+    assert result["n_p_distribution"]["2"]["count"] == 1
+    assert result["impossible_bridge_count"] == 1
 
 
 @pytest.mark.skipif(not _has_jax(), reason="embedding decomposition requires JAX/Flax")

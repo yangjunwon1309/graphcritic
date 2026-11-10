@@ -58,7 +58,7 @@ def prepare_puzzle_model_data(
 
     ``r`` is the 19D physical robot readout from ``OGBenchPuzzleStateSchema``
     (14 joint/gripper qpos values plus the five action-coordinate values).
-    The 16 button values remain exact binary inputs and targets. Statistics,
+    The puzzle button values remain exact binary inputs and targets. Statistics,
     one-step tolerances, and delta scales are fit on training episodes only.
     """
     trans.validate()
@@ -79,8 +79,8 @@ def prepare_puzzle_model_data(
            "button_states": sim_state.button_states}
     robot = schema.robot(states, aux).astype(np.float32)
     buttons = np.asarray(sim_state.button_states, dtype=np.float32)
-    if buttons.shape[1] != 16:
-        raise SchemaError("the v0.7 benchmark requires the 4x4 puzzle's 16 button bits")
+    if buttons.shape[1] not in {9, 16, 20}:
+        raise SchemaError("puzzle models require a supported 3x3, 4x4, or 4x5 button layout")
     state_raw = np.concatenate((robot, buttons), axis=1)
     n = trans.n_rows
     if state_raw.shape[0] != n + int(np.count_nonzero(trans.terminal)):
@@ -145,7 +145,7 @@ def prepare_puzzle_model_data(
     metadata = {
         "schema": "v0.7-puzzle-r-plus-bits",
         "continuous_fields": ["robot_qpos_0_13", "eef_xyz_yaw_gripper"],
-        "button_width": 16,
+        "button_width": int(buttons.shape[1]),
         "continuous_dim": int(robot.shape[1]),
         "state_dim": int(state_raw.shape[1]),
         "train_fraction": float(train_fraction),

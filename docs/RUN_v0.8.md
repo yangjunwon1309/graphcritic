@@ -1,6 +1,9 @@
 # Graph Critic v0.8 window-5 runbook
 
-**Implementation code commit:** `5bc998769766e8d244b1256f4b0ede6ce294a1ee`
+**Base v0.8 implementation code commit:** `5bc998769766e8d244b1256f4b0ede6ce294a1ee`
+
+The standard 3×3 task3 port and its run steps are documented in §10. Record the
+clean commit containing those compatibility changes when starting that run.
 
 This runbook contains the v0.8 **five-frame window** experiment and its downstream checks only. The quasimetric training and graph judging use window length 5; the constraint horizon is 5 and ε is 1.25. There are no state-input quasimetric runs or comparisons in this procedure.
 
@@ -325,3 +328,231 @@ MUJOCO_GL=egl WANDB_MODE=offline PYTHONPATH="$RUN_ROOT:$RUN_ROOT/third_party/qc"
 Before R3 starts, QC prints the resolved provenance and rejects an oracle target if `run_group` omits `oracle`. `flags.json` and W&B config retain provenance; `offline_agent.csv` and `eval.csv` include `graph_target_provenance`. Compare the six success rates and final batch regret Spearman with v0.6 G-R ρ=0.9 (14% final success, 0.676 final Spearman). A single-seed difference below 10 percentage points is descriptive only. Record the main and QC commit hashes, `git_dirty: false`, target hash, and provenance. Do not run R3b/R3c without approval.
 
 Measured v0.8.3 results are in [results_v0.8.3.md](results_v0.8.3.md).
+
+## 10. v0.8.4: standard Puzzle 3×3 task 3
+
+This section ports the v0.8 window-5 pipeline to the standard one-million-row
+`puzzle-3x3-play-singletask-task3-v0` dataset. The learned distance `L`, exact
+GF(2) upper bound `O`, and conditionally gated learned-object method `D` follow
+the attached v0.8.4 specification. No simulator diagnostic, new TD/BC baseline,
+or reduced-data comparison is included.
+
+The 3×3 G0 and G-R ρ=0.9 artifacts already exist at
+`outputs/puzzle/standard-3x3-task3/{g0,gr-rho09}`. Their graph metadata records
+the same dataset ID:
+`ogbench:puzzle-3x3-play-singletask-task3-v0:bca9b1775ea5c01af5ac3f9b652709d341bddd17fe4b6368056566ac3c5fbb0f`.
+Reuse these artifacts; do not rebuild them unless they are missing or fail the
+dataset-ID check. The saved TD baseline is under
+`third_party/qc/exp/qc/v06-p0-qc-task3-save50k/puzzle-3x3-play-singletask-task3-v0/sd00020261105_160042/`;
+its recorded success rates are 0.10, 1.00, 0.98, and 1.00 at 50k, 100k, 150k,
+and 200k updates. That run has no saved 250k or 300k evaluation.
+
+The data-dependent code paths now use the button width from the aligned sidecar:
+the learned state frame is 19+9=28 values (five-frame input 140D), and the
+object-state frame is 4×9=36 values (five-frame input 180D). The 4×4 widths and
+feature ordering remain 35/175D and 64/320D. Tests for 3×3 preparation, windows,
+minimum press counts, and board-check lower bounds were added but not run here.
+
+### 10.1 Set paths and check the run checkout
+
+Run from a clean commit containing the v0.8.4 compatibility changes. Record the
+commit before starting so model and graph provenance are reproducible. Keep the
+existing task3 files in `outputs/`; they are shared by the run checkout.
+
+```bash
+ROOT=/home/url/graphcritic
+PY=$ROOT/.pixi/envs/bench/bin/python
+ENV=puzzle-3x3-play-singletask-task3-v0
+D3=$ROOT/outputs/puzzle/standard-3x3-task3
+COMMON3="--transitions $D3/g0/transitions.npz --sim-state $D3/g0/sim_state.npz"
+
+cd "$ROOT"
+git rev-parse HEAD
+git status --short
+```
+
+`git status --short` must be empty for the recorded `git_dirty: false`
+provenance. The G0 transition and simulator sidecars are the source for every
+stage below.
+
+### 10.2 Reuse or restore the base graphs
+
+The current files are present, so the commands in this conditional should be
+skipped. If either graph is missing, restore the standard-dataset artifacts as
+follows. G0 uses `--force` because its low reachability is expected.
+
+```bash
+if [ ! -f "$D3/g0/graph.npz" ]; then
+  $PY experiments/build_graph.py --ogbench-dataset "$ENV" \
+    --config configs/graph/puzzle_g0.yaml --h 5 --unit steps \
+    --out "$D3/g0" --force
+fi
+if [ ! -f "$D3/gr-rho09/graph.npz" ]; then
+  $PY experiments/build_graph.py $COMMON3 \
+    --config configs/graph/puzzle_gr_rho09.yaml --h 5 --unit steps \
+    --out "$D3/gr-rho09"
+fi
+```
+
+### 10.3 Run the v0.8.4 checks and learned distance
+
+Run the newly added tests yourself; they have not been run as part of preparing
+this section. S0 graph builds are unnecessary while the matching task3 artifacts
+remain present.
+
+```bash
+$PY -m pytest tests/test_quasimetric_v08.py -q
+
+$PY experiments/train_quasimetric.py $COMMON3 \
+  --window 5 --constraint-horizon 5 --epsilon 1.25 \
+  --activation gelu --layernorm --grad-clip 1.0 --dual adam \
+  --steps 20000 --log-every 1000 --save-every 10000 \
+  --out "$D3/v08/check/window5_chunk"
+
+$PY experiments/eval_quasimetric_chunk.py \
+  --ckpt "$D3/v08/check/window5_chunk/step_020000" $COMMON3
+```
+
+Continue only if there is no F3 collapse alert and `step_020000` exists. Record
+the chunk violation rate, `P(d≤5)`, and dead-unit fractions.
+
+### 10.4 Build and check shared candidates
+
+```bash
+$PY experiments/build_candidate_cache.py \
+  --g0-graph "$D3/g0/graph.npz" $COMMON3 \
+  --out "$D3/v08/candidates_window5.npz" \
+  --window 5 --knn 32 --parity-size 50000 --seed 0
+
+$PY experiments/check_embedding_cache.py \
+  --ckpt "$D3/v08/check/window5_chunk/step_020000" $COMMON3 \
+  --pairs 10000 --candidate-cache "$D3/v08/candidates_window5.npz"
+```
+
+Require `knn_parity.mismatched_rows = 0` and `pass = true` from the embedding
+cache report before graph building.
+
+### 10.5 Build learned graph L and oracle upper bound O
+
+```bash
+BUILD3="--judge quasimetric --g0-graph $D3/g0/graph.npz \
+  --reference-graph $D3/gr-rho09/graph.npz $COMMON3 \
+  --checkpoint $D3/v08/check/window5_chunk/step_020000 \
+  --candidate-cache $D3/v08/candidates_window5.npz \
+  --embedding-pair-batch-size 4096 --bridge-lambda-steps 10.5"
+
+$PY experiments/build_judged_graph.py $BUILD3 --out "$D3/v08/L_lam10.5"
+$PY experiments/build_judged_graph.py $BUILD3 \
+  --diagnostic-oracle-np-max 1 --write-oracle-targets \
+  --out "$D3/v08/O_np1"
+```
+
+O is an oracle upper-bound ablation, not a learned Graph Critic result. Its QC
+run group must contain `oracle`. Record bridge counts, reachability, loss-mask
+fraction, shortest-path bridge-count distribution, h=5 regret p90, and
+zero-regret fraction for both graphs.
+
+### 10.6 Optional learned object branch D
+
+L and O proceed regardless of D0/D2.5/D3 outcomes. Start the object branch only
+if the D0 label audit reports `gate_passed: true`.
+
+```bash
+$PY experiments/check_object_labels.py $COMMON3 --window 5 \
+  --out "$D3/v08/object_labels_check_v084.json"
+
+for COST in events motion; do
+  $PY experiments/train_object_quasimetric.py $COMMON3 \
+    --cost "$COST" --window 5 --steps 20000 \
+    --log-every 1000 --save-every 10000 \
+    --out "$D3/v08/object_$COST"
+done
+
+$PY experiments/tmp_board_check.py --candidates-only \
+  --candidate-cache "$D3/v08/candidates_window5.npz" \
+  --object-event-checkpoint "$D3/v08/object_events/step_020000" \
+  $COMMON3 --out "$D3/v08/e_phi_check_v084.json"
+```
+
+Continue to D3 only if the eφ medians increase in the order `n_p=0 < 1 < ≥2`
+and at most 1% of `n_p>1` candidate pairs pass `eφ≤1.5`:
+
+```bash
+$PY experiments/build_judged_graph.py $BUILD3 \
+  --object-event-checkpoint "$D3/v08/object_events/step_020000" \
+  --object-motion-checkpoint "$D3/v08/object_motion/step_020000" \
+  --event-max auto \
+  --oracle-reference-candidates "$D3/v08/O_np1/judge_candidates.npz" \
+  --out "$D3/v08/D_learned"
+```
+
+D passes only if the impossible-bridge fraction is at most 1%, at least 90% of
+O's `n_p≤1 ∧ dθ≤20` candidates are retained, and reachability is within one
+percentage point of O. If any condition fails, do not include D in S5 or QC.
+
+### 10.7 Offline board audit
+
+If D fails its gates, audit only L and O and omit `--object-event-checkpoint`:
+
+```bash
+$PY experiments/tmp_board_check.py \
+  --graph "$D3/v08/L_lam10.5/graph.npz" "$D3/v08/O_np1/graph.npz" \
+  $COMMON3 --out "$D3/v08/board_check_v084.json"
+```
+
+If D passes, include its graph and the trained event checkpoint:
+
+```bash
+$PY experiments/tmp_board_check.py \
+  --graph "$D3/v08/L_lam10.5/graph.npz" "$D3/v08/O_np1/graph.npz" \
+    "$D3/v08/D_learned/graph.npz" \
+  --object-event-checkpoint "$D3/v08/object_events/step_020000" \
+  $COMMON3 --out "$D3/v08/board_check_v084.json"
+```
+
+Report each graph's button-press-count distribution and impossible-bridge count
+and fraction. This audit is a lower-bound check, not evidence that a bridge is
+physically executable.
+
+### 10.8 QC runs (approval-gated)
+
+The v0.8.4 specification marks L/O QC as requiring confirmation; D QC is
+conditional on passing both object gates. Do not start these runs until those
+conditions are met. This is standard OGBench data, so do **not** pass
+`--ogbench_dataset_path`.
+
+Run L and O after approval; add D only if it passed D2.5 and D3. Set `RUN` to
+`L_lam10.5`, `O_np1`, or `D_learned` for each invocation:
+
+```bash
+RUN=L_lam10.5  # change to O_np1 or D_learned for the other eligible graph
+TARGET_DIR="$D3/v08/$RUN"
+GRAPH_DATASET_ID="$($PY -c 'import json,sys; print(json.load(open(sys.argv[1]))["config"]["dataset_id"])' \
+  "$TARGET_DIR/targets.json" )"
+
+case "$RUN" in
+  O_np1) GROUP=v084-3x3t3-oracle-np1 ;;
+  *)     GROUP="v084-3x3t3-$RUN" ;;
+esac
+
+cd "$ROOT/third_party/qc"
+MUJOCO_GL=egl WANDB_MODE=offline PYTHONPATH="$ROOT:$ROOT/third_party/qc" \
+  "$PY" main.py \
+  --run_group="$GROUP" \
+  --agent.actor_type=best-of-n --agent.actor_num_samples=32 \
+  --agent.critic_mode=graph --agent.graph_target_kind=regret \
+  --agent.graph_target_unit=steps --agent.action_chunking=True \
+  --agent.alpha=100 --agent.batch_size=256 --agent.lr=0.0003 \
+  --agent.num_qs=2 --agent.layer_norm=True --agent.q_agg=mean \
+  --env_name="$ENV" --sparse=True --horizon_length=5 \
+  --offline_steps=300000 --online_steps=0 \
+  --eval_interval=50000 --eval_episodes=50 --save_interval=50000 \
+  --graph_targets="$TARGET_DIR/targets.npz" \
+  --graph_dataset_id="$GRAPH_DATASET_ID" --seed=0 \
+  --save_dir="$D3/v08/qc/$RUN"
+```
+
+Compare the six 50k-step success rates and final regret-batch Spearman with the
+saved v0.6 TD run. With one seed and 50 episodes, differences under 10 percentage
+points are descriptive only. Record code and QC commits, clean-tree status,
+graph/target hashes, and `graph_target_provenance`.

@@ -53,20 +53,24 @@ class PuzzleObjectData:
 def puzzle_object_state_raw(
     trans: TransitionSet, sim_state: SimStateSet
 ) -> np.ndarray:
-    """Return the 64D P13 vector: 32 button bits, 16 depths, 16 velocities."""
+    """Return ``4B`` object features for a supported puzzle with ``B`` buttons."""
     states, _, _, _ = state_table(trans)
     sim_state.validate(len(states))
-    if sim_state.button_states is None or sim_state.button_states.shape[1] != 16:
-        raise SchemaError("v0.8.2 object models require aligned 4x4 button states")
-    if sim_state.qvel.shape[1] < 30:
-        raise SchemaError("v0.8.2 object models require 16 button joint velocities in qvel")
+    if sim_state.button_states is None:
+        raise SchemaError("object models require aligned puzzle button states")
+    button_count = int(sim_state.button_states.shape[1])
+    layout = {9: (3, 3), 16: (4, 4), 20: (4, 5)}
+    if button_count not in layout:
+        raise SchemaError("object models support 3x3, 4x4, or 4x5 puzzle button states")
+    if sim_state.qvel.shape[1] < 14 + button_count:
+        raise SchemaError("puzzle qvel must contain one velocity per button joint")
     result = OGBenchPuzzleStateSchema().objects(states, {
         "qpos": sim_state.qpos,
         "qvel": sim_state.qvel,
         "button_states": sim_state.button_states,
     })
-    if result.shape != (len(states), 64):
-        raise SchemaError("4x4 Puzzle object state must have width 64")
+    if result.shape != (len(states), 4 * button_count):
+        raise SchemaError("Puzzle object state must contain four features per button")
     return np.ascontiguousarray(result, dtype=np.float32)
 
 
@@ -77,13 +81,16 @@ def normalize_object_state(
     values = np.asarray(raw, dtype=np.float32)
     mean = np.asarray(mean, dtype=np.float32)
     std = np.asarray(std, dtype=np.float32)
-    if values.ndim != 2 or values.shape[1] != 64 or mean.shape != (32,) or std.shape != (32,):
-        raise SchemaError("Puzzle object normalization expects 64D states and 32D stats")
+    if values.ndim != 2 or values.shape[1] == 0 or values.shape[1] % 4:
+        raise SchemaError("Puzzle object states must contain four features per button")
+    continuous_start = values.shape[1] // 2
+    if mean.shape != (continuous_start,) or std.shape != (continuous_start,):
+        raise SchemaError("Puzzle object normalization statistics must match depth and velocity features")
     if (np.any(~np.isfinite(values)) or np.any(~np.isfinite(mean))
             or np.any(~np.isfinite(std)) or np.any(std <= 0)):
         raise SchemaError("Puzzle object state and normalization statistics must be finite")
     normalized = values.copy()
-    normalized[:, 32:] = (values[:, 32:] - mean) / std
+    normalized[:, continuous_start:] = (values[:, continuous_start:] - mean) / std
     return np.ascontiguousarray(normalized, dtype=np.float32)
 
 
@@ -304,7 +311,9 @@ def prepare_puzzle_object_data(
     )
     raw = puzzle_object_state_raw(trans, sim_state)
     fit_ids = _fit_rows(split, trans)
-    continuous = raw[:, 32:].astype(np.float64)
+    button_count = int(sim_state.button_states.shape[1])
+    continuous_start = 2 * button_count
+    continuous = raw[:, continuous_start:].astype(np.float64)
     mean = np.mean(continuous[fit_ids], axis=0, dtype=np.float64)
     std = np.maximum(np.std(continuous[fit_ids], axis=0, dtype=np.float64), 1e-6)
     normalized = normalize_object_state(raw, mean, std)
@@ -315,7 +324,7 @@ def prepare_puzzle_object_data(
     valid, endpoint = _five_step_endpoints(split, trans)
     rows = np.flatnonzero(valid).astype(np.int64)
     buttons = np.asarray(sim_state.button_states, dtype=np.uint8)
-    depths = raw[:, 32:48].astype(np.float64)
+    depths = raw[:, continuous_start:continuous_start + button_count].astype(np.float64)
     delta = depths[endpoint[rows]] - depths[rows]
     displacement = np.abs(delta)
     q999 = np.quantile(displacement, 0.999, axis=0)
@@ -401,10 +410,11 @@ def prepare_puzzle_object_data(
     metadata = {
         "object_state_schema": "puzzle-button-onehot-depth-velocity-v1",
         "object_label_version": "contact-segment-position-q999-v2",
-        "object_dim": 64,
-        "frame_dim": 64,
+        "button_count": button_count,
+        "object_dim": int(raw.shape[1]),
+        "frame_dim": int(raw.shape[1]),
         "window": int(window),
-        "input_dim": int(window * 64),
+        "input_dim": int(window * raw.shape[1]),
         "continuous_mean": mean.astype(np.float32).tolist(),
         "continuous_std": std.astype(np.float32).tolist(),
         "position_q999_displacement": q999.astype(np.float32).tolist(),

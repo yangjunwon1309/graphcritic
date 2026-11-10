@@ -48,7 +48,11 @@ def _summary(values: np.ndarray) -> dict[str, float | int | None]:
 
 
 def _exact_press_counts(pairs: np.ndarray, boards: np.ndarray) -> np.ndarray:
-    matrix = toggle_matrix(4, 4)
+    board_width = int(np.asarray(boards).shape[1])
+    layout = {9: (3, 3), 16: (4, 4), 20: (4, 5)}
+    if board_width not in layout:
+        raise SchemaError("event report supports 3x3, 4x4, or 4x5 puzzle boards")
+    matrix = toggle_matrix(*layout[board_width])
     memo: dict[int, int] = {}
     result = np.empty(len(pairs), dtype=np.int16)
     for i, (source, destination) in enumerate(np.asarray(pairs, dtype=np.int64)):
@@ -388,7 +392,7 @@ def main(argv: list[str] | None = None) -> int:
         "iqe_head": "maxmean",
         "window": int(args.window),
         "input_dim": int(data.windows.shape[1]),
-        "frame_dim": 64,
+        "frame_dim": int(data.windows.shape[1] // args.window),
         "constraint_cost_definition": "onset(t)" if args.cost == "events" else "5*moved(t)",
         "constraint_cost_values": [0.0, 1.0] if args.cost == "events" else [0.0, 5.0],
         "constraint_pair_definition": (

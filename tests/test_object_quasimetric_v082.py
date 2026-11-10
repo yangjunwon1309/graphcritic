@@ -13,7 +13,7 @@ from graphcritic.types import SimStateSet, TransitionSet
 
 
 def _object_dataset():
-    steps_per_episode = 20
+    steps_per_episode = 80
     n = 2 * steps_per_episode
     episodes = np.repeat(np.asarray([11, 29], dtype=np.int64), steps_per_episode)
     times = np.tile(np.arange(steps_per_episode, dtype=np.int64), 2)
@@ -22,13 +22,15 @@ def _object_dataset():
     qpos = np.zeros((n + 2, 30), dtype=np.float32)
     qvel = np.zeros((n + 2, 30), dtype=np.float32)
     boards = np.zeros((n + 2, 16), dtype=np.int64)
-    # Each episode has two isolated board changes. State-table terminal rows
-    # duplicate the next state of each episode's final transition.
+    # Each episode has two separated, exact single-button toggles. State-table
+    # terminal rows duplicate the next state of each episode's final transition.
+    from graphcritic.puzzle import toggle_matrix
+    patterns = toggle_matrix(4, 4).astype(np.int64)
     for offset in (0, steps_per_episode):
-        boards[offset + 5:offset + steps_per_episode] = 1
-        boards[offset + 12:offset + steps_per_episode] = 0
-    boards[n] = boards[steps_per_episode]
-    boards[n + 1] = boards[-1]
+        boards[offset + 20:offset + 50] = patterns[:, 0]
+        boards[offset + 50:offset + steps_per_episode] = patterns[:, 0] ^ patterns[:, 1]
+    boards[n] = boards[steps_per_episode - 1]
+    boards[n + 1] = boards[n - 1]
     features = obs[:n]
     next_features = np.empty_like(features)
     next_features[:-1] = features[1:]
@@ -67,18 +69,35 @@ def test_puzzle_object_schema_has_onehot_depth_and_velocity_but_passive_remains_
     np.testing.assert_array_equal(coords.q_p[:, 0], [0, 1])
 
 
-def test_object_chunk_movement_and_onset_follow_button_change_windows():
+def test_contact_segments_and_stationary_event_windows_follow_button_changes():
     trans, sim = _object_dataset()
     data = prepare_puzzle_object_data(trans, sim, seed=0)
-    # Button changes at frame 5 and 12 induce overlapping moved windows at
-    # starts 0..4 and 7..11. Onset labels are evaluated on the non-overlapping
-    # five-frame chunk grid, so the corresponding starts are 0 and 10.
-    np.testing.assert_array_equal(np.flatnonzero(data.moved[:20]), np.r_[0:5, 7:12])
-    np.testing.assert_array_equal(np.flatnonzero(data.onset[:20]), [0, 10])
-    assert data.onset_report["minimum_frames"] == 10.0
-    assert data.onset_report["p1_frames"] == pytest.approx(10.0)
+    # A bit change at frame τ is visible in chunks starting at τ-5..τ-1.
+    np.testing.assert_array_equal(np.flatnonzero(data.moved[:80]), np.r_[15:20, 45:50])
+    np.testing.assert_array_equal(np.flatnonzero(data.onset[:80]), [15, 45])
+    assert data.contact_start_rows[:2].tolist() == [15, 45]
+    assert data.contact_end_rows[:2].tolist() == [19, 49]
+    assert data.event_source_ids[:2].tolist() == [15, 45]
+    assert data.event_target_ids[:2].tolist() == [28, 58]
+    assert data.onset_report["minimum_frames"] == 30.0
+    assert data.onset_report["p1_frames"] == pytest.approx(30.0)
+    assert data.label_report["gate_passed"]
+    assert data.label_report["single_toggle_pattern_fraction"] == 1.0
+    assert data.label_report["uncovered_board_change_fraction"] == 0.0
+    assert data.label_report["event_pair_count"] == 4
+    assert np.all(np.any(
+        data.frame_features[data.event_source_ids, :32]
+        != data.frame_features[data.event_target_ids, :32], axis=1
+    ))
     assert data.frame_features.shape[1] == 64
     assert data.windows.shape[1] == 320
+
+
+def test_contact_interval_merges_only_gaps_shorter_than_five_frames():
+    from graphcritic.bridges.object_state import _group_contact_intervals
+
+    intervals = _group_contact_intervals(np.asarray([2, 3, 8, 14, 15]))
+    assert intervals == [(2, 8), (14, 15)]
 
 
 def test_object_qrl_chunk_costs_match_event_and_motion_definitions():
@@ -88,8 +107,20 @@ def test_object_qrl_chunk_costs_match_event_and_motion_definitions():
     motion_costs = chunk_constraint_costs(data, "motion")
     np.testing.assert_array_equal(event_costs[data.onset], 1.0)
     np.testing.assert_array_equal(event_costs[~data.onset], 0.0)
+    assert np.sum(event_costs) == len(data.event_source_ids)
     np.testing.assert_array_equal(motion_costs[data.moved], 5.0)
     np.testing.assert_array_equal(motion_costs[~data.moved], 0.0)
+
+
+def test_d2_5_candidate_report_counts_false_positives_over_all_hard_negatives():
+    from experiments.tmp_board_check import _candidate_event_report
+
+    report = _candidate_event_report(
+        np.asarray([0, 1, 2, 4, -1]),
+        np.asarray([0.1, 1.0, 1.4, 2.0, 1.0]),
+    )
+    assert report["threshold_1_5_vs_n_p_le_1"]["false_positive"] == 2
+    assert report["false_positive_rate_for_n_p_ge_2"] == pytest.approx(2 / 3)
 
 
 def test_object_event_and_motion_judges_intersect_and_report_joint_rejections():

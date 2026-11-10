@@ -156,25 +156,36 @@ def _event_report(scores: np.ndarray, press_counts: np.ndarray) -> dict:
 
 def _heldout_report(args, data, trans, sim_state, model, params, predictor, *, step: int) -> dict:
     costs = chunk_constraint_costs(data, args.cost)
-    valid = np.asarray(data.valid_chunk_rows, dtype=np.int64)
-    heldout_mask = np.zeros(trans.n_rows, dtype=np.bool_)
-    heldout_mask[data.heldout_rows] = True
-    chunk_rows = valid[heldout_mask[valid]]
-    endpoints = data.chunk_endpoint[chunk_rows]
-    distances = predictor(data.windows[chunk_rows], data.windows[endpoints])
-    chunk_cost = costs[chunk_rows]
     epsilon_g = 0.25 if args.cost == "events" else 1.25
+    if args.cost == "events":
+        event_heldout = np.isin(
+            trans.episode_id[data.event_source_ids], data.heldout_episodes
+        )
+        constraint_source = data.event_source_ids[event_heldout]
+        constraint_target = data.event_target_ids[event_heldout]
+    else:
+        valid = np.asarray(data.valid_chunk_rows, dtype=np.int64)
+        heldout_mask = np.zeros(trans.n_rows, dtype=np.bool_)
+        heldout_mask[data.heldout_rows] = True
+        constraint_source = valid[heldout_mask[valid]]
+        constraint_target = data.chunk_endpoint[constraint_source]
+    distances = predictor(data.windows[constraint_source], data.windows[constraint_target])
+    constraint_cost = np.ones(len(distances), dtype=np.float32)
+    if args.cost == "motion":
+        constraint_cost = costs[constraint_source]
     report: dict[str, object] = {
         "step": int(step),
         "cost": args.cost,
-        "heldout_chunk_count": int(len(chunk_rows)),
-        "chunk_constraint_violation_rate": float(np.mean(distances > chunk_cost)) if len(distances) else None,
-        "chunk_constraint_violation_rate_beyond_epsilon": (
-            float(np.mean(distances > chunk_cost + epsilon_g)) if len(distances) else None
+        "heldout_constraint_pair_count": int(len(constraint_source)),
+        "heldout_constraint_violation_rate": (
+            float(np.mean(distances > constraint_cost)) if len(distances) else None
         ),
-        "distance_by_chunk_cost": {
-            str(float(value)): _summary(distances[chunk_cost == value])
-            for value in np.unique(chunk_cost)
+        "heldout_constraint_violation_rate_beyond_epsilon": (
+            float(np.mean(distances > constraint_cost + epsilon_g)) if len(distances) else None
+        ),
+        "distance_by_constraint_cost": {
+            str(float(value)): _summary(distances[constraint_cost == value])
+            for value in np.unique(constraint_cost)
         },
         "collapse_metrics": activation_diagnostics(
             make_activation_diagnostic_fn(model), params,
@@ -182,7 +193,7 @@ def _heldout_report(args, data, trans, sim_state, model, params, predictor, *, s
             activation="gelu",
         ),
         "moved_fraction": data.movement_report["moved_fraction"],
-        "q90_assumption_warning": data.movement_report["q90_assumption_warning"],
+        "label_diagnostics": data.label_report,
         "T_I": data.onset_report["p1_frames"],
     }
     if args.cost == "events":
@@ -223,6 +234,10 @@ def _parse(argv: list[str] | None = None):
     parser.add_argument("--window", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--steps", type=int, default=20_000)
+    parser.add_argument(
+        "--resume-from", type=Path,
+        help="resume optimizer/model state from a checkpoint; --steps is additional updates",
+    )
     parser.add_argument("--save-every", type=int, default=10_000)
     parser.add_argument("--log-every", type=int, default=1_000)
     parser.add_argument("--batch-size", type=int, default=4096)
@@ -239,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.window != 5 or min(args.steps, args.save_every, args.log_every,
                                args.batch_size, args.eval_batch_size, args.max_eval_pairs) <= 0:
         raise SystemExit("v0.8.2 fixes window=5; step, batch, and interval values must be positive")
-    jax, jnp, _, _, _ = _jax_modules()
+    jax, jnp, _, serialization, _ = _jax_modules()
     trans, transition_meta = load_transitions(args.transitions)
     sim_state = load_sim_state(args.sim_state)
     data = prepare_puzzle_object_data(trans, sim_state, seed=args.seed, window=args.window)
@@ -247,11 +262,25 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("episode split must contain training and held-out rows")
     train_mask = np.zeros(trans.n_rows, dtype=np.bool_)
     train_mask[data.train_rows] = True
-    constraint_rows = data.valid_chunk_rows[train_mask[data.valid_chunk_rows]]
+    if not data.label_report["gate_passed"]:
+        raise SystemExit(
+            "D0 object-label gate failed; refusing to train: "
+            + json.dumps(data.label_report, sort_keys=True, allow_nan=False)
+        )
+    if args.cost == "events":
+        train_event_mask = np.isin(
+            trans.episode_id[data.event_source_ids], data.train_episodes
+        )
+        constraint_rows = data.event_source_ids[train_event_mask]
+        constraint_targets = data.event_target_ids[train_event_mask]
+    else:
+        constraint_rows = data.valid_chunk_rows[train_mask[data.valid_chunk_rows]]
+        constraint_targets = data.chunk_endpoint[constraint_rows]
     if not len(constraint_rows):
-        raise ValueError("training split contains no valid five-frame object chunks")
+        raise ValueError(f"training split contains no valid {args.cost} constraint pairs")
     next_index = np.full(trans.n_rows, -1, dtype=np.int64)
-    next_index[constraint_rows] = data.chunk_endpoint[constraint_rows]
+    constraint_next_index = np.full(len(data.windows), -1, dtype=np.int64)
+    constraint_next_index[constraint_rows] = constraint_targets
     constraint_costs = chunk_constraint_costs(data, args.cost)
     epsilon_g = 0.25 if args.cost == "events" else 1.25
     encoder_widths = (256, 256, 128)
@@ -272,6 +301,64 @@ def main(argv: list[str] | None = None) -> int:
         model, seed=args.seed, input_dim=data.windows.shape[1],
         primal_optimizer=primal_opt, dual_optimizer=dual_opt,
     )
+    start_step = 0
+    if args.resume_from is not None:
+        resume_path = args.resume_from
+        metadata_path = resume_path / "metadata.json"
+        state_path = resume_path / "train_state.msgpack"
+        if not metadata_path.is_file() or not state_path.is_file():
+            raise ValueError("resume checkpoint must contain metadata.json and train_state.msgpack")
+        checkpoint_meta = json.loads(metadata_path.read_text(encoding="utf-8"))
+        expected_meta = {
+            "spec_version": "v0.8.2",
+            "model_kind": "object-quasimetric-v0.8.2",
+            "object_cost": args.cost,
+            "dataset_id": transition_meta["dataset_id"],
+            "object_state_schema": "puzzle-button-onehot-depth-velocity-v1",
+            "object_label_version": "contact-segment-position-q999-v2",
+            "data_split_seed": int(args.seed),
+            "window": int(args.window),
+            "input_dim": int(data.windows.shape[1]),
+            "epsilon": float(epsilon_g),
+            "batch_size": int(args.batch_size),
+            "encoder_widths": list(encoder_widths),
+            "projector_widths": list(projector_widths),
+            "n_components": int(n_components),
+            "component_dim": int(component_dim),
+            "activation": "gelu",
+            "layernorm": True,
+            "dual": "adam",
+            "dual_learning_rate": 1e-2,
+            "learning_rate": 5e-4,
+            "gradient_clip_global_norm": 1.0,
+        }
+        mismatches = {
+            name: (checkpoint_meta.get(name), expected)
+            for name, expected in expected_meta.items()
+            if checkpoint_meta.get(name) != expected
+        }
+        if mismatches:
+            raise ValueError(f"resume checkpoint configuration mismatch: {mismatches}")
+        template = {
+            "params": params,
+            "primal_state": primal_state,
+            "raw_lambda": raw_lambda,
+            "dual_state": dual_state,
+            "key": key,
+            "step": np.asarray(0, dtype=np.int32),
+        }
+        restored = serialization.from_bytes(template, state_path.read_bytes())
+        params = restored["params"]
+        primal_state = restored["primal_state"]
+        raw_lambda = restored["raw_lambda"]
+        dual_state = restored["dual_state"]
+        key = restored["key"]
+        start_step = int(restored["step"])
+        if int(checkpoint_meta.get("step", -1)) != start_step:
+            raise ValueError("resume checkpoint metadata step does not match saved train state")
+        if start_step < 0:
+            raise ValueError("resume checkpoint step must be non-negative")
+    end_step = start_step + int(args.steps)
     states = jnp.asarray(data.windows)
     next_jax = jnp.asarray(next_index, dtype=jnp.int32)
     train_jax = jnp.asarray(data.train_rows, dtype=jnp.int32)
@@ -286,6 +373,7 @@ def main(argv: list[str] | None = None) -> int:
         "object_cost": args.cost,
         "dataset_id": args.dataset_id,
         "object_state_schema": "puzzle-button-onehot-depth-velocity-v1",
+        "object_label_version": "contact-segment-position-q999-v2",
         **data.metadata,
         "data_split_seed": int(args.seed),
         "train_fraction": 0.9,
@@ -303,13 +391,20 @@ def main(argv: list[str] | None = None) -> int:
         "frame_dim": 64,
         "constraint_cost_definition": "onset(t)" if args.cost == "events" else "5*moved(t)",
         "constraint_cost_values": [0.0, 1.0] if args.cost == "events" else [0.0, 5.0],
+        "constraint_pair_definition": (
+            "stationary_window_before_contact_to_stationary_window_after_contact"
+            if args.cost == "events" else "all_valid_five_frame_chunks"
+        ),
         "epsilon": epsilon_g,
         "learning_rate": 5e-4,
         "dual": "adam",
         "dual_learning_rate": 1e-2,
         "gradient_clip_global_norm": 1.0,
         "batch_size": int(args.batch_size),
-        "planned_steps": int(args.steps),
+        "planned_steps": int(end_step),
+        "steps_this_invocation": int(args.steps),
+        "resume_start_step": int(start_step),
+        "invocation_end_step": int(end_step),
         "save_every": int(args.save_every),
         "log_every": int(args.log_every),
         "T_I": data.onset_report["p1_frames"],
@@ -331,17 +426,19 @@ def main(argv: list[str] | None = None) -> int:
     last_projector_layer = "projector_0"
     log_path = args.out / "training.jsonl"
     started = time.time()
-    with log_path.open("w", encoding="utf-8") as log:
-        for step in range(1, args.steps + 1):
+    log_mode = "a" if args.resume_from is not None else "w"
+    with log_path.open(log_mode, encoding="utf-8") as log:
+        for step in range(start_step + 1, end_step + 1):
             params, primal_state, raw_lambda, dual_state, key, metrics = update(
                 params, primal_state, raw_lambda, dual_state, key,
-                states, next_jax, train_jax, constraint_rows_jax, next_jax,
+                states, next_jax, train_jax, constraint_rows_jax,
+                jnp.asarray(constraint_next_index, dtype=jnp.int32),
                 costs_jax,
             )
             training_metrics = {
                 name: float(jax.device_get(value)) for name, value in metrics.items()
             }
-            should_save = step % args.save_every == 0 or step == args.steps
+            should_save = step % args.save_every == 0 or step == end_step
             should_log = step % args.log_every == 0 or should_save
             diagnostics = None
             alarm_reason = None

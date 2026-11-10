@@ -4,7 +4,7 @@
 
 This runbook contains the v0.8 **five-frame window** experiment and its downstream checks only. The quasimetric training and graph judging use window length 5; the constraint horizon is 5 and ε is 1.25. There are no state-input quasimetric runs or comparisons in this procedure.
 
-The v0.8.1 focused checks and full test suite were run before commit. Model training, benchmark graph builds, and the board report remain user-run. Simulator witnesses and QC are outside this runbook.
+The v0.8.1 focused checks and full test suite were run before commit. Model training, benchmark graph builds, and the board report remain user-run. The v0.8.2 rule that oracle graphs do not produce QC targets has the explicitly approved v0.8.3 upper-bound exception in §9. Simulator witnesses remain outside this runbook.
 
 ## 1. Prepare the pinned worktree
 
@@ -182,11 +182,11 @@ Also report the board-change interval sample count and its minimum, p1, and p5, 
 
 ## 8. v0.8.2: separate object event and motion judges
 
-This extension keeps the v0.8 candidate cache, optimistic `C0` filter, layered Dijkstra, path-pruned bridges, regret targets, and per-bridge `dθ + Λ` cost. It adds two optional object-only judges. Puzzle object frames have 64 values: 16 two-way button one-hots, 16 press depths, and 16 press velocities. The continuous 32 coordinates use statistics fitted on the training episode split; the five-frame model input is 320D.
+This extension keeps the v0.8 candidate cache, optimistic `C0` filter, layered Dijkstra, path-pruned bridges, regret targets, and per-bridge `dθ + Λ` cost. It adds two object-only judges. Puzzle object frames have 64 values: 16 two-way button one-hots, 16 press depths, and 16 press velocities. The continuous 32 coordinates use training-split statistics; five-frame windows are 320D.
 
-`moved(t)` compares object coordinates at `t` and `t+5` against coordinate-wise q90 thresholds, with the specified `1e-4 × σ` floor; any board-bit change also marks the chunk moved. To keep one physical transition from producing multiple event labels across overlapping windows, onset is evaluated at non-overlapping five-frame chunk starts within each episode, using `moved(t) AND NOT moved(t−5)` (the first chunk uses `moved(t)`). The report records moved fraction, q90-warning status, and the minimum/p1/p5 onset interval. A moved fraction materially above 10% means the q90 sparsity assumption should be revisited.
+Movement labels use raw press-depth displacement only: `δ_k(t)=|p_k(t+5)-p_k(t)|`, `ε_k=0.05×q99.9(δ_k)`, and `moved(t)=1` if any `δ_k>ε_k` or a button bit changes. Velocity remains in the network input but does not set labels. Moved chunk starts are grouped into contact intervals; gaps containing fewer than five frames merge. Each event constraint is the pair of stationary object windows ending at `a` and `b+9`, covering frames `a−4…a` and `b+5…b+9` around contact interval `[a,b]`. `T_I` is the p1 interval between contact starts.
 
-The object trainer runs the same QRL objective, maximization term, Adam dual, GELU/LayerNorm, gradient clipping, and collapse checks as v0.8. For `--cost events`, each chunk constraint uses `c(t)=1` at onset and `0` otherwise, with ε=0.25. For `--cost motion`, `c(t)=5` when moved and `0` otherwise, with ε=1.25. The prescribed model is encoder `(256,256,128)`, projector `(256,512)`, IQE `16×32`, Adam `5e-4`, batch 4,096, and 20k steps. Checkpoints and held-out reports are written at 10k and 20k.
+The trainer applies the same QRL objective, random independent-window maximization term, Adam dual, GELU/LayerNorm, gradient clipping, and collapse checks as v0.8. Event constraints use one pair per valid contact interval with cost 1 and ε=0.25; movement constraints use all five-frame chunks with cost `5×moved(t)` and ε=1.25. The model is encoder `(256,256,128)`, projector `(256,512)`, IQE `16×32`, Adam `5e-4`, batch 4,096, and 20k updates. A D0 label audit runs before training; the trainer repeats the gate and stops if it fails. New checkpoints use label version `contact-segment-position-q999-v2`; older object checkpoints are rejected by the graph builder.
 
 Run the implementation checks first:
 
@@ -195,7 +195,7 @@ $PY -m pytest tests/test_object_quasimetric_v082.py tests/test_v08_1.py \
   tests/test_puzzle.py tests/test_quasimetric_v08.py -q
 ```
 
-Implementation verification on the v0.8.2 code commit: compileall and `git diff --check` passed; the full repository suite passed **172 tests** (three existing upstream/runtime warnings). No object-model training or D1–D4 benchmark build was run by Codex.
+Implementation checks and measured D0/D2/D2.5 results are recorded in [results_v0.8.2b.md](results_v0.8.2b.md). D2.5 failed, so the gated D3/D4 experiments were not run.
 
 D1 builds the puzzle-only exact GF(2) upper-bound diagnostic. This graph is marked `qc_eligible: false`, stores `oracle_filter` metadata, and intentionally writes no QC target artifact:
 
@@ -210,29 +210,44 @@ $PY experiments/build_judged_graph.py $BUILD \
   --diagnostic-oracle-np-max 1 --out $D/v08/obj_oracle_np1
 ```
 
-D2 fits separate event and motion models. Passing the existing candidate cache lets the event checkpoint report held-out candidate pairs and exact minimum-press-count comparisons. The trainer also reports the same-episode motion-time comparison and held-out chunk constraint violations.
+D0 audits the contact labels before learning. Continue only if `gate_passed` is true. It writes contact/board event counts, one-toggle purity, uncovered board changes, p1/p5 `T_I`, moved fraction, contact lengths, and thresholds.
+
+```bash
+$PY experiments/check_object_labels.py $COMMON --window 5 \
+  --out $D/v08/object_labels_check_v082b.json
+```
+
+D2 fits new event and motion models from random initialization; do not resume the v0.8.2 checkpoints. The trainer repeats the D0 gate before the first optimizer update. The event model uses contact-boundary window pairs, and the motion model uses the corrected position-based moved labels.
 
 ```bash
 for COST in events motion; do
   $PY experiments/train_object_quasimetric.py $COMMON \
-    --candidate-cache $D/v08/candidates_window5.npz \
     --cost "$COST" --window 5 --steps 20000 \
     --log-every 1000 --save-every 10000 \
-    --out "$D/v08/object_$COST"
+    --out "$D/v08/object2_$COST"
 done
 ```
 
-Check both output directories for `step_020000`, `heldout.jsonl`, and finite collapse metrics. The event report includes `eφ` quantiles by exact `n_p` and a 2×2 result for `eφ≤1.5` versus `n_p≤1`. The motion report compares `mψ` to moved-chunk count × 5. Review `T_I` and moved-fraction warning before using automatic event thresholds.
+Check both directories for `step_020000`, `heldout.jsonl`, finite collapse metrics, and the D0 report embedded in their metadata. The motion report compares `mψ` with moved-chunk count × 5; the event report checks held-out contact constraints.
 
-D3 applies all enabled lower-bound checks as an AND. With `--event-max auto`, the builder reads the event checkpoint's `T_I=p1` and sets `E_max=ceil(20/T_I)`. Object scores affect acceptance only; stored bridge distance and cost remain `dθ` and `dθ+Λ`. The builder records individual and joint rejection counts and reuses node embedding caches for both object models.
+D2.5 evaluates the event model on the exact shared candidate pairs before any D3 graph build. Proceed only if the `n_p=0,1,≥2` score medians increase in that order and the false-positive rate among `n_p>1` (including unreachable boards) is at most 1%.
+
+```bash
+$PY experiments/tmp_board_check.py --candidates-only \
+  --candidate-cache $D/v08/candidates_window5.npz \
+  --object-event-checkpoint $D/v08/object2_events/step_020000 \
+  $COMMON --out $D/v08/e_phi_check_v082b.json
+```
+
+D3 applies `dθ≤20`, `mψ≤20`, and `eφ≤E_max+0.5` as an AND. With `--event-max auto`, the builder reads the corrected contact-start `T_I=p1` and sets `E_max=ceil(20/T_I)`. Distances `mψ` and `eφ` affect acceptance only; stored bridge distance and cost remain `dθ` and `dθ+Λ`.
 
 ```bash
 $PY experiments/build_judged_graph.py $BUILD \
-  --object-event-checkpoint $D/v08/object_events/step_020000 \
-  --object-motion-checkpoint $D/v08/object_motion/step_020000 \
+  --object-event-checkpoint $D/v08/object2_events/step_020000 \
+  --object-motion-checkpoint $D/v08/object2_motion/step_020000 \
   --event-max auto \
   --oracle-reference-candidates $D/v08/obj_oracle_np1/judge_candidates.npz \
-  --out $D/v08/obj_learned
+  --out $D/v08/obj2_learned
 ```
 
 When supplied, the builder verifies that D1 and D3 use the same optimistic candidate pairs in the same order and that their candidate hash matches. It reports D3 recall on D1's exact `n_p≤1, dθ≤20` subset in `result.json`.
@@ -243,9 +258,65 @@ D4 adds `eφ` diagnostics to the existing offline board audit. It recomputes eve
 $PY experiments/tmp_board_check.py \
   --graph $D/v08/quasimetric_lam10.5/graph.npz \
           $D/v08/obj_oracle_np1/graph.npz \
-          $D/v08/obj_learned/graph.npz \
-  --object-event-checkpoint $D/v08/object_events/step_020000 \
-  $COMMON --out $D/v08/board_check_v082.json
+          $D/v08/obj2_learned/graph.npz \
+  --object-event-checkpoint $D/v08/object2_events/step_020000 \
+  $COMMON --out $D/v08/board_check_v082b.json
 ```
 
 Report the v0.8.1 Λ=10.5, D1, and D3 columns together. Include retained bridges, impossible-bridge fraction, `n_p` distribution, reachability, shortest-path bridge-count distribution, reduced-`C` fraction, and D3's `dθ`/`mψ`/`eφ` individual and joint rejection counts. The D3 guide gates are: impossible fraction ≤1%; at least 90% of D1's `n_p≤1, dθ≤20` candidates retained by D3; and reachability within one percentage point of D1. The oracle graph is a diagnostic upper bound only and must not be used for QC.
+
+## 9. v0.8.3: D1 oracle QC upper bound
+
+This approved experiment is an exception to the v0.8.2 oracle-target prohibition. The oracle target must be described as an upper-bound ablation, never as the learned Graph Critic method. The output graph and target metadata explicitly label it `oracle_upper_bound`; QC also requires `oracle` in its run group. R3b (quasimetric-only QC) and R3c (TD QC) remain approval-gated and are not part of this run.
+
+Run only the two prescribed checks and the R2/R3 commands below. R3 uses P13 task 2, seed 0, sparse rewards, best-of-32, horizon 5, 300k offline updates, zero online updates, 50k evaluation/save intervals, and 50 evaluation episodes.
+
+### R1. Approved code checks
+
+```bash
+$PY -m pytest tests/test_quasimetric_v08.py -q
+JAX_PLATFORM_NAME=cpu pixi run -e bench pytest -q third_party/qc/tests/test_graph_targets.py
+```
+
+### R2. D1 graph and explicit oracle regret targets
+
+Use a new output directory. Without `--write-oracle-targets`, the diagnostic mode continues to omit QC targets.
+
+```bash
+BUILD="--judge quasimetric --g0-graph $D/g0/graph.npz \
+  --reference-graph $D/gr-rho09/graph.npz $COMMON \
+  --checkpoint $D/v08/check/window5_chunk/step_020000 \
+  --candidate-cache $D/v08/candidates_window5.npz \
+  --embedding-pair-batch-size 4096 --bridge-lambda-steps 10.5"
+
+$PY experiments/build_judged_graph.py $BUILD \
+  --diagnostic-oracle-np-max 1 --write-oracle-targets \
+  --out $D/v08/obj_oracle_np1_qc
+```
+
+Check `result.json` for graph reachability, `h5_regret_valid_fraction`, path bridge-count distribution (0/1/2), h=5 regret p90, and zero-regret fraction. Compare reachability and loss coverage with the v0.6 G-R reference values of 99.80% and 99.90%. The target's `config.dataset_id` is passed to QC below; the target JSON also records `target_provenance`.
+
+### R3. D1 oracle target QC run
+
+```bash
+RUN_ROOT="$(git rev-parse --show-toplevel)"
+cd "$RUN_ROOT/third_party/qc"
+GRAPH_DATASET_ID="$($PY -c 'import json,sys; print(json.load(open(sys.argv[1]))["config"]["dataset_id"])' \
+  "$D/v08/obj_oracle_np1_qc/targets.json")"
+
+MUJOCO_GL=egl WANDB_MODE=offline PYTHONPATH="$RUN_ROOT:$RUN_ROOT/third_party/qc" \
+  "$PY" main.py \
+  --run_group=v083-p13-d1-oracle \
+  --agent.actor_type=best-of-n --agent.actor_num_samples=32 \
+  --agent.critic_mode=graph --agent.graph_target_kind=regret \
+  --env_name=puzzle-4x4-play-singletask-task2-v0 \
+  --ogbench_dataset_path="$D/train.npz" \
+  --sparse=True --horizon_length=5 \
+  --offline_steps=300000 --online_steps=0 \
+  --eval_interval=50000 --eval_episodes=50 --save_interval=50000 \
+  --graph_targets="$D/v08/obj_oracle_np1_qc/targets.npz" \
+  --graph_dataset_id="$GRAPH_DATASET_ID" --seed=0 \
+  --save_dir="$D/v08/qc"
+```
+
+Before R3 starts, QC prints the resolved provenance and rejects an oracle target if `run_group` omits `oracle`. `flags.json` and W&B config retain provenance; `offline_agent.csv` and `eval.csv` include `graph_target_provenance`. Compare the six success rates and final batch regret Spearman with v0.6 G-R ρ=0.9 (14% final success, 0.676 final Spearman). A single-seed difference below 10 percentage points is descriptive only. Record the main and QC commit hashes, `git_dirty: false`, target hash, and provenance. Do not run R3b/R3c without approval.

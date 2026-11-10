@@ -223,6 +223,10 @@ def _parse(argv: list[str] | None = None):
                         help="event limit: auto=ceil(K/T_I) from event metadata, or a non-negative integer")
     parser.add_argument("--diagnostic-oracle-np-max", type=int,
                         help="Puzzle-only exact GF(2) press-count filter; diagnostic graph, never a QC target")
+    parser.add_argument(
+        "--write-oracle-targets", action="store_true",
+        help="explicitly write regret targets for a diagnostic oracle upper-bound experiment",
+    )
     parser.add_argument("--oracle-reference-candidates", type=Path,
                         help="D1 judge_candidates.npz used to measure D3 recall on the n_p<=limit, d_theta<=K subset")
     return parser.parse_args(argv)
@@ -251,6 +255,8 @@ def _load_object_judge(
         raise ValueError("object checkpoint window does not match candidate window")
     if metadata.get("object_state_schema") != "puzzle-button-onehot-depth-velocity-v1":
         raise ValueError("object checkpoint uses an unknown object-state schema")
+    if metadata.get("object_label_version") != "contact-segment-position-q999-v2":
+        raise ValueError("object checkpoint was not trained with the corrected v0.8.2 contact labels")
     if metadata.get("dataset_id") != expected_dataset_id:
         raise ValueError("object checkpoint dataset ID does not match graph-build data")
     if int(metadata.get("data_split_seed", metadata.get("split_seed", -1))) != expected_seed:
@@ -329,6 +335,62 @@ def _oracle_candidate_recall(
     }
 
 
+def _validate_oracle_target_flags(
+    diagnostic_oracle_np_max: int | None,
+    write_oracle_targets: bool,
+) -> None:
+    if write_oracle_targets and diagnostic_oracle_np_max is None:
+        raise SystemExit("--write-oracle-targets requires --diagnostic-oracle-np-max")
+
+
+def _write_graph_targets(
+    trans,
+    artifact: GraphArtifact,
+    out: Path,
+    *,
+    diagnostic_oracle_np_max: int | None,
+    write_oracle_targets: bool,
+):
+    """Write regular targets or explicitly authorized oracle targets."""
+    if diagnostic_oracle_np_max is not None and not write_oracle_targets:
+        return None
+    target_provenance = (
+        {
+            "kind": "oracle_upper_bound",
+            "oracle_np_max": int(diagnostic_oracle_np_max),
+        }
+        if diagnostic_oracle_np_max is not None
+        else {"kind": "learned"}
+    )
+    targets = critic_targets(
+        trans, artifact, TargetConfig(h=5, unit="steps", kind="regret")
+    )
+    if len(targets.y) != trans.n_rows:
+        raise ValueError("graph targets must have one row per transition")
+    save_targets(
+        targets, out / "targets", target_provenance=target_provenance
+    )
+    return targets
+
+
+def _target_summary(targets) -> dict[str, float | None]:
+    if targets is None:
+        return {
+            "h5_regret_p90": None,
+            "h5_zero_regret_fraction": None,
+            "h5_regret_loss_mask_fraction": None,
+        }
+    included = targets.valid & targets.loss_mask
+    values = np.asarray(targets.y[included], dtype=np.float64)
+    return {
+        "h5_regret_p90": float(np.quantile(values, 0.9)) if values.size else None,
+        "h5_zero_regret_fraction": (
+            float(np.mean(values <= 1e-8)) if values.size else None
+        ),
+        "h5_regret_loss_mask_fraction": float(np.mean(included)),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
     if (args.knn != 32 or args.delta != 5.0 or args.judge_batch_size < 1
@@ -340,6 +402,9 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--bridge-lambda-steps must be finite and non-negative")
     if args.diagnostic_oracle_np_max is not None and args.diagnostic_oracle_np_max < 0:
         raise SystemExit("--diagnostic-oracle-np-max must be non-negative")
+    _validate_oracle_target_flags(
+        args.diagnostic_oracle_np_max, args.write_oracle_targets
+    )
     if args.object_event_checkpoint is not None or args.object_motion_checkpoint is not None:
         if args.judge != "quasimetric":
             raise SystemExit("object-state filters are only supported with --judge quasimetric")
@@ -723,7 +788,15 @@ def main(argv: list[str] | None = None) -> int:
                 "max_press_count": int(args.diagnostic_oracle_np_max),
                 "diagnostic_only": True,
             }
-            artifact.meta["qc_eligible"] = False
+            artifact.meta["qc_eligible"] = (
+                "oracle_upper_bound" if args.write_oracle_targets else False
+            )
+            artifact.meta["target_provenance"] = {
+                "kind": "oracle_upper_bound",
+                "oracle_np_max": int(args.diagnostic_oracle_np_max),
+            }
+            if args.write_oracle_targets:
+                artifact.meta["spec_version"] = "v0.8.3"
         if args.object_event_checkpoint is not None or args.object_motion_checkpoint is not None:
             artifact.meta["object_judge_rule"] = {
                 "acceptance": "d_theta<=K AND m_psi<=K AND e_phi<=E_max+0.5 for enabled judges",
@@ -740,12 +813,13 @@ def main(argv: list[str] | None = None) -> int:
                 "motion_embedding_cache": object_embedding_reports.get("motion"),
             }
     graph_hash = save_graph(artifact, args.out / "graph.npz")
-    targets = None
-    if args.diagnostic_oracle_np_max is None:
-        targets = critic_targets(
-            trans, artifact, TargetConfig(h=5, unit="steps", kind="regret")
-        )
-        save_targets(targets, args.out / "targets")
+    targets = _write_graph_targets(
+        trans,
+        artifact,
+        args.out,
+        diagnostic_oracle_np_max=args.diagnostic_oracle_np_max,
+        write_oracle_targets=args.write_oracle_targets,
+    )
     np.savez_compressed(
         args.out / "layered_paths.npz",
         cost_steps=paths.cost_steps, successor=paths.successor,
@@ -805,10 +879,34 @@ def main(argv: list[str] | None = None) -> int:
     final_cost_steps = paths.cost_steps[2]
     original_reachable = np.isfinite(c0)
     decreased = original_reachable & (final_cost_steps < c0 - 1e-8)
-    bridge_counts, bridge_frequencies = np.unique(paths.bridge_count[2], return_counts=True)
+    reachable_paths = np.isfinite(paths.cost_steps[2])
+    reachable_path_count = int(np.count_nonzero(reachable_paths))
+    bridge_distribution = {
+        str(count): int(np.count_nonzero(reachable_paths & (paths.bridge_count[2] == count)))
+        for count in (0, 1, 2)
+    }
+    bridge_distribution_fraction = {
+        key: float(count / n_nodes) if n_nodes else 0.0
+        for key, count in bridge_distribution.items()
+    }
+    bridge_distribution_reachable_fraction = {
+        key: float(count / reachable_path_count) if reachable_path_count else 0.0
+        for key, count in bridge_distribution.items()
+    }
     result = {
         **provenance(ROOT),
-        "spec_version": "v0.8.2" if object_filters_active else "v0.8",
+        "spec_version": (
+            "v0.8.3" if args.write_oracle_targets
+            else "v0.8.2" if object_filters_active else "v0.8"
+        ),
+        "target_provenance": (
+            {
+                "kind": "oracle_upper_bound",
+                "oracle_np_max": int(args.diagnostic_oracle_np_max),
+            }
+            if args.diagnostic_oracle_np_max is not None
+            else {"kind": "learned"}
+        ),
         "dataset_id": dataset_id,
         "judge": args.judge,
         "bridge_lambda_steps": float(args.bridge_lambda_steps),
@@ -846,12 +944,13 @@ def main(argv: list[str] | None = None) -> int:
             float(np.count_nonzero(decreased) / np.count_nonzero(original_reachable))
             if np.any(original_reachable) else None
         ),
-        "bridge_count_distribution": {
-            str(int(count)): int(n) for count, n in zip(bridge_counts, bridge_frequencies, strict=True)
-        },
+        "bridge_count_distribution": bridge_distribution,
+        "bridge_count_fraction": bridge_distribution_fraction,
+        "bridge_count_fraction_reachable": bridge_distribution_reachable_fraction,
         "h5_regret_valid_fraction": (
             float(np.mean(targets.valid)) if targets is not None else None
         ),
+        **_target_summary(targets),
         "quasimetric_distance_summary": (
             {
                 "accepted_p50": float(np.quantile(accepted_distances, 0.5)),

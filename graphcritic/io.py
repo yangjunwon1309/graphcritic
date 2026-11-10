@@ -355,20 +355,31 @@ def _target_config(targets: TargetSet) -> dict[str, Any]:
     }
 
 
-def save_targets(targets: TargetSet, path: str | Path) -> str:
+def save_targets(
+    targets: TargetSet,
+    path: str | Path,
+    *,
+    target_provenance: Mapping[str, Any] | None = None,
+) -> str:
     targets.validate()
     arrays = _target_arrays(targets)
     config = _target_config(targets)
     content_hash = _content_hash(TARGET_SCHEMA_VERSION, config, arrays)
+    metadata: dict[str, Any] = {
+        "schema_version": TARGET_SCHEMA_VERSION,
+        "config": config,
+        "meta": {},
+        "content_hash": content_hash,
+    }
+    if target_provenance is not None:
+        provenance = dict(target_provenance)
+        if provenance.get("kind") not in {"learned", "oracle_upper_bound"}:
+            raise SchemaError("target provenance kind must be learned or oracle_upper_bound")
+        metadata["target_provenance"] = provenance
     _write_pair(
         path,
         arrays,
-        {
-            "schema_version": TARGET_SCHEMA_VERSION,
-            "config": config,
-            "meta": {},
-            "content_hash": content_hash,
-        },
+        metadata,
     )
     npz_path, _ = _pair_paths(path)
     source_path = npz_path.with_name(f"{npz_path.stem}_source.npy")

@@ -8,6 +8,7 @@ does not simulate or execute bridges.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -27,6 +28,11 @@ from graphcritic.types import GraphArtifact, SchemaError, TransitionSet
 
 _BOARD_LAYOUTS = {9: (3, 3), 16: (4, 4), 20: (4, 5)}
 _NP_GROUPS = ("0", "1", "2", "3", "≥4", "∞")
+
+
+def _array_sha256(array: np.ndarray) -> str:
+    values = np.ascontiguousarray(array)
+    return hashlib.sha256(values.view(np.uint8)).hexdigest()
 
 
 def _board_change_intervals(
@@ -109,6 +115,55 @@ def _np_group_masks(press_counts: np.ndarray) -> dict[str, np.ndarray]:
         "3": finite & (press_counts == 3),
         "≥4": finite & (press_counts >= 4),
         "∞": ~finite,
+    }
+
+
+def _candidate_event_report(press_counts: np.ndarray, event_scores: np.ndarray) -> dict:
+    counts = np.asarray(press_counts, dtype=np.int64)
+    scores = np.asarray(event_scores, dtype=np.float32)
+    if counts.shape != scores.shape:
+        raise ValueError("candidate press counts and event scores must align")
+    finite = counts >= 0
+    groups = {
+        "0": finite & (counts == 0),
+        "1": finite & (counts == 1),
+        "≥2": finite & (counts >= 2),
+        "∞": ~finite,
+    }
+    by_group = {
+        label: {
+            "count": int(np.count_nonzero(mask)),
+            **(_quantiles(scores[mask]) or {"p10": None, "p50": None, "p90": None}),
+        }
+        for label, mask in groups.items()
+    }
+    predicted = scores <= 1.5
+    actual = finite & (counts <= 1)
+    false_positive = predicted & ~actual
+    hard_negative = ~actual
+    hard_negative_count = int(np.count_nonzero(hard_negative))
+    false_positive_count = int(np.count_nonzero(false_positive & hard_negative))
+    median0 = by_group["0"]["p50"]
+    median1 = by_group["1"]["p50"]
+    median2 = by_group["≥2"]["p50"]
+    ordered_medians = bool(
+        median0 is not None and median1 is not None and median2 is not None
+        and median0 < median1 < median2
+    )
+    fpr = false_positive_count / hard_negative_count if hard_negative_count else None
+    return {
+        "candidate_pair_count": int(len(scores)),
+        "e_phi_by_minimum_press_count": by_group,
+        "threshold_1_5_vs_n_p_le_1": {
+            "true_positive": int(np.count_nonzero(predicted & actual)),
+            "false_positive": int(np.count_nonzero(false_positive)),
+            "false_negative": int(np.count_nonzero(~predicted & actual)),
+            "true_negative": int(np.count_nonzero(~predicted & ~actual)),
+        },
+        "false_positive_rate_for_n_p_ge_2": fpr,
+        "median_order_0_lt_1_lt_ge2": ordered_medians,
+        "d2_5_gate_passed": bool(ordered_medians and fpr is not None and fpr <= 0.01),
+        "median_gate_note": "ordering is a machine-readable proxy for the spec's approximate 0, 1, >=2 separation",
     }
 
 
@@ -253,7 +308,11 @@ def analyze_bridge_arrays(
 
 def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--graph", type=Path, nargs="+", required=True)
+    parser.add_argument("--graph", type=Path, nargs="*", default=[])
+    parser.add_argument("--candidates-only", action="store_true",
+                        help="run D2.5 event-score check on the candidate cache, without graphs")
+    parser.add_argument("--candidate-cache", type=Path,
+                        help="shared v0.8 window-5 pair cache for --candidates-only")
     parser.add_argument("--transitions", type=Path, required=True)
     parser.add_argument("--sim-state", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True, help="output JSON report")
@@ -264,6 +323,13 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
+    if args.candidates_only:
+        if args.graph:
+            raise SystemExit("--candidates-only cannot be combined with --graph")
+        if args.candidate_cache is None or args.object_event_checkpoint is None:
+            raise SystemExit("--candidates-only requires --candidate-cache and --object-event-checkpoint")
+    elif not args.graph:
+        raise SystemExit("provide --graph or use --candidates-only")
     trans, trans_meta = load_transitions(args.transitions)
     sim_state = load_sim_state(args.sim_state)
     sim_state.validate(trans.n_rows + int(np.count_nonzero(trans.terminal)))
@@ -285,6 +351,82 @@ def main(argv: list[str] | None = None) -> int:
         "p1_frames": min_button_interval,
         "p5_frames": float(np.quantile(intervals, 0.05)),
     }
+
+    if args.candidates_only:
+        from experiments.v08_runtime import (
+            load_quasimetric_checkpoint,
+            make_embedding_cache_predictor,
+        )
+
+        checkpoint = args.object_event_checkpoint
+        event_meta = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
+        if (event_meta.get("model_kind") != "object-quasimetric-v0.8.2"
+                or event_meta.get("object_cost") != "events"):
+            raise ValueError("--object-event-checkpoint must name a v0.8.2 event-count model")
+        if event_meta.get("object_label_version") != "contact-segment-position-q999-v2":
+            raise ValueError("event checkpoint was not trained with the corrected contact labels")
+        if event_meta.get("dataset_id") != trans_meta["dataset_id"] or int(event_meta.get("window", -1)) != 5:
+            raise ValueError("event checkpoint dataset ID or window does not match the inputs")
+        with np.load(args.candidate_cache, allow_pickle=False) as cache:
+            required = {"pairs", "dataset_id", "window"}
+            if not required.issubset(cache.files):
+                raise ValueError("candidate cache is missing pairs, dataset_id, or window metadata")
+            if str(cache["dataset_id"].item()) != trans_meta["dataset_id"]:
+                raise ValueError("candidate cache dataset ID does not match the input data")
+            if int(cache["window"].item()) != 5:
+                raise ValueError("D2.5 requires the shared five-frame candidate cache")
+            pairs = np.asarray(cache["pairs"], dtype=np.int64)
+        if pairs.ndim != 2 or pairs.shape[1] != 2:
+            raise ValueError("candidate cache pairs must have shape (N,2)")
+        if pairs.size and (np.any(pairs < 0) or np.any(pairs >= len(boards))):
+            raise SchemaError("candidate pair references a state outside the sidecar table")
+        if not len(pairs):
+            raise ValueError("candidate cache has no candidate pairs")
+        features = frame_object_features_from_checkpoint(
+            trans, sim_state,
+            continuous_mean=np.asarray(event_meta["continuous_mean"], dtype=np.float32),
+            continuous_std=np.asarray(event_meta["continuous_std"], dtype=np.float32),
+            window=5,
+        )
+        node_ids = np.unique(pairs)
+        model, params, event_meta = load_quasimetric_checkpoint(
+            checkpoint, input_dim=features.shape[1],
+            expected_dataset_id=trans_meta["dataset_id"],
+        )
+        cache_path = args.out.parent / (
+            f"{args.out.stem}-event-embeddings-{event_meta['params_sha256'][:16]}.npy"
+        )
+        predict, cache_report = make_embedding_cache_predictor(
+            model, params, features[node_ids], node_ids,
+            params_sha256=str(event_meta["params_sha256"]),
+            dataset_id=trans_meta["dataset_id"], cache_path=cache_path,
+        )
+        event_scores = predict(pairs)
+        press_counts = np.empty(len(pairs), dtype=np.int16)
+        memo: dict[int, int | None] = {}
+        for index, (source, destination) in enumerate(pairs):
+            count = _minimum_press_count(
+                boards[int(source)] ^ boards[int(destination)], toggle, memo
+            )
+            press_counts[index] = -1 if count is None else count
+        result = {
+            "diagnostic": "v0.8.2_d2_5_event_candidate_check",
+            "dataset_id": trans_meta["dataset_id"],
+            "candidate_cache": str(args.candidate_cache),
+            "candidate_pair_sha256": _array_sha256(pairs),
+            "event_checkpoint": str(checkpoint),
+            "event_checkpoint_sha256": event_meta.get("params_sha256"),
+            "event_embedding_cache": cache_report,
+            "button_interval_frames": interval_report,
+            **_candidate_event_report(press_counts, event_scores),
+        }
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(
+            json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps(result, sort_keys=True, ensure_ascii=False, allow_nan=False))
+        return 0
 
     loaded_graphs = []
     for graph_path in args.graph:
@@ -308,6 +450,8 @@ def main(argv: list[str] | None = None) -> int:
         event_meta = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
         if event_meta.get("model_kind") != "object-quasimetric-v0.8.2" or event_meta.get("object_cost") != "events":
             raise ValueError("--object-event-checkpoint must name a v0.8.2 event-count model")
+        if event_meta.get("object_label_version") != "contact-segment-position-q999-v2":
+            raise ValueError("event checkpoint was not trained with the corrected contact labels")
         if event_meta.get("dataset_id") is None:
             raise ValueError("event checkpoint lacks a dataset ID")
         if int(event_meta.get("window", -1)) != 5:

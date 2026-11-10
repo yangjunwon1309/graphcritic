@@ -309,6 +309,9 @@ MUJOCO_GL=egl WANDB_MODE=offline PYTHONPATH="$RUN_ROOT:$RUN_ROOT/third_party/qc"
   --run_group=v083-p13-d1-oracle \
   --agent.actor_type=best-of-n --agent.actor_num_samples=32 \
   --agent.critic_mode=graph --agent.graph_target_kind=regret \
+  --agent.graph_target_unit=steps --agent.action_chunking=True \
+  --agent.alpha=100 --agent.batch_size=256 --agent.lr=0.0003 \
+  --agent.num_qs=2 --agent.layer_norm=True --agent.q_agg=mean \
   --env_name=puzzle-4x4-play-singletask-task2-v0 \
   --ogbench_dataset_path="$D/train.npz" \
   --sparse=True --horizon_length=5 \
@@ -320,3 +323,5 @@ MUJOCO_GL=egl WANDB_MODE=offline PYTHONPATH="$RUN_ROOT:$RUN_ROOT/third_party/qc"
 ```
 
 Before R3 starts, QC prints the resolved provenance and rejects an oracle target if `run_group` omits `oracle`. `flags.json` and W&B config retain provenance; `offline_agent.csv` and `eval.csv` include `graph_target_provenance`. Compare the six success rates and final batch regret Spearman with v0.6 G-R ρ=0.9 (14% final success, 0.676 final Spearman). A single-seed difference below 10 percentage points is descriptive only. Record the main and QC commit hashes, `git_dirty: false`, target hash, and provenance. Do not run R3b/R3c without approval.
+
+Measured v0.8.3 results are in [results_v0.8.3.md](results_v0.8.3.md).

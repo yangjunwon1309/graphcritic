@@ -1,6 +1,6 @@
 # Graph Critic v0.8 window-5 runbook
 
-**Implementation code commit:** `fffbb6e20de8e4742a919febeb63e41321fa35b0`
+**Implementation code commit:** `72c6dca8b40e62fff60c1505f475c5e57b1e3e0d`
 
 This runbook contains the v0.8 **five-frame window** experiment and its downstream checks only. The quasimetric training and graph judging use window length 5; the constraint horizon is 5 and ε is 1.25. There are no state-input quasimetric runs or comparisons in this procedure.
 
@@ -179,3 +179,73 @@ Report these values side by side. The previous Λ=0 result is included for compa
 | Impossible bridge count / fraction | — | — | — |
 
 Also report the board-change interval sample count and its minimum, p1, and p5, plus impossible rates by `n_p`. Expected direction: Λ=10.5 reduces the two-bridge path share and the fraction of originally reachable states with lower `C`, while keeping reachability close to Λ=0. A high board-impossibility rate indicates that the quasimetric judge itself needs further review, regardless of Λ.
+
+## 8. v0.8.2: separate object event and motion judges
+
+This extension keeps the v0.8 candidate cache, optimistic `C0` filter, layered Dijkstra, path-pruned bridges, regret targets, and per-bridge `dθ + Λ` cost. It adds two optional object-only judges. Puzzle object frames have 64 values: 16 two-way button one-hots, 16 press depths, and 16 press velocities. The continuous 32 coordinates use statistics fitted on the training episode split; the five-frame model input is 320D.
+
+`moved(t)` compares object coordinates at `t` and `t+5` against coordinate-wise q90 thresholds, with the specified `1e-4 × σ` floor; any board-bit change also marks the chunk moved. To keep one physical transition from producing multiple event labels across overlapping windows, onset is evaluated at non-overlapping five-frame chunk starts within each episode, using `moved(t) AND NOT moved(t−5)` (the first chunk uses `moved(t)`). The report records moved fraction, q90-warning status, and the minimum/p1/p5 onset interval. A moved fraction materially above 10% means the q90 sparsity assumption should be revisited.
+
+The object trainer runs the same QRL objective, maximization term, Adam dual, GELU/LayerNorm, gradient clipping, and collapse checks as v0.8. For `--cost events`, each chunk constraint uses `c(t)=1` at onset and `0` otherwise, with ε=0.25. For `--cost motion`, `c(t)=5` when moved and `0` otherwise, with ε=1.25. The prescribed model is encoder `(256,256,128)`, projector `(256,512)`, IQE `16×32`, Adam `5e-4`, batch 4,096, and 20k steps. Checkpoints and held-out reports are written at 10k and 20k.
+
+Run the implementation checks first:
+
+```bash
+$PY -m pytest tests/test_object_quasimetric_v082.py tests/test_v08_1.py \
+  tests/test_puzzle.py tests/test_quasimetric_v08.py -q
+```
+
+Implementation verification on the v0.8.2 code commit: compileall and `git diff --check` passed; the full repository suite passed **172 tests** (three existing upstream/runtime warnings). No object-model training or D1–D4 benchmark build was run by Codex.
+
+D1 builds the puzzle-only exact GF(2) upper-bound diagnostic. This graph is marked `qc_eligible: false`, stores `oracle_filter` metadata, and intentionally writes no QC target artifact:
+
+```bash
+BUILD="--judge quasimetric --g0-graph $D/g0/graph.npz \
+  --reference-graph $D/gr-rho09/graph.npz $COMMON \
+  --checkpoint $D/v08/check/window5_chunk/step_020000 \
+  --candidate-cache $D/v08/candidates_window5.npz \
+  --embedding-pair-batch-size 4096 --bridge-lambda-steps 10.5"
+
+$PY experiments/build_judged_graph.py $BUILD \
+  --diagnostic-oracle-np-max 1 --out $D/v08/obj_oracle_np1
+```
+
+D2 fits separate event and motion models. Passing the existing candidate cache lets the event checkpoint report held-out candidate pairs and exact minimum-press-count comparisons. The trainer also reports the same-episode motion-time comparison and held-out chunk constraint violations.
+
+```bash
+for COST in events motion; do
+  $PY experiments/train_object_quasimetric.py $COMMON \
+    --candidate-cache $D/v08/candidates_window5.npz \
+    --cost "$COST" --window 5 --steps 20000 \
+    --log-every 1000 --save-every 10000 \
+    --out "$D/v08/object_$COST"
+done
+```
+
+Check both output directories for `step_020000`, `heldout.jsonl`, and finite collapse metrics. The event report includes `eφ` quantiles by exact `n_p` and a 2×2 result for `eφ≤1.5` versus `n_p≤1`. The motion report compares `mψ` to moved-chunk count × 5. Review `T_I` and moved-fraction warning before using automatic event thresholds.
+
+D3 applies all enabled lower-bound checks as an AND. With `--event-max auto`, the builder reads the event checkpoint's `T_I=p1` and sets `E_max=ceil(20/T_I)`. Object scores affect acceptance only; stored bridge distance and cost remain `dθ` and `dθ+Λ`. The builder records individual and joint rejection counts and reuses node embedding caches for both object models.
+
+```bash
+$PY experiments/build_judged_graph.py $BUILD \
+  --object-event-checkpoint $D/v08/object_events/step_020000 \
+  --object-motion-checkpoint $D/v08/object_motion/step_020000 \
+  --event-max auto \
+  --oracle-reference-candidates $D/v08/obj_oracle_np1/judge_candidates.npz \
+  --out $D/v08/obj_learned
+```
+
+When supplied, the builder verifies that D1 and D3 use byte-identical optimistic candidate pairs and reports D3 recall on D1's exact `n_p≤1, dθ≤20` subset in `result.json`.
+
+D4 adds `eφ` diagnostics to the existing offline board audit. It recomputes event scores for retained bridges and reports their distribution by exact `n_p`, plus the `eφ≤1.5` versus `n_p≤1` table. It does not step a simulator.
+
+```bash
+$PY experiments/tmp_board_check.py \
+  --graph $D/v08/quasimetric_lam10.5/graph.npz \
+          $D/v08/obj_oracle_np1/graph.npz \
+          $D/v08/obj_learned/graph.npz \
+  --object-event-checkpoint $D/v08/object_events/step_020000 \
+  $COMMON --out $D/v08/board_check_v082.json
+```
+
+Report the v0.8.1 Λ=10.5, D1, and D3 columns together. Include retained bridges, impossible-bridge fraction, `n_p` distribution, reachability, shortest-path bridge-count distribution, reduced-`C` fraction, and D3's `dθ`/`mψ`/`eφ` individual and joint rejection counts. The D3 guide gates are: impossible fraction ≤1%; at least 90% of D1's `n_p≤1, dθ≤20` candidates retained by D3; and reachability within one percentage point of D1. The oracle graph is a diagnostic upper bound only and must not be used for QC.

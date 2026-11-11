@@ -113,5 +113,8 @@ are available for v1.2. The v1.2 QC comparison rows are therefore:
 
 ## Push status
 
-Pushes of `quasi_develop` and the QC fork's `graph-critic` branch were not
-attempted yet; this report commit must be created first.
+Push attempts failed for both branches because this environment has no
+interactive GitHub HTTPS credentials (`fatal: could not read Username for
+'https://github.com': No such device or address`). The commits remain local:
+`quasi_develop` and the QC fork's `graph-critic` branch are ahead of their
+respective origins.

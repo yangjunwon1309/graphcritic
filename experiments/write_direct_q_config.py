@@ -51,6 +51,7 @@ def _is_v11_same_object_graph(graph_meta: dict, build_result: dict) -> bool:
     candidate_rule = str(build_result.get("candidate_rule", graph_meta.get("candidate_rule", "")))
     return bool(
         provenance == "learned"
+        and graph_meta.get("spec_version") in {None, "v1.1", "v1.2"}
         and candidate_rule.startswith("cross_episode_observed_object_change_v1_")
         and build_result.get("object_change_set_sha256")
     )
@@ -189,7 +190,8 @@ def main(argv=None):
                 raise ValueError(f"v1.1 action-head seed {seed} failed held-out C1")
     config = {
         "spec_version": (
-            "v1.1" if v11_same_object else "v1.0" if args.anchor_mode == "dplus" else "v0.9"
+            str(graph.meta.get("spec_version", "v1.1")) if v11_same_object
+            else "v1.0" if args.anchor_mode == "dplus" else "v0.9"
         ),
         "dataset_id": trans_meta["dataset_id"],
         "graph": str(args.graph.resolve()),
@@ -210,7 +212,7 @@ def main(argv=None):
         "successors": 4,
         "max_local_distance": 20.0,
         "ensemble": "maximum",
-        "cost_layer": 2,
+        "cost_layer": int(graph.meta.get("cost_layer", graph.meta.get("b_max", 2))),
         "candidate_count": int(len(embeddings)),
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)

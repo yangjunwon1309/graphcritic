@@ -33,8 +33,11 @@ from experiments.v08_runtime import (
     make_embedding_cache_predictor,
     provenance,
 )
-from graphcritic.bridges.object_state import frame_object_features_from_checkpoint, pack_button_states
-from graphcritic.bridges.insert import layered_reverse_dijkstra
+from graphcritic.bridges.object_state import (
+    frame_object_features_from_checkpoint, pack_button_states,
+    same_object_candidate_subset,
+)
+from graphcritic.bridges.insert import layered_reverse_dijkstra, used_bridge_mask_for_budget
 from graphcritic.bridges.judge_flow import FlowJudge
 from graphcritic.bridges.judge_quasimetric import (
     QuasimetricJudge,
@@ -111,6 +114,7 @@ def _make_artifact(
     candidate_rule: str,
     window_size: int,
     bridge_lambda_steps: float = 0.0,
+    b_max: int = 2,
 ) -> GraphArtifact:
     src = np.asarray(bridge_src, dtype=np.int64)
     dst = np.asarray(bridge_dst, dtype=np.int64)
@@ -159,7 +163,7 @@ def _make_artifact(
         "bridge_strategy": "judge_all_optimistic_candidates_layered_dijkstra",
         "bridge_candidate_rule": candidate_rule,
         "bridge_window_size": int(window_size),
-        "bridge_max_added_per_path": 2,
+        "bridge_max_added_per_path": int(b_max),
         "bridge_max_judge_distance_steps": 20.0 if judge_name == "quasimetric" else None,
         "bridge_lambda_steps": float(bridge_lambda_steps),
         "bridge_cost_definition": (
@@ -215,6 +219,11 @@ def _parse(argv: list[str] | None = None):
         "--bridge-lambda-steps", type=float, default=0.0,
         help="extra pessimism cost added per accepted bridge, in steps",
     )
+    parser.add_argument("--bridge-object-change", choices=("any", "same"), default="any",
+                        help="restrict accepted candidates to equal object states")
+    parser.add_argument("--b-max", type=int, default=2,
+                        help="maximum number of bridges allowed in a path")
+    parser.add_argument("--sweep-only", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--embedding-cache", type=Path,
                         help="float32 .npy cache for per-node IQE embeddings")
     parser.add_argument(
@@ -446,6 +455,10 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("v0.8 fixes K=20 and at most four flow chunks")
     if not math.isfinite(args.bridge_lambda_steps) or args.bridge_lambda_steps < 0:
         raise SystemExit("--bridge-lambda-steps must be finite and non-negative")
+    if args.b_max < 0:
+        raise SystemExit("--b-max must be non-negative")
+    if args.sweep_only and args.judge != "quasimetric":
+        raise SystemExit("--sweep-only requires --judge quasimetric")
     if args.diagnostic_oracle_np_max is not None and args.diagnostic_oracle_np_max < 0:
         raise SystemExit("--diagnostic-oracle-np-max must be non-negative")
     _validate_oracle_target_flags(
@@ -661,6 +674,18 @@ def main(argv: list[str] | None = None) -> int:
         candidate_feature_hash = _array_sha256(frame_features)
         candidate_episode_hash = _array_sha256(episode)
         candidate_goal_hash = _array_sha256(base.nodes.is_goal)
+    candidate_count_before_object_filter = len(pairs)
+    if args.bridge_object_change == "same":
+        if sim_state.button_states is None:
+            raise SchemaError("same-object bridge filtering requires puzzle button_states")
+        with np.load(args.candidate_cache, allow_pickle=False) as cache:
+            cached_delta = (
+                np.asarray(cache["pair_delta"], dtype=np.uint64)
+                if "pair_delta" in cache.files else None
+            )
+        pairs, _ = same_object_candidate_subset(
+            pairs, sim_state.button_states, pair_delta=cached_delta,
+        )
     stages["candidate_cache_load_seconds"] = time.time() - cache_started
     base_c = step_cost(base.config.gamma)
     temporal = base.edges.kind == 0
@@ -770,8 +795,12 @@ def main(argv: list[str] | None = None) -> int:
     flow_sample_index = np.full(n_optimistic, -1, dtype=np.int16)
     flow_endpoint_error = np.full(n_optimistic, np.nan, dtype=np.float32)
     action_offsets = np.full(n_optimistic, -1, dtype=np.int64)
-    spool_path = args.out / "accepted_actions.spool.f32"
-    args.out.mkdir(parents=True, exist_ok=True)
+    if args.sweep_only:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        spool_path = args.out.with_name(f".{args.out.name}.spool.f32")
+    else:
+        args.out.mkdir(parents=True, exist_ok=True)
+        spool_path = args.out / "accepted_actions.spool.f32"
     action_rows = 0
     judge_started = time.time()
     with spool_path.open("wb") as spool:
@@ -885,21 +914,45 @@ def main(argv: list[str] | None = None) -> int:
         accepted_pairs[:, 0] if len(accepted_pairs) else np.empty(0, dtype=np.int64),
         accepted_pairs[:, 1] if len(accepted_pairs) else np.empty(0, dtype=np.int64),
         accepted_costs,
-        b_max=2,
+        b_max=args.b_max,
     )
     stages["layered_reverse_dijkstra_seconds"] = time.time() - dijkstra_started
-    retained_mask = paths.used_bridge_mask
+    if args.sweep_only:
+        spool_path.unlink(missing_ok=True)
+        from graphcritic.bridges.sweep import summarize_budget_sweep
+        sweep = summarize_budget_sweep(paths.cost_steps)
+        sweep.update({
+            "dataset_id": dataset_id,
+            "bridge_object_change": args.bridge_object_change,
+            "n_cached_candidates": int(candidate_count_before_object_filter),
+            "n_judged_candidates": int(len(pairs)),
+            "n_optimistic_candidates": int(n_optimistic),
+            "n_accepted_candidates": int(np.count_nonzero(accepted)),
+            "stage_seconds": stages,
+            "elapsed_seconds": time.time() - started,
+        })
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(
+            json.dumps(sweep, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps(sweep, sort_keys=True, allow_nan=False))
+        return 0
+    retained_mask = used_bridge_mask_for_budget(
+        paths, accepted_pairs[:, 0], accepted_pairs[:, 1],
+        n_nodes=n_nodes, budget=args.b_max,
+    )
     retained_pairs = accepted_pairs[retained_mask]
     retained_costs = accepted_costs[retained_mask]
     retained_distances = accepted_distances[retained_mask]
-    successor = paths.successor[2]
+    successor = paths.successor[args.b_max]
     successor = np.where(successor >= 0, successor % n_nodes, -1).astype(np.int64)
 
     artifact_started = time.time()
     artifact = _make_artifact(
         base, retained_pairs[:, 0] if len(retained_pairs) else np.empty(0, dtype=np.int64),
         retained_pairs[:, 1] if len(retained_pairs) else np.empty(0, dtype=np.int64),
-        retained_costs, retained_distances, paths.cost_steps[2], successor,
+        retained_costs, retained_distances, paths.cost_steps[args.b_max], successor,
         judge_name=args.judge, model_metadata={
             key: value for key, value in model_meta.items()
             if key in {"spec_version", "dataset_id", "params_sha256", "step", "input_dim",
@@ -907,6 +960,7 @@ def main(argv: list[str] | None = None) -> int:
                        "projector_widths", "n_components", "component_dim"}
         }, candidate_rule=candidate_rule, window_size=candidate_window,
         bridge_lambda_steps=args.bridge_lambda_steps,
+        b_max=args.b_max,
     )
     if object_filters_active:
         artifact.meta["spec_version"] = "v0.8.2"
@@ -941,10 +995,17 @@ def main(argv: list[str] | None = None) -> int:
                 "motion_embedding_cache": object_embedding_reports.get("motion"),
             }
     if object_change_mode:
-        artifact.meta["spec_version"] = "v1.1"
+        artifact.meta["spec_version"] = (
+            "v1.2" if args.bridge_object_change == "same" else "v1.1"
+        )
         artifact.meta["target_provenance"] = {"kind": "learned"}
         artifact.meta["candidate_rule"] = candidate_rule
         artifact.meta["object_change_set_sha256"] = object_change_set_sha256
+    elif args.bridge_object_change == "same":
+        artifact.meta["spec_version"] = "v1.2"
+    artifact.meta["bridge_object_change"] = args.bridge_object_change
+    artifact.meta["b_max"] = int(args.b_max)
+    artifact.meta["cost_layer"] = int(args.b_max)
     graph_hash = save_graph(artifact, args.out / "graph.npz")
     targets = _write_graph_targets(
         trans,
@@ -958,7 +1019,7 @@ def main(argv: list[str] | None = None) -> int:
     np.savez_compressed(
         args.out / "layered_paths.npz",
         cost_steps=paths.cost_steps, successor=paths.successor,
-        bridge_count=paths.bridge_count, b_max=np.asarray(2, dtype=np.int64),
+        bridge_count=paths.bridge_count, b_max=np.asarray(args.b_max, dtype=np.int64),
         graph_hash=np.asarray(graph_hash),
     )
     candidate_artifact = {
@@ -1011,14 +1072,16 @@ def main(argv: list[str] | None = None) -> int:
     reference_fraction = (
         float(np.mean(np.isfinite(reference.cost))) if reference is not None else None
     )
-    final_cost_steps = paths.cost_steps[2]
+    final_cost_steps = paths.cost_steps[args.b_max]
     original_reachable = np.isfinite(c0)
     decreased = original_reachable & (final_cost_steps < c0 - 1e-8)
-    reachable_paths = np.isfinite(paths.cost_steps[2])
+    reachable_paths = np.isfinite(paths.cost_steps[args.b_max])
     reachable_path_count = int(np.count_nonzero(reachable_paths))
     bridge_distribution = {
-        str(count): int(np.count_nonzero(reachable_paths & (paths.bridge_count[2] == count)))
-        for count in (0, 1, 2)
+        str(count): int(np.count_nonzero(
+            reachable_paths & (paths.bridge_count[args.b_max] == count)
+        ))
+        for count in range(args.b_max + 1)
     }
     bridge_distribution_fraction = {
         key: float(count / n_nodes) if n_nodes else 0.0
@@ -1031,7 +1094,8 @@ def main(argv: list[str] | None = None) -> int:
     result = {
         **provenance(ROOT),
         "spec_version": (
-            "v1.1" if object_change_mode
+            "v1.2" if args.bridge_object_change == "same"
+            else "v1.1" if object_change_mode
             else "v0.8.3" if args.write_oracle_targets
             else "v0.8.2" if object_filters_active else "v0.8"
         ),
@@ -1046,6 +1110,8 @@ def main(argv: list[str] | None = None) -> int:
         "dataset_id": dataset_id,
         "judge": args.judge,
         "bridge_lambda_steps": float(args.bridge_lambda_steps),
+        "bridge_object_change": args.bridge_object_change,
+        "b_max": int(args.b_max),
         "g0_hash": base.content_hash,
         "graph_hash": graph_hash,
         "model_checkpoint": str(args.checkpoint),
@@ -1065,6 +1131,7 @@ def main(argv: list[str] | None = None) -> int:
         },
         "optimistic_candidate_sha256": _array_sha256(optimistic_pairs),
         "n_cached_candidates": int(len(pairs)),
+        "n_candidates_before_object_change_filter": int(candidate_count_before_object_filter),
         "n_optimistic_candidates": int(n_optimistic),
         "n_excluded_infinite_destinations": excluded_infinite_destinations,
         "n_accepted_candidates": int(len(accepted_pairs)),

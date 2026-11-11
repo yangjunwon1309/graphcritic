@@ -24,6 +24,39 @@ class LayeredPathSolution:
     used_bridge_mask: np.ndarray
 
 
+def used_bridge_mask_for_budget(
+    solution: LayeredPathSolution,
+    bridge_src: np.ndarray,
+    bridge_dst: np.ndarray,
+    *,
+    n_nodes: int,
+    budget: int,
+) -> np.ndarray:
+    """Return bridge edges used by shortest paths at exactly ``budget``.
+
+    A path that starts with budget ``B`` can take bridges from any remaining
+    budget layer in ``1..B``.  An edge is retained when it is selected as the
+    successor of its source in any such layer.
+    """
+    n = int(n_nodes)
+    b = int(budget)
+    src = np.asarray(bridge_src, dtype=np.int64)
+    dst = np.asarray(bridge_dst, dtype=np.int64)
+    if n <= 0 or b < 0 or b >= solution.cost_steps.shape[0]:
+        raise ValueError("budget must be between zero and the solved maximum")
+    if src.shape != dst.shape:
+        raise ValueError("bridge endpoint arrays must align")
+    if solution.successor.shape[1] != n:
+        raise ValueError("solution node count does not match n_nodes")
+    if src.size and (np.any(src < 0) or np.any(src >= n)
+                     or np.any(dst < 0) or np.any(dst >= n)):
+        raise ValueError("bridge endpoint is outside the graph")
+    used = np.zeros(len(src), dtype=np.bool_)
+    for layer in range(1, b + 1):
+        used |= solution.successor[layer, src] == ((layer - 1) * n + dst)
+    return used
+
+
 def layered_reverse_dijkstra(
     n_nodes: int,
     goals: np.ndarray,

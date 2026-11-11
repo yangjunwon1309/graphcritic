@@ -67,6 +67,36 @@ def object_change(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     return np.bitwise_xor(left.astype(np.uint8, copy=False), right.astype(np.uint8, copy=False))
 
 
+def same_object_candidate_subset(
+    pairs: np.ndarray,
+    button_states: np.ndarray,
+    *,
+    pair_delta: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Select candidate pairs with zero observed object change.
+
+    ``pair_delta`` is the packed XOR indicator stored by v1.1 candidate
+    caches. If absent, the exact change pattern is computed with
+    :func:`object_change`.
+    """
+    endpoints = np.asarray(pairs, dtype=np.int64)
+    boards = np.asarray(button_states)
+    if endpoints.ndim != 2 or endpoints.shape[1] != 2:
+        raise ValueError("candidate pairs must have shape (N,2)")
+    if boards.ndim != 2 or np.any((boards != 0) & (boards != 1)):
+        raise SchemaError("button_states must be a binary matrix")
+    if endpoints.size and (np.any(endpoints < 0) or np.any(endpoints >= len(boards))):
+        raise SchemaError("candidate endpoint lies outside button_states")
+    if pair_delta is None:
+        same = np.all(object_change(boards[endpoints[:, 0]], boards[endpoints[:, 1]]) == 0, axis=1)
+    else:
+        delta = np.asarray(pair_delta, dtype=np.uint64)
+        if delta.shape != (len(endpoints),):
+            raise ValueError("pair_delta must align with candidate pairs")
+        same = delta == 0
+    return endpoints[same], same
+
+
 def pack_button_states(button_states: np.ndarray) -> np.ndarray:
     """Pack binary button rows into integer bit patterns, little-endian by index."""
     values = np.asarray(button_states)

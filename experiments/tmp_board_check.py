@@ -719,9 +719,14 @@ def analyze_bridge_arrays(
         })
 
     impossible_count = int(np.count_nonzero(impossible))
+    nonzero_press_count = int(np.count_nonzero(press_counts >= 1))
     result = {
         "bridge_count": int(count_total),
         "n_p_distribution": distribution,
+        "same_object_gate": {
+            "n_p_ge_1_count": nonzero_press_count,
+            "passed": nonzero_press_count == 0,
+        },
         "d_theta_by_n_p": distance_by_group,
         "impossible_bridge_count": impossible_count,
         "impossible_bridge_fraction": (

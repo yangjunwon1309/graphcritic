@@ -87,7 +87,8 @@ def _c0_optimistic_mask(pairs: np.ndarray, c0: np.ndarray, *, minimum_gain: floa
         raise ValueError("candidate pairs must have shape (N,2)")
     if pairs.size and (pairs.min() < 0 or pairs.max() >= len(costs)):
         raise ValueError("candidate pair node is outside the G0 cost vector")
-    gain = costs[pairs[:, 0]] - costs[pairs[:, 1]]
+    with np.errstate(invalid="ignore"):
+        gain = costs[pairs[:, 0]] - costs[pairs[:, 1]]
     return np.isfinite(costs[pairs[:, 1]]) & (gain >= float(minimum_gain))
 
 
@@ -369,7 +370,9 @@ def _candidate_distance_audit(args, trans, trans_meta, sim_state, boards) -> dic
             by_group["0"]["d_plus_p50"] is not None and d1 is not None and dge2 is not None
             and by_group["0"]["d_plus_p50"] < d1 < dge2
         ),
-        "np_ge2_accept_rate_at_most_1_percent": bool(dge2_accept is not None and dge2_accept <= 0.01),
+        "np_ge2_accept_rate_at_most_1_percent": bool(
+            np_ge2_accept is not None and np_ge2_accept <= 0.01
+        ),
     }
     gates["s2_all_passed"] = bool(all(gates.values()))
     gate_values = {
@@ -378,7 +381,7 @@ def _candidate_distance_audit(args, trans, trans_meta, sim_state, boards) -> dic
         "median_d_plus_n_p0": by_group["0"]["d_plus_p50"],
         "median_d_plus_n_p1": by_group["1"]["d_plus_p50"],
         "median_d_plus_n_p_ge2_including_infinity": dge2,
-        "n_p_ge2_fraction_d_plus_le_20": dge2_accept,
+        "n_p_ge2_fraction_d_plus_le_20": np_ge2_accept,
     }
     return {
         "diagnostic": "v1.0_dplus_candidate_audit",
@@ -410,7 +413,7 @@ def _candidate_distance_audit(args, trans, trans_meta, sim_state, boards) -> dic
         "c0_optimistic_acceptance_fraction_by_press_class": optimistic_acceptance,
         "np0_d_le_20_recall": d0,
         "np1_d_le_20_fraction": by_group["1"]["fraction_d_plus_le_20"],
-        "np_ge2_d_le_20_false_accept_rate": dge2_accept,
+        "np_ge2_d_le_20_false_accept_rate": np_ge2_accept,
         "gate_values": gate_values,
         "gates": gates,
     }

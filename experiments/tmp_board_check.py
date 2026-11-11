@@ -302,8 +302,20 @@ def _candidate_distance_audit(args, trans, trans_meta, sim_state, boards) -> dic
         raise SchemaError("G0 costs must align with its node table")
     if np.any(g0_graph.edges.kind != 0):
         raise SchemaError("optimistic audit expects the temporal-only G0 graph")
+    from graphcritic.bridges.insert import layered_reverse_dijkstra
     from graphcritic.weights import step_cost
-    c0_steps = g0_graph.cost / step_cost(g0_graph.config.gamma)
+    temporal = g0_graph.edges.kind == 0
+    base_c = step_cost(g0_graph.config.gamma)
+    c0_solution = layered_reverse_dijkstra(
+        g0_graph.nodes.n_nodes,
+        np.flatnonzero(g0_graph.nodes.is_goal),
+        g0_graph.edges.src[temporal].astype(np.int64),
+        g0_graph.edges.dst[temporal].astype(np.int64),
+        (g0_graph.weights[temporal] / base_c).astype(np.float64),
+        np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64),
+        np.empty(0, dtype=np.float64), b_max=0,
+    )
+    c0_steps = c0_solution.cost_steps[0]
     optimistic_mask = _c0_optimistic_mask(pairs, c0_steps, minimum_gain=10.0)
     optimistic_report = _distance_group_report(
         counts[optimistic_mask], distances[optimistic_mask],

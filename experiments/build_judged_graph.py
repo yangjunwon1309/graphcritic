@@ -33,7 +33,7 @@ from experiments.v08_runtime import (
     make_embedding_cache_predictor,
     provenance,
 )
-from graphcritic.bridges.object_state import frame_object_features_from_checkpoint
+from graphcritic.bridges.object_state import frame_object_features_from_checkpoint, pack_button_states
 from graphcritic.bridges.insert import layered_reverse_dijkstra
 from graphcritic.bridges.judge_flow import FlowJudge
 from graphcritic.bridges.judge_quasimetric import (
@@ -554,21 +554,103 @@ def main(argv: list[str] | None = None) -> int:
         candidate_features_all = frame_features
         embedding_node_ids = np.arange(len(frame_features), dtype=np.int64)
     cache_started = time.time()
+    object_change_mode = False
+    object_change_set_sha256 = None
     if candidate_window > 1:
-        pairs = load_or_build_window_candidate_pairs(
-            candidate_features_all, trans, base.nodes.is_goal,
-            dataset_id=dataset_id, window=candidate_window, k=args.knn,
-            cache_path=args.candidate_cache, node_limit=args.candidate_node_limit,
-            progress=True,
-        )
-        candidate_rule = f"{CANDIDATE_RULE}_boundary_window{candidate_window}"
-        candidate_feature_hash = _array_sha256(candidate_features_all[embedding_node_ids])
+        custom_cache = False
+        if args.candidate_cache.is_file():
+            with np.load(args.candidate_cache, allow_pickle=False) as cache:
+                custom_cache = "object_change_set_sha256" in cache.files
+        if custom_cache:
+            with np.load(args.candidate_cache, allow_pickle=False) as cache:
+                required = {
+                    "pairs", "pair_delta", "dataset_id", "window", "k", "knn_changed",
+                    "candidate_rule", "object_change_set_sha256", "allowed_change_codes",
+                    "node_ids", "node_ids_sha256", "feature_sha256", "episode_sha256", "goal_sha256",
+                }
+                if not required.issubset(cache.files):
+                    raise ValueError("object-change candidate cache is missing required metadata")
+                if str(cache["dataset_id"].item()) != dataset_id:
+                    raise ValueError("object-change candidate cache dataset ID mismatch")
+                if int(cache["window"].item()) != candidate_window or int(cache["k"].item()) != args.knn:
+                    raise ValueError("object-change candidate cache window or k mismatch")
+                if int(cache["knn_changed"].item()) != 32 or args.knn != 32:
+                    raise ValueError("v1.1 graph build requires k=32 for both object-change groups")
+                cached_node_ids = np.asarray(cache["node_ids"], dtype=np.int64)
+                if not np.array_equal(cached_node_ids, embedding_node_ids):
+                    raise ValueError("object-change candidate cache node IDs differ from graph nodes")
+                pairs = np.asarray(cache["pairs"], dtype=np.int64)
+                pair_delta = np.asarray(cache["pair_delta"], dtype=np.uint64)
+                allowed_change_codes = np.asarray(cache["allowed_change_codes"], dtype=np.uint64)
+                candidate_rule = str(cache["candidate_rule"].item())
+                object_change_set_sha256 = str(cache["object_change_set_sha256"].item())
+                candidate_feature_hash = str(cache["feature_sha256"].item())
+                candidate_episode_hash = str(cache["episode_sha256"].item())
+                candidate_goal_hash = str(cache["goal_sha256"].item())
+                cached_node_hash = str(cache["node_ids_sha256"].item())
+                cached_k = int(cache["k"].item())
+            if pairs.ndim != 2 or pairs.shape[1] != 2 or pair_delta.shape != (len(pairs),):
+                raise ValueError("object-change candidate pair arrays have invalid shapes")
+            if pairs.size and (np.any(pairs < 0) or np.any(pairs >= base.nodes.n_nodes)):
+                raise ValueError("object-change candidate pair references an invalid node")
+            if sim_state.button_states is None:
+                raise SchemaError("object-change graph building requires button_states")
+            state_episode_ids = np.concatenate((
+                trans.episode_id, trans.episode_id[np.flatnonzero(trans.terminal)],
+            ))
+            candidate_episodes = state_episode_ids[embedding_node_ids]
+            candidate_goals = base.nodes.is_goal[embedding_node_ids]
+            if cached_node_hash != _array_sha256(embedding_node_ids):
+                raise ValueError("object-change candidate cache node hash is invalid")
+            if candidate_episode_hash != _array_sha256(candidate_episodes):
+                raise ValueError("object-change candidate cache episode hash is invalid")
+            if candidate_goal_hash != _array_sha256(candidate_goals):
+                raise ValueError("object-change candidate cache goal hash is invalid")
+            robot_frames = candidate_features_all[embedding_node_ids].reshape(
+                len(embedding_node_ids), candidate_window, -1
+            )[:, :, :19]
+            robot_features = np.ascontiguousarray(robot_frames.reshape(len(embedding_node_ids), -1))
+            if candidate_feature_hash != _array_sha256(robot_features):
+                raise ValueError("object-change candidate cache robot-feature hash is invalid")
+            if not candidate_rule.startswith("cross_episode_observed_object_change_v1_robot_"):
+                raise ValueError("candidate cache does not declare the v1.1 robot-only rule")
+            if cached_k != 32:
+                raise ValueError("v1.1 candidate cache must use k=32")
+            src_local = np.searchsorted(embedding_node_ids, pairs[:, 0])
+            dst_local = np.searchsorted(embedding_node_ids, pairs[:, 1])
+            if (np.any(src_local >= len(embedding_node_ids)) or np.any(dst_local >= len(embedding_node_ids))
+                    or np.any(embedding_node_ids[np.minimum(src_local, len(embedding_node_ids) - 1)] != pairs[:, 0])
+                    or np.any(embedding_node_ids[np.minimum(dst_local, len(embedding_node_ids) - 1)] != pairs[:, 1])):
+                raise ValueError("object-change candidate endpoints are absent from candidate node IDs")
+            _, _, source_mask = puzzle_window_candidate_nodes(
+                trans, base.nodes.is_goal, window=candidate_window,
+            )
+            if np.any(~source_mask[src_local]):
+                raise ValueError("object-change candidate cache includes a non-boundary or goal source")
+            if np.any(candidate_episodes[src_local] == candidate_episodes[dst_local]):
+                raise ValueError("object-change candidates must cross episodes")
+            state_codes = pack_button_states(sim_state.button_states)
+            actual_delta = np.bitwise_xor(state_codes[pairs[:, 0]], state_codes[pairs[:, 1]])
+            if (not np.array_equal(actual_delta, pair_delta)
+                    or np.any(~np.isin(actual_delta, allowed_change_codes))):
+                raise ValueError("object-change candidate cache violates its observed change set")
+            object_change_mode = True
+        else:
+            pairs = load_or_build_window_candidate_pairs(
+                candidate_features_all, trans, base.nodes.is_goal,
+                dataset_id=dataset_id, window=candidate_window, k=args.knn,
+                cache_path=args.candidate_cache, node_limit=args.candidate_node_limit,
+                progress=True,
+            )
+            candidate_rule = f"{CANDIDATE_RULE}_boundary_window{candidate_window}"
+            candidate_feature_hash = _array_sha256(candidate_features_all[embedding_node_ids])
         candidate_episode_ids = np.concatenate((
             trans.episode_id,
             trans.episode_id[np.flatnonzero(trans.terminal)],
         ))[embedding_node_ids]
-        candidate_episode_hash = _array_sha256(candidate_episode_ids)
-        candidate_goal_hash = _array_sha256(base.nodes.is_goal[embedding_node_ids])
+        if not object_change_mode:
+            candidate_episode_hash = _array_sha256(candidate_episode_ids)
+            candidate_goal_hash = _array_sha256(base.nodes.is_goal[embedding_node_ids])
     else:
         pairs = load_or_build_candidate_pairs(
             frame_features, episode, base.nodes.is_goal,
@@ -858,6 +940,11 @@ def main(argv: list[str] | None = None) -> int:
                 "event_embedding_cache": object_embedding_reports.get("events"),
                 "motion_embedding_cache": object_embedding_reports.get("motion"),
             }
+    if object_change_mode:
+        artifact.meta["spec_version"] = "v1.1"
+        artifact.meta["target_provenance"] = {"kind": "learned"}
+        artifact.meta["candidate_rule"] = candidate_rule
+        artifact.meta["object_change_set_sha256"] = object_change_set_sha256
     graph_hash = save_graph(artifact, args.out / "graph.npz")
     targets = _write_graph_targets(
         trans,
@@ -944,7 +1031,8 @@ def main(argv: list[str] | None = None) -> int:
     result = {
         **provenance(ROOT),
         "spec_version": (
-            "v0.8.3" if args.write_oracle_targets
+            "v1.1" if object_change_mode
+            else "v0.8.3" if args.write_oracle_targets
             else "v0.8.2" if object_filters_active else "v0.8"
         ),
         "target_provenance": (
@@ -965,6 +1053,8 @@ def main(argv: list[str] | None = None) -> int:
         "match_constraint": model_meta.get("match_constraint"),
         "candidate_cache": str(args.candidate_cache),
         "candidate_rule": candidate_rule,
+        **({"object_change_set_sha256": object_change_set_sha256}
+           if object_change_mode else {}),
         "window_size": int(candidate_window),
         "model_window_size": int(model_window),
         "candidate_cache_hashes": {

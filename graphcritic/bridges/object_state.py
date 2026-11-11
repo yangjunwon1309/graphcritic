@@ -47,6 +47,80 @@ def object_match(x: np.ndarray, y: np.ndarray, *, epsilon: float | np.ndarray | 
     return bool(result) if np.ndim(result) == 0 else result
 
 
+def object_change(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Return the exact Puzzle button-state change pattern ``x XOR y``.
+
+    The final axis is the button axis. Keeping this operation here gives
+    future object representations one place to replace bitwise changes with
+    relative-pose changes.
+    """
+    left = np.asarray(x)
+    right = np.asarray(y)
+    if left.ndim == 0 or right.ndim == 0 or left.shape[-1] != right.shape[-1]:
+        raise SchemaError("object states must have matching non-empty feature axes")
+    if np.any((left != 0) & (left != 1)) or np.any((right != 0) & (right != 1)):
+        raise SchemaError("Puzzle button states must be binary")
+    try:
+        left, right = np.broadcast_arrays(left, right)
+    except ValueError as exc:
+        raise SchemaError("object states must have broadcast-compatible leading dimensions") from exc
+    return np.bitwise_xor(left.astype(np.uint8, copy=False), right.astype(np.uint8, copy=False))
+
+
+def pack_button_states(button_states: np.ndarray) -> np.ndarray:
+    """Pack binary button rows into integer bit patterns, little-endian by index."""
+    values = np.asarray(button_states)
+    if values.ndim != 2 or values.shape[1] > 63:
+        raise SchemaError("button_states must be a matrix with at most 63 buttons")
+    if np.any((values != 0) & (values != 1)):
+        raise SchemaError("Puzzle button states must be binary")
+    powers = np.left_shift(np.uint64(1), np.arange(values.shape[1], dtype=np.uint64))
+    return np.sum(values.astype(np.uint64) * powers[None, :], axis=1, dtype=np.uint64)
+
+
+def observed_object_change_counts(
+    button_states: np.ndarray,
+    episode_ids: np.ndarray,
+    times: np.ndarray,
+    *,
+    max_horizon: int = 20,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Count same-episode button XOR patterns over offsets ``1..max_horizon``.
+
+    Returns sorted pattern codes, occurrence counts, and each pattern's
+    smallest observed frame offset.
+    """
+    boards = np.asarray(button_states)
+    episodes = np.asarray(episode_ids, dtype=np.int64)
+    frame_times = np.asarray(times, dtype=np.int64)
+    if boards.ndim != 2 or len(boards) != len(episodes) or episodes.shape != frame_times.shape:
+        raise SchemaError("button states, episode IDs, and times must align")
+    if boards.shape[1] > 20:
+        raise SchemaError("observed change counting currently supports at most 20 buttons")
+    if max_horizon < 1:
+        raise SchemaError("max_horizon must be positive")
+    packed = pack_button_states(boards)
+    counts = np.zeros(1 << boards.shape[1], dtype=np.int64)
+    minimum_horizon = np.full(len(counts), np.iinfo(np.int16).max, dtype=np.int16)
+    for episode_id in np.unique(episodes):
+        ids = np.flatnonzero(episodes == episode_id)
+        ids = ids[np.argsort(frame_times[ids], kind="stable")]
+        episode_times = frame_times[ids]
+        for horizon in range(1, int(max_horizon) + 1):
+            left = np.searchsorted(episode_times, episode_times + horizon, side="left")
+            valid = left < len(ids)
+            valid &= episode_times[np.minimum(left, len(ids) - 1)] == episode_times + horizon
+            if not np.any(valid):
+                continue
+            differences = np.bitwise_xor(packed[ids[valid]], packed[ids[left[valid]]]).astype(np.int64)
+            hist = np.bincount(differences, minlength=len(counts))
+            counts += hist
+            observed = np.flatnonzero(hist)
+            minimum_horizon[observed] = np.minimum(minimum_horizon[observed], horizon)
+    patterns = np.flatnonzero(counts).astype(np.uint64)
+    return patterns, counts[patterns].copy(), minimum_horizon[patterns].copy()
+
+
 def _object_pair_cache_hash(array: np.ndarray) -> str:
     value = np.ascontiguousarray(array)
     digest = hashlib.sha256()

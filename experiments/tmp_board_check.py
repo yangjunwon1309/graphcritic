@@ -25,6 +25,8 @@ from graphcritic.bridges.models import prepare_puzzle_model_data
 from graphcritic.bridges.object_state import (
     frame_object_features_from_checkpoint,
     load_or_build_object_pair_index,
+    object_change,
+    pack_button_states,
 )
 from graphcritic.bridges.windows import puzzle_state_windows, puzzle_window_candidate_nodes
 from graphcritic.puzzle import minimum_press_solution, toggle_matrix
@@ -38,10 +40,8 @@ _NP_GROUPS = ("0", "1", "2", "3", "≥4", "∞")
 def _candidate_only_mode(args) -> str:
     """Validate candidate-only arguments without opening optional checkpoints."""
     if args.distance_checkpoint is not None:
-        if args.object_event_checkpoint is not None or args.reference_checkpoint is None:
-            raise SystemExit(
-                "--distance-checkpoint requires --reference-checkpoint and excludes --object-event-checkpoint"
-            )
+        if args.object_event_checkpoint is not None:
+            raise SystemExit("--distance-checkpoint excludes --object-event-checkpoint")
         return "distance"
     if args.object_event_checkpoint is None:
         raise SystemExit("--candidates-only requires --object-event-checkpoint or --distance-checkpoint")
@@ -453,6 +453,102 @@ def _node_state_indices(graph: GraphArtifact, trans: TransitionSet) -> np.ndarra
     return result
 
 
+def _object_change_candidate_audit(args, trans, trans_meta, sim_state, boards) -> dict[str, Any]:
+    """Audit v1.1 object-conditioned candidates with fixed d_theta and GF(2) labels."""
+    with np.load(args.candidate_cache, allow_pickle=False) as archive:
+        required = {
+            "pairs", "pair_delta", "dataset_id", "window", "k", "knn_changed",
+            "candidate_rule", "object_change_set_sha256", "node_ids",
+        }
+        if not required.issubset(archive.files):
+            raise SchemaError("candidate cache is not a v1.1 observed-object cache")
+        if str(archive["dataset_id"].item()) != trans_meta["dataset_id"]:
+            raise SchemaError("candidate cache dataset ID does not match the audit transitions")
+        if int(archive["window"].item()) != 5 or int(archive["k"].item()) != 32 or int(archive["knn_changed"].item()) != 32:
+            raise SchemaError("v1.1 audit requires window-5, k=32/32 object candidates")
+        candidate_pairs = np.asarray(archive["pairs"], dtype=np.int64)
+        pair_delta = np.asarray(archive["pair_delta"], dtype=np.uint64)
+        candidate_nodes = np.asarray(archive["node_ids"], dtype=np.int64)
+        object_change_hash = str(archive["object_change_set_sha256"].item())
+        candidate_rule = str(archive["candidate_rule"].item())
+    if candidate_pairs.ndim != 2 or candidate_pairs.shape[1] != 2 or pair_delta.shape != (len(candidate_pairs),):
+        raise SchemaError("candidate pair arrays have invalid shape")
+    model_data = prepare_puzzle_model_data(trans, sim_state, seed=0)
+    frame = np.concatenate((model_data.state_cont, model_data.state_bits), axis=1).astype(np.float32)
+    state_windows = puzzle_state_windows(frame, trans, model_data.terminal_state_index, window=5)
+    terminal_rows = np.flatnonzero(trans.terminal)
+    state_goals = np.concatenate((trans.success_cur, trans.success[terminal_rows]))
+    expected_nodes, _, source_mask = puzzle_window_candidate_nodes(trans, state_goals, window=5)
+    if not np.array_equal(expected_nodes, candidate_nodes):
+        raise SchemaError("candidate cache node order differs from the v0.8 window-5 rule")
+    state_episodes = np.concatenate((trans.episode_id, trans.episode_id[terminal_rows]))
+    if candidate_pairs.size and (np.any(candidate_pairs < 0) or np.any(candidate_pairs >= len(boards))):
+        raise SchemaError("candidate pair references a state outside the sidecar table")
+    src_local = np.searchsorted(candidate_nodes, candidate_pairs[:, 0])
+    dst_local = np.searchsorted(candidate_nodes, candidate_pairs[:, 1])
+    if (np.any(src_local >= len(candidate_nodes)) or np.any(dst_local >= len(candidate_nodes))
+            or np.any(candidate_nodes[np.minimum(src_local, len(candidate_nodes) - 1)] != candidate_pairs[:, 0])
+            or np.any(candidate_nodes[np.minimum(dst_local, len(candidate_nodes) - 1)] != candidate_pairs[:, 1])
+            or np.any(~source_mask[src_local])):
+        raise SchemaError("candidate cache endpoints violate the v0.8.4 boundary-node rule")
+    if np.any(state_episodes[candidate_pairs[:, 0]] == state_episodes[candidate_pairs[:, 1]]):
+        raise SchemaError("v1.1 candidate pairs must cross episodes")
+    board_codes = pack_button_states(boards)
+    actual_delta = np.bitwise_xor(board_codes[candidate_pairs[:, 0]], board_codes[candidate_pairs[:, 1]])
+    if not np.array_equal(actual_delta, pair_delta):
+        raise SchemaError("candidate cache pair_delta does not match sidecar button states")
+
+    distances, distance_meta, distance_cache = _distance_checkpoint_pairs(
+        args.distance_checkpoint, trans=trans, dataset_id=trans_meta["dataset_id"],
+        states=state_windows, node_ids=candidate_nodes, pairs=candidate_pairs,
+        cache_dir=args.out.parent, label="d_theta",
+    )
+    button_count = boards.shape[1]
+    layout = {9: (3, 3), 16: (4, 4), 20: (4, 5)}
+    if button_count not in layout:
+        raise SchemaError("GF(2) audit supports 3x3, 4x4, or 4x5 Puzzle boards")
+    toggle = toggle_matrix(*layout[button_count])
+    memo: dict[int, int | None] = {}
+    press = np.empty(len(candidate_pairs), dtype=np.int16)
+    for index, (source, target) in enumerate(candidate_pairs):
+        count = _minimum_press_count(
+            object_change(boards[int(source)], boards[int(target)]), toggle, memo,
+        )
+        press[index] = -1 if count is None else count
+    groups = {"0": press == 0, "1": press == 1, "2": press == 2,
+              "3": press == 3, "≥4": press >= 4, "∞": press < 0}
+    by_bundle = {}
+    for name, bundle in (("delta_zero", pair_delta == 0), ("delta_nonzero", pair_delta != 0)):
+        by_bundle[name] = {
+            label: {
+                "count": int(np.count_nonzero(bundle & mask)),
+                "d_theta_p10": float(np.quantile(distances[bundle & mask], 0.1)) if np.any(bundle & mask) else None,
+                "d_theta_p50": float(np.quantile(distances[bundle & mask], 0.5)) if np.any(bundle & mask) else None,
+                "d_theta_p90": float(np.quantile(distances[bundle & mask], 0.9)) if np.any(bundle & mask) else None,
+                "fraction_d_theta_le_20": float(np.mean(distances[bundle & mask] <= 20.0)) if np.any(bundle & mask) else None,
+            }
+            for label, mask in groups.items()
+        }
+    n_p_ge_2 = (press >= 2) | (press < 0)
+    gate_fraction = float(np.mean(n_p_ge_2)) if len(press) else None
+    result = {
+        "spec_version": "v1.1", "dataset_id": trans_meta["dataset_id"],
+        "candidate_rule": candidate_rule, "object_change_set_sha256": object_change_hash,
+        "candidate_count": int(len(candidate_pairs)),
+        "distance_checkpoint": str(args.distance_checkpoint),
+        "distance_checkpoint_sha256": distance_meta.get("params_sha256"),
+        "embedding_cache": distance_cache,
+        "by_object_change_and_minimum_press_count": by_bundle,
+        "gate_a": {
+            "n_p_ge_2_count": int(np.count_nonzero(n_p_ge_2)),
+            "candidate_count": int(len(candidate_pairs)),
+            "fraction": gate_fraction, "maximum_fraction": 0.01,
+            "passed": bool(gate_fraction is not None and gate_fraction <= 0.01),
+        },
+    }
+    return result
+
+
 def _np_group_masks(press_counts: np.ndarray) -> dict[str, np.ndarray]:
     finite = press_counts >= 0
     return {
@@ -714,9 +810,14 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         if mode == "distance":
-            result = _candidate_distance_audit(
-                args, trans, trans_meta, sim_state, boards,
-            )
+            if args.reference_checkpoint is not None:
+                result = _candidate_distance_audit(args, trans, trans_meta, sim_state, boards)
+            else:
+                with np.load(args.candidate_cache, allow_pickle=False) as cache:
+                    is_object_cache = "object_change_set_sha256" in cache.files
+                if not is_object_cache:
+                    raise SystemExit("a reference checkpoint is required for legacy candidate caches")
+                result = _object_change_candidate_audit(args, trans, trans_meta, sim_state, boards)
             args.out.parent.mkdir(parents=True, exist_ok=True)
             args.out.write_text(
                 json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n",

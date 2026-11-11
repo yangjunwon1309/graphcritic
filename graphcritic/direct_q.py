@@ -611,6 +611,16 @@ def load_direct_q_scorer(config_path: str | Path):
     anchor_mode = str(cfg.get("anchor_mode", "same_object"))
     if cfg.get("spec_version") == "v1.0" and anchor_mode != "dplus":
         raise ValueError("v1.0 direct-Q config must use dplus anchors")
+    if cfg.get("spec_version") == "v1.1":
+        if anchor_mode != "same_object" or graph.meta.get("target_provenance", {}).get("kind") != "learned":
+            raise ValueError("v1.1 direct-Q requires same_object anchors on a learned graph")
+        bridge_meta = graph.meta.get("bridge_model_metadata", {})
+        if bridge_meta.get("params_sha256") != cfg["state_checkpoint_sha256"]:
+            raise ValueError("v1.1 graph judge and same_object anchor checkpoints differ")
+        if not str(graph.meta.get("candidate_rule", "")).startswith(
+            "cross_episode_observed_object_change_v1_"
+        ):
+            raise ValueError("v1.1 same_object anchors require the observed object-change graph")
     if cfg.get("spec_version") == "v1.0":
         if state_meta.get("spec_version") != "v1.0" or state_meta.get("match_constraint") != "object":
             raise ValueError("v1.0 direct-Q anchors require the trained dplus checkpoint")

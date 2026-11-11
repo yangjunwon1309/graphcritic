@@ -355,15 +355,26 @@ class GraphConfig:
 class TargetConfig:
     h: int
     unit: Literal["steps", "nats"] = "steps"
-    kind: Literal["cost", "regret"] = "regret"
+    kind: Literal["cost", "regret", "discounted"] = "regret"
     regret_max: float = 50.0
+    discount_gamma: float | None = None
 
     def __post_init__(self) -> None:
         _positive_int("h", self.h)
         if self.unit not in {"steps", "nats"}:
             raise SchemaError("unit must be 'steps' or 'nats'")
-        if self.kind not in {"cost", "regret"}:
-            raise SchemaError("kind must be 'cost' or 'regret'")
+        if self.kind not in {"cost", "regret", "discounted"}:
+            raise SchemaError("kind must be 'cost', 'regret', or 'discounted'")
+        if self.kind == "discounted":
+            if self.unit != "steps":
+                raise SchemaError("discounted targets are defined in steps units")
+            if (not isinstance(self.discount_gamma, (int, float))
+                    or isinstance(self.discount_gamma, bool)
+                    or not math.isfinite(self.discount_gamma)
+                    or not 0.0 < self.discount_gamma < 1.0):
+                raise SchemaError("discounted targets require discount_gamma in (0,1)")
+        elif self.discount_gamma is not None:
+            raise SchemaError("discount_gamma is only valid for discounted targets")
         if (not isinstance(self.regret_max, (int, float)) or not math.isfinite(self.regret_max)
                 or self.regret_max <= 0):
             raise SchemaError("regret_max must be finite and positive")
@@ -372,7 +383,7 @@ class TargetConfig:
     def from_dict(cls, value: Mapping[str, Any]) -> TargetConfig:
         if not isinstance(value, Mapping):
             raise SchemaError("TargetConfig data must be a mapping")
-        unknown = set(value) - {"h", "unit", "kind", "regret_max"}
+        unknown = set(value) - {"h", "unit", "kind", "regret_max", "discount_gamma"}
         if unknown:
             raise SchemaError(f"unknown TargetConfig fields: {sorted(unknown)}")
         try:

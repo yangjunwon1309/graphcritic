@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
+import gc
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -16,6 +18,7 @@ if str(ROOT) not in sys.path:
 import numpy as np
 
 from graphcritic.bridges.models import prepare_puzzle_model_data
+from graphcritic.bridges.object_state import load_or_build_object_pair_index
 from graphcritic.bridges.windows import puzzle_state_windows
 from graphcritic.io import load_sim_state, load_transitions
 from experiments.v08_runtime import (
@@ -30,6 +33,8 @@ from experiments.v08_runtime import (
     load_quasimetric_checkpoint,
     make_activation_diagnostic_fn,
     make_distance_predictor,
+    make_embedding_cache_predictor,
+    make_object_consistency_train_step,
     make_quasimetric_model,
     make_train_step,
     next_state_indices,
@@ -210,7 +215,165 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--collapse-min-var", type=float, default=1e-6)
     parser.add_argument("--init-from", type=Path)
     parser.add_argument("--resume-from", type=Path)
+    parser.add_argument("--match-constraint", choices=("none", "object"), default="none")
+    parser.add_argument("--candidate-cache", type=Path)
+    parser.add_argument("--reference-checkpoint", type=Path)
+    parser.add_argument("--epsilon-match", type=float, default=1.25)
+    parser.add_argument("--unmatched-max-frac", type=float, default=0.5)
     return parser.parse_args(argv)
+
+
+def _state_episode_ids(trans) -> np.ndarray:
+    terminal_rows = np.flatnonzero(trans.terminal)
+    return np.concatenate((trans.episode_id, trans.episode_id[terminal_rows])).astype(np.int64)
+
+
+def _load_object_pairs(candidate_cache: Path, dataset_id: str, data, trans):
+    """Load cached object-match indexes and split both endpoints by episode."""
+    pairs, matched_idx, unmatched_idx, index_path, cache_hit = load_or_build_object_pair_index(
+        candidate_cache, data.state_bits, dataset_id=dataset_id,
+    )
+    episodes = _state_episode_ids(trans)
+    pair_eps = episodes[pairs]
+    if np.any(pair_eps[:, 0] == pair_eps[:, 1]):
+        raise ValueError("object-match training requires cross-episode candidate pairs")
+    train_only = np.isin(pair_eps[:, 0], data.train_episodes) & np.isin(
+        pair_eps[:, 1], data.train_episodes
+    )
+    heldout_only = np.isin(pair_eps[:, 0], data.heldout_episodes) & np.isin(
+        pair_eps[:, 1], data.heldout_episodes
+    )
+    train_matched_idx = matched_idx[train_only[matched_idx]]
+    train_unmatched_idx = unmatched_idx[train_only[unmatched_idx]]
+    heldout_matched_idx = matched_idx[heldout_only[matched_idx]]
+    heldout_unmatched_idx = unmatched_idx[heldout_only[unmatched_idx]]
+    if not len(train_matched_idx) or not len(train_unmatched_idx):
+        raise ValueError("training episode split needs both matched and unmatched candidate pairs")
+    return {
+        "pairs": pairs,
+        "train_matched": pairs[train_matched_idx],
+        "train_unmatched": pairs[train_unmatched_idx],
+        "heldout_matched": pairs[heldout_matched_idx],
+        "heldout_unmatched": pairs[heldout_unmatched_idx],
+        "index_path": index_path,
+        "cache_hit": cache_hit,
+        "candidate_pair_count": int(len(pairs)),
+        "matched_pair_count": int(len(matched_idx)),
+        "unmatched_pair_count": int(len(unmatched_idx)),
+        "train_matched_count": int(len(train_matched_idx)),
+        "train_unmatched_count": int(len(train_unmatched_idx)),
+        "heldout_matched_count": int(len(heldout_matched_idx)),
+        "heldout_unmatched_count": int(len(heldout_unmatched_idx)),
+    }
+
+
+def _reference_match_distances(
+    checkpoint: Path,
+    *,
+    dataset_id: str,
+    state_features: np.ndarray,
+    candidate_nodes: np.ndarray,
+    train_pairs: np.ndarray,
+    heldout_pairs: np.ndarray,
+    expected_state_mean: np.ndarray,
+    expected_state_std: np.ndarray,
+    output_dir: Path,
+):
+    """Precompute directed d_R caps for train and held-out matched pairs."""
+    model, params, metadata = load_quasimetric_checkpoint(
+        checkpoint, input_dim=state_features.shape[1], expected_dataset_id=dataset_id,
+    )
+    if int(metadata.get("window", -1)) != 5 or int(metadata.get("constraint_horizon", -1)) != 5:
+        raise ValueError("reference checkpoint must be the fixed v0.8 window-5, horizon-5 model")
+    if int(metadata.get("data_split_seed", metadata.get("split_seed", -1))) != 0:
+        raise ValueError("reference checkpoint must use the prescribed seed-0 episode split")
+    reference_mean = metadata.get("state_mean")
+    reference_std = metadata.get("state_std")
+    if reference_mean is None or reference_std is None:
+        raise ValueError("reference checkpoint is missing state normalization metadata")
+    if (not np.allclose(np.asarray(reference_mean), expected_state_mean, atol=1e-10, rtol=0)
+            or not np.allclose(np.asarray(reference_std), expected_state_std, atol=1e-10, rtol=0)):
+        raise ValueError("reference checkpoint normalization does not match the prepared puzzle data")
+    checkpoint_bytes = (checkpoint / "params.msgpack").read_bytes()
+    reference_sha = hashlib.sha256(checkpoint_bytes).hexdigest()
+    if reference_sha != metadata.get("params_sha256"):
+        raise ValueError("reference checkpoint params SHA256 does not match metadata")
+    cache_path = output_dir / "reference_embeddings" / (
+        f"embeddings-{reference_sha[:16]}-{hashlib.sha256(candidate_nodes.tobytes()).hexdigest()[:16]}.npy"
+    )
+    predict, report = make_embedding_cache_predictor(
+        model, params, state_features[candidate_nodes], candidate_nodes,
+        params_sha256=reference_sha, dataset_id=dataset_id,
+        cache_path=cache_path, pair_batch_size=4096,
+    )
+
+    def both_directions(pairs):
+        if not len(pairs):
+            empty = np.empty(0, dtype=np.float32)
+            return empty, empty
+        return predict(pairs), predict(pairs[:, ::-1])
+
+    train_forward, train_reverse = both_directions(train_pairs)
+    heldout_forward, heldout_reverse = both_directions(heldout_pairs)
+    del predict, params, model
+    gc.collect()
+    try:
+        import jax
+        jax.clear_caches()
+    except Exception:  # pragma: no cover - runtime cleanup is best effort
+        pass
+    return (train_forward, train_reverse, heldout_forward, heldout_reverse,
+            reference_sha, report)
+
+
+def _heldout_object_match_metrics(predict, states, pairs, reference_forward,
+                                 reference_reverse, *, epsilon_match: float,
+                                 batch_size: int) -> dict:
+    """Measure P2 in both directions on held-out cross-episode pairs."""
+    if not len(pairs):
+        return {
+            "pair_count": 0,
+            "directed_pair_count": 0,
+            "violation_rate": None,
+            "distance_p50": None,
+            "reference_distance_p50": None,
+        }
+    directed_source = np.concatenate((pairs[:, 0], pairs[:, 1]))
+    directed_target = np.concatenate((pairs[:, 1], pairs[:, 0]))
+    reference = np.concatenate((reference_forward, reference_reverse))
+    distance = _batched_distances(
+        predict, states[directed_source], states[directed_target], batch_size
+    )
+    return {
+        "pair_count": int(len(pairs)),
+        "directed_pair_count": int(len(distance)),
+        "epsilon_match": float(epsilon_match),
+        "violation_rate": float(np.mean(distance > reference + epsilon_match)),
+        "distance_p50": float(np.median(distance)),
+        "reference_distance_p50": float(np.median(reference)),
+    }
+
+
+def _heldout_unmatched_metrics(predict, states, pairs, *, batch_size: int) -> dict:
+    """Report d+ scale and false-accept rate on held-out object-mismatched pairs."""
+    if not len(pairs):
+        return {
+            "pair_count": 0,
+            "d_plus_p10": None,
+            "d_plus_p50": None,
+            "d_plus_p90": None,
+            "fraction_d_plus_le_20": None,
+        }
+    distances = _batched_distances(
+        predict, states[pairs[:, 0]], states[pairs[:, 1]], batch_size
+    )
+    return {
+        "pair_count": int(len(distances)),
+        "d_plus_p10": float(np.quantile(distances, 0.1)),
+        "d_plus_p50": float(np.quantile(distances, 0.5)),
+        "d_plus_p90": float(np.quantile(distances, 0.9)),
+        "fraction_d_plus_le_20": float(np.mean(distances <= 20.0)),
+    }
 
 
 def _source_architecture(metadata: dict) -> dict:
@@ -304,8 +467,20 @@ def _validate_resume_metadata(metadata: dict, *, args, dual_lr: float) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    object_mode = args.match_constraint == "object"
     if args.resume_from is not None and args.init_from is not None:
         raise SystemExit("choose at most one of --resume-from and --init-from")
+    if object_mode:
+        if args.candidate_cache is None or args.reference_checkpoint is None:
+            raise SystemExit("--match-constraint object requires --candidate-cache and --reference-checkpoint")
+        if args.resume_from is not None or args.init_from is not None:
+            raise SystemExit("object-match v1.0 training must initialize from scratch")
+        if args.window != 5 or args.constraint_horizon != 5 or args.dual != "adam":
+            raise SystemExit("object-match v1.0 fixes window=5, horizon=5, and Adam duals")
+        if not 0.0 < args.unmatched_max_frac <= 0.5 or args.epsilon_match < 0:
+            raise SystemExit("unmatched-max-frac must be in (0,0.5] and epsilon-match non-negative")
+    elif args.candidate_cache is not None or args.reference_checkpoint is not None:
+        raise SystemExit("--candidate-cache and --reference-checkpoint require --match-constraint object")
     dual_lr = args.dual_lr if args.dual_lr is not None else (0.01 if args.dual == "adam" else 1.0)
     if min(args.steps, args.save_every, args.batch_size,
            args.eval_batch_size, args.triangles, args.log_every) <= 0:
@@ -342,6 +517,31 @@ def main(argv: list[str] | None = None) -> int:
     if not len(train_rows_np) or not len(data.heldout_rows):
         raise ValueError("episode split must contain training and held-out transitions")
 
+    object_pairs = None
+    train_match_reference_forward = train_match_reference_reverse = None
+    heldout_match_reference_forward = heldout_match_reference_reverse = None
+    reference_sha = None
+    reference_cache_report = None
+    candidate_nodes = None
+    if object_mode:
+        object_pairs = _load_object_pairs(
+            args.candidate_cache, transition_meta["dataset_id"], data, trans,
+        )
+        with np.load(args.candidate_cache, allow_pickle=False) as candidate_archive:
+            candidate_nodes = np.asarray(candidate_archive["node_ids"], dtype=np.int64)
+        (train_match_reference_forward, train_match_reference_reverse,
+         heldout_match_reference_forward, heldout_match_reference_reverse,
+         reference_sha, reference_cache_report) = _reference_match_distances(
+            args.reference_checkpoint,
+            dataset_id=transition_meta["dataset_id"], state_features=states_np,
+            candidate_nodes=candidate_nodes,
+            train_pairs=object_pairs["train_matched"],
+            heldout_pairs=object_pairs["heldout_matched"],
+            expected_state_mean=data.state_mean,
+            expected_state_std=data.state_std,
+            output_dir=args.out,
+        )
+
     model = make_quasimetric_model(
         encoder_widths=tuple(args.encoder_widths),
         projector_widths=tuple(args.projector_widths),
@@ -350,16 +550,34 @@ def main(argv: list[str] | None = None) -> int:
         activation=args.activation,
         layernorm=args.layernorm,
     )
-    train_update, primal_optimizer, dual_optimizer = make_train_step(
-        model, batch_size=args.batch_size, epsilon=args.epsilon,
-        learning_rate=5e-4, lambda_learning_rate=dual_lr,
-        grad_clip=args.grad_clip, dual=args.dual,
-        constraint_horizon=args.constraint_horizon,
-    )
+    if object_mode:
+        train_update, primal_optimizer, dual_optimizer = make_object_consistency_train_step(
+            model, batch_size=args.batch_size, epsilon_chunk=args.epsilon,
+            epsilon_match=args.epsilon_match,
+            unmatched_max_frac=args.unmatched_max_frac,
+            learning_rate=5e-4, lambda_learning_rate=dual_lr,
+            grad_clip=args.grad_clip, constraint_horizon=args.constraint_horizon,
+        )
+    else:
+        train_update, primal_optimizer, dual_optimizer = make_train_step(
+            model, batch_size=args.batch_size, epsilon=args.epsilon,
+            learning_rate=5e-4, lambda_learning_rate=dual_lr,
+            grad_clip=args.grad_clip, dual=args.dual,
+            constraint_horizon=args.constraint_horizon,
+        )
     params, primal_state, raw_lambda, dual_state, key = initialize_train_state(
         model, seed=args.seed, input_dim=states_np.shape[1],
         primal_optimizer=primal_optimizer, dual_optimizer=dual_optimizer,
     )
+    if object_mode:
+        raw_lambda_match = jnp.asarray(_inverse_softplus(0.01, jnp), dtype=jnp.float32)
+        dual_state_match = dual_optimizer.init(raw_lambda_match)
+        train_match_pairs_jax = jnp.asarray(object_pairs["train_matched"], dtype=jnp.int32)
+        train_match_forward_jax = jnp.asarray(train_match_reference_forward, dtype=jnp.float32)
+        train_match_reverse_jax = jnp.asarray(train_match_reference_reverse, dtype=jnp.float32)
+        train_unmatched_pairs_jax = jnp.asarray(object_pairs["train_unmatched"], dtype=jnp.int32)
+        heldout_match_pairs = object_pairs["heldout_matched"]
+        heldout_unmatched_pairs = object_pairs["heldout_unmatched"]
     start_step = 0
     init_from_step = None
     if args.resume_from is not None:
@@ -411,7 +629,7 @@ def main(argv: list[str] | None = None) -> int:
     git_meta = provenance(ROOT)
     common_meta = {
         **git_meta,
-        "spec_version": "v0.8",
+        "spec_version": "v1.0" if object_mode else "v0.8",
         "dataset_id": transition_meta["dataset_id"],
         "input_dim": int(states_np.shape[1]),
         "frame_dim": int(frame_states_np.shape[1]),
@@ -461,9 +679,32 @@ def main(argv: list[str] | None = None) -> int:
         "epsilon_z": data.epsilon_z.tolist(),
         "device_backend": jax.default_backend(),
     }
+    if object_mode:
+        common_meta.update({
+            "match_constraint": "object",
+            "candidate_cache": str(args.candidate_cache.resolve()),
+            "candidate_pair_index_cache": str(object_pairs["index_path"].resolve()),
+            "candidate_pair_index_cache_hit": bool(object_pairs["cache_hit"]),
+            "candidate_pair_count": object_pairs["candidate_pair_count"],
+            "matched_pair_count": object_pairs["matched_pair_count"],
+            "unmatched_pair_count": object_pairs["unmatched_pair_count"],
+            "train_matched_pair_count": object_pairs["train_matched_count"],
+            "train_unmatched_pair_count": object_pairs["train_unmatched_count"],
+            "heldout_matched_pair_count": object_pairs["heldout_matched_count"],
+            "reference_checkpoint": str(args.reference_checkpoint.resolve()),
+            "reference_checkpoint_sha256": reference_sha,
+            "reference_embedding_cache": reference_cache_report,
+            "epsilon_match": float(args.epsilon_match),
+            "unmatched_max_frac": float(args.unmatched_max_frac),
+            "maximization_batch_size": int(args.batch_size),
+            "maximization_random_count": int(round(args.batch_size * (1 - args.unmatched_max_frac))),
+            "maximization_unmatched_count": int(round(args.batch_size * args.unmatched_max_frac)),
+            "lambda_chunk_start_value": 0.01,
+            "lambda_match_start_value": 0.01,
+        })
     (args.out / "data.json").write_text(
         json.dumps({**data.metadata, **git_meta, "dataset_id": transition_meta["dataset_id"],
-                    "spec_version": "v0.8"}, indent=2, sort_keys=True) + "\n",
+                    "spec_version": "v1.0" if object_mode else "v0.8"}, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
 
@@ -472,6 +713,10 @@ def main(argv: list[str] | None = None) -> int:
     constraint_next_indices = jnp.asarray(constraint_next_index, dtype=jnp.int32)
     train_rows = jnp.asarray(train_rows_np, dtype=jnp.int32)
     constraint_rows = jnp.asarray(constraint_rows_np, dtype=jnp.int32)
+    if object_mode:
+        object_train_rows = jnp.asarray(train_rows_np, dtype=jnp.int32)
+        object_chunk_rows = jnp.asarray(constraint_rows_np, dtype=jnp.int32)
+        object_chunk_targets = jnp.asarray(constraint_targets_np, dtype=jnp.int32)
     diag_rng = np.random.default_rng(args.seed + 0x51A7)
     diag_rows = diag_rng.choice(
         data.heldout_rows, size=4096,
@@ -490,11 +735,23 @@ def main(argv: list[str] | None = None) -> int:
     ) as train_hist:
         for step in range(start_step + 1, end_step + 1):
             run_step = step - start_step
-            params, primal_state, raw_lambda, dual_state, key, metrics = train_update(
-                params, primal_state, raw_lambda, dual_state, key,
-                states, next_indices, train_rows, constraint_rows,
-                constraint_next_indices,
-            )
+            gate_failure = None
+            if object_mode:
+                (params, primal_state, raw_lambda, dual_state,
+                 raw_lambda_match, dual_state_match, key, metrics) = train_update(
+                    params, primal_state, raw_lambda, dual_state,
+                    raw_lambda_match, dual_state_match, key,
+                    states, next_indices, object_train_rows,
+                    object_chunk_rows, object_chunk_targets,
+                    train_match_pairs_jax, train_match_forward_jax,
+                    train_match_reverse_jax, train_unmatched_pairs_jax,
+                )
+            else:
+                params, primal_state, raw_lambda, dual_state, key, metrics = train_update(
+                    params, primal_state, raw_lambda, dual_state, key,
+                    states, next_indices, train_rows, constraint_rows,
+                    constraint_next_indices,
+                )
             train_values = {
                 key: float(jax.device_get(value))
                 for key, value in metrics.items()
@@ -512,6 +769,9 @@ def main(argv: list[str] | None = None) -> int:
                     dead_fraction_limit=args.collapse_dead_frac,
                     min_projector_variance=args.collapse_min_var,
                 )
+                if (object_mode and run_step == args.steps and not alarm
+                        and any(value != 0.0 for value in diagnostics["dead_unit_frac_by_layer"].values())):
+                    gate_failure = "v1.0 S1 gate requires zero dead units"
                 train_row = {
                     "step": int(step),
                     "run_step": int(run_step),
@@ -536,6 +796,11 @@ def main(argv: list[str] | None = None) -> int:
                     "key": key,
                     "step": np.asarray(step, dtype=np.int32),
                 }
+                if object_mode:
+                    state_payload.update({
+                        "raw_lambda_match": raw_lambda_match,
+                        "dual_state_match": dual_state_match,
+                    })
                 meta = {
                     **common_meta,
                     "step": int(step),
@@ -544,6 +809,18 @@ def main(argv: list[str] | None = None) -> int:
                     )),
                     "collapse_alarm_reason": alarm_reason,
                 }
+                if object_mode:
+                    meta.update({
+                        "lambda_chunk": float(jax.device_get(
+                            _dual_value(raw_lambda, dual=args.dual, jax=jax)
+                        )),
+                        "lambda_match": float(jax.device_get(
+                            jax.nn.softplus(raw_lambda_match)
+                        )),
+                        "lambda_value": float(jax.device_get(
+                            _dual_value(raw_lambda, dual=args.dual, jax=jax)
+                        )),
+                    })
                 save_quasimetric_checkpoint(
                     checkpoint, params, meta, train_state=state_payload
                 )
@@ -558,6 +835,17 @@ def main(argv: list[str] | None = None) -> int:
                     eval_batch_size=args.eval_batch_size,
                     constraint_horizon=args.constraint_horizon, epsilon=args.epsilon,
                 )
+                if object_mode:
+                    report["heldout_object_match_constraint"] = _heldout_object_match_metrics(
+                        predictor, states_np, object_pairs["heldout_matched"],
+                        heldout_match_reference_forward, heldout_match_reference_reverse,
+                        epsilon_match=args.epsilon_match,
+                        batch_size=args.eval_batch_size,
+                    )
+                    report["heldout_unmatched_object_pairs"] = _heldout_unmatched_metrics(
+                        predictor, states_np, heldout_unmatched_pairs,
+                        batch_size=args.eval_batch_size,
+                    )
                 row = {
                     **report,
                     "run_step": int(run_step),
@@ -575,6 +863,9 @@ def main(argv: list[str] | None = None) -> int:
                     f"checkpoint saved to {checkpoint}", file=sys.stderr, flush=True,
                 )
                 return 3
+            if gate_failure is not None:
+                print(f"training gate failed at step {step}: {gate_failure}", file=sys.stderr, flush=True)
+                return 4
     return 0
 
 

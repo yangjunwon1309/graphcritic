@@ -345,7 +345,7 @@ def _target_arrays(targets: TargetSet) -> dict[str, NDArray[Any]]:
 
 
 def _target_config(targets: TargetSet) -> dict[str, Any]:
-    return {
+    config = {
         "dataset_id": targets.dataset_id,
         "graph_hash": targets.graph_hash,
         "h": targets.h,
@@ -353,6 +353,9 @@ def _target_config(targets: TargetSet) -> dict[str, Any]:
         "kind": targets.kind,
         "regret_max": targets.regret_max,
     }
+    if targets.kind == "discounted":
+        config["gamma"] = float(targets.discount_gamma)
+    return config
 
 
 def save_targets(
@@ -424,6 +427,7 @@ def load_targets(
         kind=config.get("kind", "cost"),
         loss_mask=arrays.get("loss_mask", arrays["valid"]),
         regret_max=config.get("regret_max", 50.0),
+        discount_gamma=config.get("gamma"),
     )
     source_path = _pair_paths(path)[0].with_name(f"{_pair_paths(path)[0].stem}_source.npy")
     if source_path.is_file():

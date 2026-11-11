@@ -8,6 +8,10 @@ velocity remains an input feature but is excluded from label generation.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
+import os
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -18,6 +22,134 @@ from graphcritic.featurize import state_table
 from graphcritic.puzzle import toggle_matrix
 from graphcritic.state_schema import OGBenchPuzzleStateSchema
 from graphcritic.types import SchemaError, SimStateSet, TransitionSet
+
+
+def object_match(x: np.ndarray, y: np.ndarray, *, epsilon: float | np.ndarray | None = None) -> np.ndarray | bool:
+    """Return whether two object states match.
+
+    Puzzle button states use exact equality.  Continuous object features may
+    pass a scalar or componentwise measurement tolerance; this keeps the
+    object-match decision in one shared location for future task adapters.
+    Leading dimensions are broadcast according to NumPy rules and the final
+    feature axis is reduced.
+    """
+    left = np.asarray(x)
+    right = np.asarray(y)
+    if left.ndim == 0 or right.ndim == 0 or left.shape[-1] != right.shape[-1]:
+        raise SchemaError("object states must have matching non-empty feature axes")
+    if epsilon is None:
+        result = np.all(left == right, axis=-1)
+    else:
+        tolerance = np.asarray(epsilon, dtype=np.float64)
+        if np.any(~np.isfinite(tolerance)) or np.any(tolerance < 0):
+            raise SchemaError("object match tolerance must be finite and non-negative")
+        result = np.all(np.abs(left.astype(np.float64) - right.astype(np.float64)) <= tolerance, axis=-1)
+    return bool(result) if np.ndim(result) == 0 else result
+
+
+def _object_pair_cache_hash(array: np.ndarray) -> str:
+    value = np.ascontiguousarray(array)
+    digest = hashlib.sha256()
+    digest.update(value.dtype.str.encode("ascii"))
+    digest.update(np.asarray(value.shape, dtype="<i8").tobytes())
+    digest.update(memoryview(value).cast("B"))
+    return digest.hexdigest()
+
+
+def load_or_build_object_pair_index(
+    candidate_cache: str | Path,
+    object_states: np.ndarray,
+    *,
+    dataset_id: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, Path, bool]:
+    """Classify candidate-cache pairs by exact object state, caching row indices.
+
+    Returns ``(pairs, matched_indices, unmatched_indices, index_path, hit)``.
+    Cached indices are keyed by both the exact pair array and object-state
+    table, so stale partitions are never reused after either input changes.
+    """
+    source = Path(candidate_cache)
+    try:
+        with np.load(source, allow_pickle=False) as archive:
+            required = {"pairs", "dataset_id", "window"}
+            if not required.issubset(archive.files):
+                raise SchemaError("candidate cache must include pairs, dataset_id, and window")
+            if str(archive["dataset_id"].item()) != str(dataset_id):
+                raise SchemaError("candidate cache dataset ID does not match training data")
+            if int(archive["window"].item()) != 5:
+                raise SchemaError("object-match constraint requires the window-5 candidate cache")
+            if "k" in archive.files and int(archive["k"].item()) != 32:
+                raise SchemaError("object-match constraint requires the candidate cache with k=32")
+            pairs = np.asarray(archive["pairs"], dtype=np.int32)
+            candidate_nodes = (
+                np.asarray(archive["node_ids"], dtype=np.int64)
+                if "node_ids" in archive.files else None
+            )
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, SchemaError):
+            raise
+        raise SchemaError(f"cannot read candidate pair cache at {source}") from exc
+    states = np.asarray(object_states)
+    if states.ndim != 2 or states.shape[1] == 0:
+        raise SchemaError("object state table must be a non-empty matrix")
+    if pairs.ndim != 2 or pairs.shape[1] != 2:
+        raise SchemaError("candidate cache pairs must have shape (N,2)")
+    if pairs.size and (np.any(pairs < 0) or np.any(pairs >= len(states))):
+        raise SchemaError("candidate cache pair references an unknown object state")
+    if candidate_nodes is not None:
+        if (candidate_nodes.ndim != 1 or np.any(candidate_nodes < 0)
+                or np.any(candidate_nodes >= len(states))
+                or (len(candidate_nodes) > 1 and np.any(candidate_nodes[1:] <= candidate_nodes[:-1]))):
+            raise SchemaError("candidate cache node_ids must be sorted, unique, valid state IDs")
+        if pairs.size:
+            source_local = np.searchsorted(candidate_nodes, pairs[:, 0])
+            destination_local = np.searchsorted(candidate_nodes, pairs[:, 1])
+            if (np.any(source_local >= len(candidate_nodes))
+                    or np.any(destination_local >= len(candidate_nodes))
+                    or np.any(candidate_nodes[source_local] != pairs[:, 0])
+                    or np.any(candidate_nodes[destination_local] != pairs[:, 1])):
+                raise SchemaError("candidate pair endpoints must belong to candidate node_ids")
+    pairs = np.ascontiguousarray(pairs, dtype=np.int32)
+    key = {
+        "schema": "object-pair-index-v1",
+        "dataset_id": str(dataset_id),
+        "pairs_sha256": _object_pair_cache_hash(pairs),
+        "object_states_sha256": _object_pair_cache_hash(states),
+        "n_pairs": int(len(pairs)),
+    }
+    index_path = source.with_name(source.stem + ".object_match_indices.npz")
+    if index_path.is_file():
+        try:
+            with np.load(index_path, allow_pickle=False) as archive:
+                saved_key = json.loads(str(archive["cache_key"].item()))
+                matched = np.asarray(archive["matched_indices"], dtype=np.int64)
+                unmatched = np.asarray(archive["unmatched_indices"], dtype=np.int64)
+            all_indices = np.concatenate((matched, unmatched))
+            if (saved_key == key and np.all(matched < len(pairs))
+                    and np.all(unmatched < len(pairs))
+                    and len(all_indices) == len(pairs)
+                    and np.array_equal(np.sort(all_indices), np.arange(len(pairs)))):
+                return pairs, matched, unmatched, index_path, True
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            pass
+    matches = np.empty(len(pairs), dtype=np.bool_)
+    pair_chunk = 1_000_000
+    for start in range(0, len(pairs), pair_chunk):
+        end = min(start + pair_chunk, len(pairs))
+        matches[start:end] = object_match(
+            states[pairs[start:end, 0]], states[pairs[start:end, 1]],
+        )
+    matched = np.flatnonzero(matches).astype(np.int64)
+    unmatched = np.flatnonzero(~matches).astype(np.int64)
+    temporary = index_path.with_name(index_path.name + ".tmp.npz")
+    np.savez_compressed(
+        temporary,
+        cache_key=np.asarray(json.dumps(key, sort_keys=True)),
+        matched_indices=matched.astype(np.int32),
+        unmatched_indices=unmatched.astype(np.int32),
+    )
+    os.replace(temporary, index_path)
+    return pairs, matched, unmatched, index_path, False
 
 
 @dataclass(frozen=True)

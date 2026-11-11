@@ -69,6 +69,21 @@ def critic_targets(
             source[:n_starts][graph_used & valid[:n_starts]] = 1
             source[:n_starts][capped] = 2
             loss_mask[:n_starts] = valid[:n_starts]
+        elif cfg.kind == "discounted":
+            gamma_discounted = float(cfg.discount_gamma)
+            horizon_to_goal = float(h) + end_cost
+            values = (1.0 - np.power(gamma_discounted, horizon_to_goal)) / (1.0 - gamma_discounted)
+            values[~end_reachable] = 1.0 / (1.0 - gamma_discounted)
+            success_steps = first_success.astype(np.float64) + 1.0
+            values[has_success] = (
+                1.0 - np.power(gamma_discounted, success_steps[has_success])
+            ) / (1.0 - gamma_discounted)
+            values[trans.success_cur[:n_starts]] = 0.0
+            capped = valid[:n_starts] & ~chunk_success & ~end_finite
+            source[:n_starts][valid[:n_starts] & chunk_success] = 0
+            source[:n_starts][valid[:n_starts] & ~chunk_success & end_finite] = 1
+            source[:n_starts][capped] = 2
+            loss_mask[:n_starts] = valid[:n_starts]
         else:
             # A temporal path of h edges from the chunk start to endpoint
             # makes C(start) <= h + C(end). An unreachable start behind a
@@ -136,6 +151,7 @@ def critic_targets(
         kind=cfg.kind,
         loss_mask=loss_mask,
         regret_max=cfg.regret_max,
+        discount_gamma=cfg.discount_gamma,
     )
     targets.validate(trans)
     return targets

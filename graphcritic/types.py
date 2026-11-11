@@ -690,6 +690,7 @@ class TargetSet:
     kind: str = "cost"
     loss_mask: NDArray[np.bool_] | None = None
     regret_max: float = 50.0
+    discount_gamma: float | None = None
 
     def __post_init__(self) -> None:
         self.y = _array(self.y, np.float32, "y")
@@ -727,10 +728,23 @@ class TargetSet:
             raise SchemaError("source code 4 (both endpoints capped) must have loss_mask=0")
         if np.any(self.y[self.source == 4] != 0):
             raise SchemaError("source code 4 (both endpoints capped) must use the zero placeholder target")
-        if self.kind not in {"cost", "regret"}:
-            raise SchemaError("target kind must be 'cost' or 'regret'")
+        if self.kind not in {"cost", "regret", "discounted"}:
+            raise SchemaError("target kind must be 'cost', 'regret', or 'discounted'")
         if self.kind == "cost" and (np.any(self.source == 4) or not np.array_equal(self.loss_mask, self.valid)):
             raise SchemaError("cost targets cannot contain excluded both-capped rows")
+        if self.kind == "discounted":
+            if self.unit != "steps":
+                raise SchemaError("discounted targets are defined in steps units")
+            if (not isinstance(self.discount_gamma, (int, float))
+                    or isinstance(self.discount_gamma, bool)
+                    or not np.isfinite(self.discount_gamma)
+                    or not 0.0 < self.discount_gamma < 1.0):
+                raise SchemaError("discounted targets require discount_gamma in (0,1)")
+            cap = 1.0 / (1.0 - float(self.discount_gamma))
+            if np.any(self.y[self.loss_mask] > cap + 1e-3):
+                raise SchemaError("discounted targets exceed their geometric-series cap")
+        elif self.discount_gamma is not None:
+            raise SchemaError("discount_gamma is only valid for discounted targets")
         if (not isinstance(self.regret_max, (int, float)) or not np.isfinite(self.regret_max)
                 or self.regret_max <= 0):
             raise SchemaError("regret_max must be finite and positive")

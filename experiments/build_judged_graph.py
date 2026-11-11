@@ -193,9 +193,11 @@ def _parse(argv: list[str] | None = None):
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--candidate-cache", type=Path, required=True)
     parser.add_argument(
-        "--target-kind", choices=("regret", "cost"), default="regret",
+        "--target-kind", choices=("regret", "cost", "discounted"), default="regret",
         help="critic target representation written for the built graph",
     )
+    parser.add_argument("--discount-gamma", type=float, default=0.99,
+                        help="discount factor used only by discounted targets")
     parser.add_argument(
         "--candidate-window", type=int, default=None,
         help="window size used to generate shared candidate pairs (defaults from the quasi checkpoint or cache)",
@@ -355,6 +357,7 @@ def _write_graph_targets(
     diagnostic_oracle_np_max: int | None,
     write_oracle_targets: bool,
     target_kind: str = "regret",
+    discount_gamma: float = 0.99,
 ):
     """Write regular targets or explicitly authorized oracle targets."""
     if diagnostic_oracle_np_max is not None and not write_oracle_targets:
@@ -368,7 +371,10 @@ def _write_graph_targets(
         else {"kind": "learned"}
     )
     targets = critic_targets(
-        trans, artifact, TargetConfig(h=5, unit="steps", kind=target_kind)
+        trans, artifact, TargetConfig(
+            h=5, unit="steps", kind=target_kind,
+            discount_gamma=float(discount_gamma) if target_kind == "discounted" else None,
+        )
     )
     if len(targets.y) != trans.n_rows:
         raise ValueError("graph targets must have one row per transition")
@@ -382,6 +388,14 @@ def _target_summary(
     targets, target_kind: str = "regret"
 ) -> dict[str, float | None]:
     if targets is None:
+        if target_kind == "discounted":
+            return {
+                "h5_discounted_mean": None,
+                "h5_discounted_p50": None,
+                "h5_discounted_p90": None,
+                "h5_discounted_max": None,
+                "h5_discounted_capped_loss_mask_fraction": None,
+            }
         if target_kind == "cost":
             return {
                 "h5_cost_mean": None,
@@ -397,17 +411,18 @@ def _target_summary(
         }
     included = targets.valid & targets.loss_mask
     values = np.asarray(targets.y[included], dtype=np.float64)
-    if targets.kind == "cost":
+    if targets.kind in {"cost", "discounted"}:
+        name = targets.kind
         loss_mask_count = int(np.count_nonzero(targets.loss_mask))
         capped_count = int(np.count_nonzero(
             targets.loss_mask & (np.asarray(targets.source) == 2)
         ))
         return {
-            "h5_cost_mean": float(np.mean(values)) if values.size else None,
-            "h5_cost_p50": float(np.quantile(values, 0.5)) if values.size else None,
-            "h5_cost_p90": float(np.quantile(values, 0.9)) if values.size else None,
-            "h5_cost_max": float(np.max(values)) if values.size else None,
-            "h5_cost_capped_loss_mask_fraction": (
+            f"h5_{name}_mean": float(np.mean(values)) if values.size else None,
+            f"h5_{name}_p50": float(np.quantile(values, 0.5)) if values.size else None,
+            f"h5_{name}_p90": float(np.quantile(values, 0.9)) if values.size else None,
+            f"h5_{name}_max": float(np.max(values)) if values.size else None,
+            f"h5_{name}_capped_loss_mask_fraction": (
                 float(capped_count / loss_mask_count) if loss_mask_count else None
             ),
         }
@@ -425,6 +440,8 @@ def main(argv: list[str] | None = None) -> int:
     if (args.knn != 32 or args.delta != 5.0 or args.judge_batch_size < 1
             or args.embedding_pair_batch_size < 1):
         raise SystemExit("v0.8 fixes k=32 and delta=5; judge-batch-size must be positive")
+    if not 0.0 < args.discount_gamma < 1.0:
+        raise SystemExit("--discount-gamma must be in (0,1)")
     if not 1 <= args.max_chunks <= 4 or args.plan_samples < 1 or args.max_bridge_distance != 20.0:
         raise SystemExit("v0.8 fixes K=20 and at most four flow chunks")
     if not math.isfinite(args.bridge_lambda_steps) or args.bridge_lambda_steps < 0:
@@ -849,6 +866,7 @@ def main(argv: list[str] | None = None) -> int:
         diagnostic_oracle_np_max=args.diagnostic_oracle_np_max,
         write_oracle_targets=args.write_oracle_targets,
         target_kind=args.target_kind,
+        discount_gamma=args.discount_gamma,
     )
     np.savez_compressed(
         args.out / "layered_paths.npz",
@@ -944,6 +962,7 @@ def main(argv: list[str] | None = None) -> int:
         "graph_hash": graph_hash,
         "model_checkpoint": str(args.checkpoint),
         "model_checkpoint_sha256": model_meta.get("params_sha256"),
+        "match_constraint": model_meta.get("match_constraint"),
         "candidate_cache": str(args.candidate_cache),
         "candidate_rule": candidate_rule,
         "window_size": int(candidate_window),
@@ -978,6 +997,8 @@ def main(argv: list[str] | None = None) -> int:
         "bridge_count_fraction": bridge_distribution_fraction,
         "bridge_count_fraction_reachable": bridge_distribution_reachable_fraction,
         "target_kind": args.target_kind,
+        **({"discount_gamma": float(args.discount_gamma)}
+           if args.target_kind == "discounted" else {}),
         f"h5_{args.target_kind}_valid_fraction": (
             float(np.mean(targets.valid)) if targets is not None else None
         ),

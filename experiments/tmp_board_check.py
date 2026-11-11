@@ -21,13 +21,74 @@ import numpy as np
 
 from graphcritic.io import load_graph, load_sim_state, load_transitions
 from graphcritic.modes import state_episode_time
-from graphcritic.bridges.object_state import frame_object_features_from_checkpoint
+from graphcritic.bridges.models import prepare_puzzle_model_data
+from graphcritic.bridges.object_state import (
+    frame_object_features_from_checkpoint,
+    load_or_build_object_pair_index,
+)
+from graphcritic.bridges.windows import puzzle_state_windows, puzzle_window_candidate_nodes
 from graphcritic.puzzle import minimum_press_solution, toggle_matrix
 from graphcritic.types import GraphArtifact, SchemaError, TransitionSet
 
 
 _BOARD_LAYOUTS = {9: (3, 3), 16: (4, 4), 20: (4, 5)}
 _NP_GROUPS = ("0", "1", "2", "3", "≥4", "∞")
+
+
+def _candidate_only_mode(args) -> str:
+    """Validate candidate-only arguments without opening optional checkpoints."""
+    if args.distance_checkpoint is not None:
+        if args.object_event_checkpoint is not None or args.reference_checkpoint is None:
+            raise SystemExit(
+                "--distance-checkpoint requires --reference-checkpoint and excludes --object-event-checkpoint"
+            )
+        return "distance"
+    if args.object_event_checkpoint is None:
+        raise SystemExit("--candidates-only requires --object-event-checkpoint or --distance-checkpoint")
+    return "object_event"
+
+
+def _distance_group_report(press_counts: np.ndarray, dplus: np.ndarray,
+                           dtheta: np.ndarray) -> dict[str, dict[str, Any]]:
+    """Summarize d+ and reference d_theta for the v1.0 press-count bins."""
+    counts = np.asarray(press_counts, dtype=np.int64)
+    plus = np.asarray(dplus, dtype=np.float32)
+    theta = np.asarray(dtheta, dtype=np.float32)
+    if counts.shape != plus.shape or counts.shape != theta.shape:
+        raise ValueError("press counts and distance arrays must align")
+    masks = {
+        "0": counts == 0,
+        "1": counts == 1,
+        "2": counts == 2,
+        "3": counts == 3,
+        "≥4": counts >= 4,
+        "∞": counts < 0,
+    }
+    report = {}
+    for label, mask in masks.items():
+        plus_values = plus[mask]
+        theta_values = theta[mask]
+        report[label] = {
+            "count": int(np.count_nonzero(mask)),
+            "d_plus_p10": float(np.quantile(plus_values, 0.1)) if len(plus_values) else None,
+            "d_plus_p50": float(np.quantile(plus_values, 0.5)) if len(plus_values) else None,
+            "d_plus_p90": float(np.quantile(plus_values, 0.9)) if len(plus_values) else None,
+            "d_theta_p50": float(np.quantile(theta_values, 0.5)) if len(theta_values) else None,
+            "fraction_d_plus_le_20": float(np.mean(plus_values <= 20.0)) if len(plus_values) else None,
+        }
+    return report
+
+
+def _c0_optimistic_mask(pairs: np.ndarray, c0: np.ndarray, *, minimum_gain: float = 10.0) -> np.ndarray:
+    """Match build_judged_graph's finite-destination, C0 gain filter."""
+    pairs = np.asarray(pairs, dtype=np.int64)
+    costs = np.asarray(c0, dtype=np.float64)
+    if pairs.ndim != 2 or pairs.shape[1] != 2:
+        raise ValueError("candidate pairs must have shape (N,2)")
+    if pairs.size and (pairs.min() < 0 or pairs.max() >= len(costs)):
+        raise ValueError("candidate pair node is outside the G0 cost vector")
+    gain = costs[pairs[:, 0]] - costs[pairs[:, 1]]
+    return np.isfinite(costs[pairs[:, 1]]) & (gain >= float(minimum_gain))
 
 
 def _array_sha256(array: np.ndarray) -> str:
@@ -82,6 +143,277 @@ def _minimum_press_count(
     if memo is not None:
         memo[key] = count
     return count
+
+
+def _distance_checkpoint_pairs(
+    checkpoint: Path,
+    *,
+    trans,
+    dataset_id: str,
+    states: np.ndarray,
+    node_ids: np.ndarray,
+    pairs: np.ndarray,
+    cache_dir: Path,
+    label: str,
+) -> tuple[np.ndarray, dict[str, Any], dict[str, Any]]:
+    """Evaluate a saved state quasimetric on cached candidate pairs."""
+    from experiments.v08_runtime import (
+        load_quasimetric_checkpoint,
+        make_embedding_cache_predictor,
+    )
+
+    metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
+    if metadata.get("dataset_id") != dataset_id or int(metadata.get("window", -1)) != 5:
+        raise ValueError(f"{label} checkpoint dataset or window does not match the audit")
+    params_bytes = (checkpoint / "params.msgpack").read_bytes()
+    checkpoint_sha = hashlib.sha256(params_bytes).hexdigest()
+    if checkpoint_sha != metadata.get("params_sha256"):
+        raise ValueError(f"{label} checkpoint parameter hash mismatch")
+    model, params, metadata = load_quasimetric_checkpoint(
+        checkpoint, input_dim=states.shape[1], expected_dataset_id=dataset_id,
+    )
+    cache_path = cache_dir / (
+        f"embeddings-{checkpoint_sha[:16]}-{_array_sha256(node_ids)[:16]}.npy"
+    )
+    predict, cache_report = make_embedding_cache_predictor(
+        model, params, states[node_ids], node_ids,
+        params_sha256=checkpoint_sha, dataset_id=dataset_id,
+        cache_path=cache_path, pair_batch_size=4096,
+    )
+    distances = predict(pairs)
+    del predict, params, model
+    try:
+        import gc
+        import jax
+        gc.collect()
+        jax.clear_caches()
+    except Exception:  # pragma: no cover - best-effort accelerator cleanup
+        pass
+    return distances, metadata, cache_report
+
+
+def _candidate_distance_audit(args, trans, trans_meta, sim_state, boards) -> dict[str, Any]:
+    """Run the v1.0 full-candidate P2/P3 distance audit."""
+    if args.reference_checkpoint is None:
+        raise SystemExit("--distance-checkpoint requires --reference-checkpoint")
+    if args.object_event_checkpoint is not None:
+        raise SystemExit("choose --distance-checkpoint or --object-event-checkpoint, not both")
+    with np.load(args.candidate_cache, allow_pickle=False) as archive:
+        candidate_pairs = np.asarray(archive["pairs"], dtype=np.int64)
+        candidate_nodes = np.asarray(archive["node_ids"], dtype=np.int64)
+        if str(archive["dataset_id"].item()) != trans_meta["dataset_id"]:
+            raise SchemaError("candidate cache dataset ID does not match the audit transitions")
+        if int(archive["window"].item()) != 5 or int(archive["k"].item()) != 32:
+            raise SchemaError("distance audit requires the v0.8 window-5, k=32 candidate cache")
+    model_data = prepare_puzzle_model_data(trans, sim_state, seed=0)
+    frame = np.concatenate((model_data.state_cont, model_data.state_bits), axis=1).astype(np.float32)
+    state_windows = puzzle_state_windows(
+        frame, trans, model_data.terminal_state_index, window=5,
+    )
+    terminal_rows = np.flatnonzero(trans.terminal)
+    state_goals = np.concatenate((trans.success_cur, trans.success[terminal_rows]))
+    expected_nodes, _, _ = puzzle_window_candidate_nodes(trans, state_goals, window=5)
+    if not np.array_equal(expected_nodes, candidate_nodes):
+        raise SchemaError("candidate cache node order differs from the v0.8 window-5 rule")
+    state_episodes = np.concatenate((trans.episode_id, trans.episode_id[terminal_rows]))
+    if np.any(state_episodes[candidate_pairs[:, 0]] == state_episodes[candidate_pairs[:, 1]]):
+        raise SchemaError("candidate distance audit requires cross-episode pairs")
+    pairs, matched_idx, unmatched_idx, pair_index_path, pair_index_hit = load_or_build_object_pair_index(
+        args.candidate_cache, boards, dataset_id=trans_meta["dataset_id"],
+    )
+    if not np.array_equal(pairs, candidate_pairs):
+        raise SchemaError("object match index cache is keyed to a different pair array")
+
+    distances, distance_meta, distance_cache = _distance_checkpoint_pairs(
+        args.distance_checkpoint,
+        trans=trans, dataset_id=trans_meta["dataset_id"],
+        states=state_windows, node_ids=candidate_nodes,
+        pairs=pairs, cache_dir=args.out.parent, label="dplus",
+    )
+
+    # The candidate audit command is the machine-readable S2 gate report.  The
+    # separate eval_quasimetric_chunk.py command in RUN_v1.0 remains useful for
+    # its richer diagnostics, while this computes the exact held-out d+ > 6.25
+    # criterion so all four S2 gates can be summarized together.
+    from experiments.train_quasimetric import _targets_at_offset
+    from experiments.v08_runtime import (
+        load_quasimetric_checkpoint,
+        make_distance_predictor,
+    )
+
+    heldout_data = prepare_puzzle_model_data(trans, sim_state, seed=0)
+    chunk_rows, chunk_endpoints = _targets_at_offset(
+        heldout_data.heldout_rows, heldout_data, 5,
+    )
+    chunk_model, chunk_params, _ = load_quasimetric_checkpoint(
+        args.distance_checkpoint,
+        input_dim=state_windows.shape[1],
+        expected_dataset_id=trans_meta["dataset_id"],
+    )
+    chunk_predict = make_distance_predictor(chunk_model, chunk_params, batch_size=8192)
+    chunk_distances = chunk_predict(
+        state_windows[chunk_rows], state_windows[chunk_endpoints]
+    )
+    chunk_violation_rate = (
+        float(np.mean(chunk_distances > 6.25)) if len(chunk_distances) else None
+    )
+    del chunk_predict, chunk_params, chunk_model
+    try:
+        import gc
+        import jax
+        gc.collect()
+        jax.clear_caches()
+    except Exception:  # pragma: no cover - best-effort accelerator cleanup
+        pass
+
+    counts = np.empty(len(pairs), dtype=np.int16)
+    memo: dict[int, int | None] = {}
+    toggle = toggle_matrix(*_BOARD_LAYOUTS[boards.shape[1]])
+    for index, (source, destination) in enumerate(pairs):
+        counts[index] = -1 if (count := _minimum_press_count(
+            boards[int(source)] ^ boards[int(destination)], toggle, memo
+        )) is None else count
+
+    reference_distances, reference_meta, reference_cache = _distance_checkpoint_pairs(
+        args.reference_checkpoint,
+        trans=trans, dataset_id=trans_meta["dataset_id"],
+        states=state_windows, node_ids=candidate_nodes,
+        pairs=pairs, cache_dir=args.out.parent, label="dtheta-reference",
+    )
+    del reference_meta
+    by_group = _distance_group_report(counts, distances, reference_distances)
+    np_ge2_mask = (counts >= 2) | (counts < 0)
+    np_ge2_values = distances[np_ge2_mask]
+    np_ge2_accept = float(np.mean(np_ge2_values <= 20.0)) if len(np_ge2_values) else None
+    acceptance_by_press_class = {
+        "n_p_0": by_group["0"]["fraction_d_plus_le_20"],
+        "n_p_1": by_group["1"]["fraction_d_plus_le_20"],
+        "n_p_ge_2_including_infinity": np_ge2_accept,
+    }
+
+    # The command intentionally has no extra G0 argument. Resolve the runbook's
+    # sibling D3/g0/graph.npz from the shared candidate-cache location.
+    g0_path = args.candidate_cache.parent.parent / "g0" / "graph.npz"
+    if not g0_path.is_file():
+        raise FileNotFoundError(f"cannot locate the G0 graph beside candidate cache: {g0_path}")
+    g0_graph = load_graph(g0_path, trans=trans)
+    if len(g0_graph.cost) != len(g0_graph.nodes.is_goal):
+        raise SchemaError("G0 costs must align with its node table")
+    if np.any(g0_graph.edges.kind != 0):
+        raise SchemaError("optimistic audit expects the temporal-only G0 graph")
+    from graphcritic.weights import step_cost
+    c0_steps = g0_graph.cost / step_cost(g0_graph.config.gamma)
+    optimistic_mask = _c0_optimistic_mask(pairs, c0_steps, minimum_gain=10.0)
+    optimistic_report = _distance_group_report(
+        counts[optimistic_mask], distances[optimistic_mask],
+        reference_distances[optimistic_mask],
+    )
+    optimistic_counts = counts[optimistic_mask]
+    optimistic_distances = distances[optimistic_mask]
+    optimistic_ge2 = (optimistic_counts >= 2) | (optimistic_counts < 0)
+    optimistic_acceptance = {
+        "n_p_0": optimistic_report["0"]["fraction_d_plus_le_20"],
+        "n_p_1": optimistic_report["1"]["fraction_d_plus_le_20"],
+        "n_p_ge_2_including_infinity": (
+            float(np.mean(optimistic_distances[optimistic_ge2] <= 20.0))
+            if np.any(optimistic_ge2) else None
+        ),
+    }
+
+    # Candidate pairs are cross-episode; retaining pairs whose endpoints both
+    # belong to held-out episodes gives an episode-disjoint P2 audit.
+    heldout_state_mask = np.isin(state_episodes, model_data.heldout_episodes)
+    heldout_pair_mask = heldout_state_mask[pairs[:, 0]] & heldout_state_mask[pairs[:, 1]]
+    matched_mask = np.zeros(len(pairs), dtype=np.bool_)
+    matched_mask[matched_idx] = True
+    heldout_match_indices = np.flatnonzero(heldout_pair_mask & matched_mask)
+    heldout_match_pairs = pairs[heldout_match_indices]
+    reference_forward = reference_reverse = np.empty(0, dtype=np.float32)
+    dplus_reverse = np.empty(0, dtype=np.float32)
+    if len(heldout_match_pairs):
+        reference_reverse, _, reference_reverse_cache = _distance_checkpoint_pairs(
+            args.reference_checkpoint,
+            trans=trans, dataset_id=trans_meta["dataset_id"],
+            states=state_windows, node_ids=candidate_nodes,
+            pairs=heldout_match_pairs[:, ::-1], cache_dir=args.out.parent,
+            label="dtheta-reference-reverse",
+        )
+        reference_forward = reference_distances[heldout_match_indices]
+        dplus_reverse, _, dplus_reverse_cache = _distance_checkpoint_pairs(
+            args.distance_checkpoint,
+            trans=trans, dataset_id=trans_meta["dataset_id"],
+            states=state_windows, node_ids=candidate_nodes,
+            pairs=heldout_match_pairs[:, ::-1], cache_dir=args.out.parent,
+            label="dplus-reverse",
+        )
+        distance_cache["reverse_pair_embedding_cache"] = dplus_reverse_cache
+        reference_cache["reverse_pair_embedding_cache"] = reference_reverse_cache
+    if len(heldout_match_pairs):
+        dplus_directed = np.concatenate((distances[heldout_match_indices], dplus_reverse))
+        dref_directed = np.concatenate((reference_forward, reference_reverse))
+        p2_violation_rate = float(np.mean(dplus_directed > dref_directed + 1.25))
+    else:
+        p2_violation_rate = None
+
+    d0 = by_group["0"]["fraction_d_plus_le_20"]
+    d1 = by_group["1"]["d_plus_p50"]
+    dge2 = float(np.median(np.concatenate((
+        distances[counts >= 2], distances[counts < 0]
+    )))) if np.any(np_ge2_mask) else None
+    gates = {
+        "chunk_violation_passed": bool(
+            chunk_violation_rate is not None and chunk_violation_rate <= 0.05
+        ),
+        "p2_heldout_violation_at_most_5_percent": bool(p2_violation_rate is not None and p2_violation_rate <= 0.05),
+        "median_order_np0_lt_np1_lt_np_ge2": bool(
+            by_group["0"]["d_plus_p50"] is not None and d1 is not None and dge2 is not None
+            and by_group["0"]["d_plus_p50"] < d1 < dge2
+        ),
+        "np_ge2_accept_rate_at_most_1_percent": bool(dge2_accept is not None and dge2_accept <= 0.01),
+    }
+    gates["s2_all_passed"] = bool(all(gates.values()))
+    gate_values = {
+        "chunk_violation_rate": chunk_violation_rate,
+        "p2_heldout_violation_rate_both_directions": p2_violation_rate,
+        "median_d_plus_n_p0": by_group["0"]["d_plus_p50"],
+        "median_d_plus_n_p1": by_group["1"]["d_plus_p50"],
+        "median_d_plus_n_p_ge2_including_infinity": dge2,
+        "n_p_ge2_fraction_d_plus_le_20": dge2_accept,
+    }
+    return {
+        "diagnostic": "v1.0_dplus_candidate_audit",
+        "dataset_id": trans_meta["dataset_id"],
+        "candidate_pair_count": int(len(pairs)),
+        "candidate_node_count": int(len(candidate_nodes)),
+        "object_match_index_cache": str(pair_index_path),
+        "object_match_index_cache_hit": bool(pair_index_hit),
+        "matched_pair_count": int(len(matched_idx)),
+        "unmatched_pair_count": int(len(unmatched_idx)),
+        "distance_checkpoint": str(args.distance_checkpoint),
+        "distance_checkpoint_sha256": distance_meta["params_sha256"],
+        "distance_embedding_cache": distance_cache,
+        "reference_checkpoint": str(args.reference_checkpoint),
+        "g0_graph": str(g0_path),
+        "c0_optimistic_minimum_gain_steps": 10.0,
+        "c0_optimistic_candidate_count": int(np.count_nonzero(optimistic_mask)),
+        "reference_embedding_cache": reference_cache,
+        "heldout_matched_pair_count": int(len(heldout_match_pairs)),
+        "heldout_p2_violation_rate_both_directions": p2_violation_rate,
+        "heldout_chunk_constraint": {
+            "pair_count": int(len(chunk_distances)),
+            "threshold": 6.25,
+            "violation_rate": chunk_violation_rate,
+        },
+        "press_count_groups": by_group,
+        "acceptance_fraction_by_press_class": acceptance_by_press_class,
+        "c0_optimistic_press_count_groups": optimistic_report,
+        "c0_optimistic_acceptance_fraction_by_press_class": optimistic_acceptance,
+        "np0_d_le_20_recall": d0,
+        "np1_d_le_20_fraction": by_group["1"]["fraction_d_plus_le_20"],
+        "np_ge2_d_le_20_false_accept_rate": dge2_accept,
+        "gate_values": gate_values,
+        "gates": gates,
+    }
 
 
 def _node_state_indices(graph: GraphArtifact, trans: TransitionSet) -> np.ndarray:
@@ -310,9 +642,13 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--graph", type=Path, nargs="*", default=[])
     parser.add_argument("--candidates-only", action="store_true",
-                        help="run D2.5 event-score check on the candidate cache, without graphs")
+                        help="audit a candidate cache without reading graph bridges")
     parser.add_argument("--candidate-cache", type=Path,
                         help="shared v0.8 window-5 pair cache for --candidates-only")
+    parser.add_argument("--distance-checkpoint", type=Path,
+                        help="state quasimetric checkpoint to audit on every candidate pair")
+    parser.add_argument("--reference-checkpoint", type=Path,
+                        help="fixed d_R checkpoint used for the held-out P2 comparison")
     parser.add_argument("--transitions", type=Path, required=True)
     parser.add_argument("--sim-state", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True, help="output JSON report")
@@ -326,8 +662,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.candidates_only:
         if args.graph:
             raise SystemExit("--candidates-only cannot be combined with --graph")
-        if args.candidate_cache is None or args.object_event_checkpoint is None:
-            raise SystemExit("--candidates-only requires --candidate-cache and --object-event-checkpoint")
+        if args.candidate_cache is None:
+            raise SystemExit("--candidates-only requires --candidate-cache")
+        _candidate_only_mode(args)
+    elif args.distance_checkpoint is not None or args.reference_checkpoint is not None:
+        raise SystemExit("--distance-checkpoint and --reference-checkpoint require --candidates-only")
     elif not args.graph:
         raise SystemExit("provide --graph or use --candidates-only")
     trans, trans_meta = load_transitions(args.transitions)
@@ -353,10 +692,23 @@ def main(argv: list[str] | None = None) -> int:
     }
 
     if args.candidates_only:
+        mode = _candidate_only_mode(args)
         from experiments.v08_runtime import (
             load_quasimetric_checkpoint,
             make_embedding_cache_predictor,
         )
+
+        if mode == "distance":
+            result = _candidate_distance_audit(
+                args, trans, trans_meta, sim_state, boards,
+            )
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(
+                json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n",
+                encoding="utf-8",
+            )
+            print(json.dumps(result, sort_keys=True, ensure_ascii=False, allow_nan=False))
+            return 0
 
         checkpoint = args.object_event_checkpoint
         event_meta = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))

@@ -385,6 +385,206 @@ def make_train_step(model, *, batch_size: int = 4096, epsilon: float = 0.25,
     return update, primal_optimizer, dual_optimizer
 
 
+def object_consistency_batch_sizes(batch_size: int, unmatched_max_frac: float) -> tuple[int, int]:
+    """Return random and mismatched-object counts in the maximization batch."""
+    if batch_size < 2 or not np.isfinite(unmatched_max_frac) or not 0.0 < unmatched_max_frac <= 0.5:
+        raise ValueError("batch_size must be >=2 and unmatched_max_frac must be in (0,0.5]")
+    unmatched = int(round(batch_size * unmatched_max_frac))
+    unmatched = min(max(unmatched, 1), batch_size - 1)
+    return batch_size - unmatched, unmatched
+
+
+def object_consistency_loss_components(
+    random_distances,
+    unmatched_distances,
+    chunk_distances,
+    matched_distances,
+    reference_matched_distances,
+    lambda_chunk,
+    lambda_match,
+    *,
+    constraint_horizon: float = 5.0,
+    epsilon_chunk: float = 1.25,
+    epsilon_match: float = 1.25,
+):
+    """Compute the v1.0 P2/P3 primal loss and its two constraint gaps."""
+    jax, jnp, *_ = _jax_modules()
+    random_distances = jnp.asarray(random_distances)
+    unmatched_distances = jnp.asarray(unmatched_distances)
+    chunk_distances = jnp.asarray(chunk_distances)
+    matched_distances = jnp.asarray(matched_distances)
+    reference_matched_distances = jnp.asarray(reference_matched_distances)
+    maximize_distances = jnp.concatenate((random_distances, unmatched_distances), axis=0)
+    maximize = jnp.mean(jax.nn.softplus((500.0 - maximize_distances) * 0.01) / 0.01)
+    chunk_gap = (
+        jnp.mean(jnp.square(jax.nn.relu(chunk_distances - float(constraint_horizon))))
+        - float(epsilon_chunk) ** 2
+    )
+    match_gap = (
+        jnp.mean(jnp.square(jax.nn.relu(matched_distances - reference_matched_distances)))
+        - float(epsilon_match) ** 2
+    )
+    total = maximize + lambda_chunk * chunk_gap + lambda_match * match_gap
+    return total, maximize, chunk_gap, match_gap
+
+
+def orient_pair_batch(pairs, reverse):
+    """Flip selected directed pair rows while preserving their aligned order."""
+    _, jnp, *_ = _jax_modules()
+    values = jnp.asarray(pairs)
+    flip = jnp.asarray(reverse, dtype=jnp.bool_)
+    if values.ndim != 2 or values.shape[1] != 2 or flip.shape != (values.shape[0],):
+        raise ValueError("pairs and reverse mask must have shapes (N,2) and (N,)")
+    return jnp.where(flip[:, None], values[:, ::-1], values)
+
+
+def make_object_consistency_train_step(
+    model,
+    *,
+    batch_size: int = 4096,
+    epsilon_chunk: float = 1.25,
+    epsilon_match: float = 1.25,
+    unmatched_max_frac: float = 0.5,
+    learning_rate: float = 5e-4,
+    lambda_learning_rate: float = 1e-2,
+    grad_clip: float = 1.0,
+    constraint_horizon: int = 5,
+):
+    """Create a chunk + cross-episode object-match P2/P3 update for v1.0."""
+    jax, jnp, _, _, optax = _jax_modules()
+    random_count, unmatched_count = object_consistency_batch_sizes(
+        batch_size, unmatched_max_frac
+    )
+    if epsilon_chunk < 0 or epsilon_match < 0 or constraint_horizon < 1:
+        raise ValueError("constraint epsilons must be non-negative and horizon positive")
+    primal = (
+        optax.chain(optax.clip_by_global_norm(grad_clip), optax.adam(learning_rate))
+        if grad_clip > 0 else optax.adam(learning_rate)
+    )
+    dual = optax.adam(lambda_learning_rate)
+
+    @jax.jit
+    def update(
+        params, primal_state, raw_lambda_chunk, dual_state_chunk,
+        raw_lambda_match, dual_state_match, key, states, next_state_index,
+        train_rows, chunk_rows, chunk_targets, matched_pairs,
+        matched_reference_forward, matched_reference_reverse, unmatched_pairs,
+    ):
+        (key, random_src_key, random_dst_key, chunk_key, match_key,
+         match_flip_key, unmatched_key, unmatched_flip_key) = jax.random.split(key, 8)
+        random_source_rows = train_rows[jax.random.randint(
+            random_src_key, (random_count,), 0, train_rows.shape[0]
+        )]
+        random_goal_rows = train_rows[jax.random.randint(
+            random_dst_key, (random_count,), 0, train_rows.shape[0]
+        )]
+        random_sources = states[random_source_rows]
+        random_goals = states[next_state_index[random_goal_rows]]
+
+        sampled_chunk = jax.random.randint(chunk_key, (batch_size,), 0, chunk_rows.shape[0])
+        chunk_source_rows = chunk_rows[sampled_chunk]
+        chunk_sources = states[chunk_source_rows]
+        chunk_targets_values = states[chunk_targets[sampled_chunk]]
+
+        sampled_match = jax.random.randint(match_key, (batch_size,), 0, matched_pairs.shape[0])
+        reverse_match = jax.random.bernoulli(match_flip_key, 0.5, (batch_size,))
+        oriented_match = orient_pair_batch(matched_pairs[sampled_match], reverse_match)
+        matched_sources = states[oriented_match[:, 0]]
+        matched_targets = states[oriented_match[:, 1]]
+        matched_reference = jnp.where(
+            reverse_match,
+            matched_reference_reverse[sampled_match],
+            matched_reference_forward[sampled_match],
+        )
+
+        sampled_unmatched = jax.random.randint(
+            unmatched_key, (unmatched_count,), 0, unmatched_pairs.shape[0]
+        )
+        reverse_unmatched = jax.random.bernoulli(
+            unmatched_flip_key, 0.5, (unmatched_count,)
+        )
+        oriented_unmatched = orient_pair_batch(
+            unmatched_pairs[sampled_unmatched], reverse_unmatched
+        )
+        unmatched_sources = states[oriented_unmatched[:, 0]]
+        unmatched_targets = states[oriented_unmatched[:, 1]]
+
+        left = jnp.concatenate(
+            (random_sources, unmatched_sources, chunk_sources, matched_sources), axis=0
+        )
+        right = jnp.concatenate(
+            (random_goals, unmatched_targets, chunk_targets_values, matched_targets), axis=0
+        )
+        lambdas = jax.lax.stop_gradient(jax.nn.softplus(
+            jnp.stack((raw_lambda_chunk, raw_lambda_match))
+        ))
+
+        def loss_fn(parameters):
+            distances = model.apply({"params": parameters}, left, right)
+            random_end = random_count
+            unmatched_end = random_end + unmatched_count
+            chunk_end = unmatched_end + batch_size
+            random_distances = distances[:random_end]
+            unmatched_distances = distances[random_end:unmatched_end]
+            chunk_distances = distances[unmatched_end:chunk_end]
+            matched_distances = distances[chunk_end:]
+            total, maximize, chunk_gap, match_gap = object_consistency_loss_components(
+                random_distances, unmatched_distances, chunk_distances,
+                matched_distances, matched_reference,
+                lambdas[0], lambdas[1], constraint_horizon=constraint_horizon,
+                epsilon_chunk=epsilon_chunk, epsilon_match=epsilon_match,
+            )
+            return total, (
+                maximize, chunk_gap, match_gap, chunk_distances, matched_distances,
+                random_distances, unmatched_distances,
+            )
+
+        (loss, (maximize, chunk_gap, match_gap, chunk_distances,
+                matched_distances, random_distances,
+                unmatched_distances)), gradients = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        gradient_norm = optax.global_norm(gradients)
+        updates, primal_state = primal.update(gradients, primal_state, params)
+        params = optax.apply_updates(params, updates)
+
+        def update_dual(raw, state, gap):
+            def dual_loss(value):
+                return -jax.nn.softplus(value) * jax.lax.stop_gradient(gap)
+            gradient = jax.grad(dual_loss)(raw)
+            updates, state = dual.update(gradient, state, raw)
+            return optax.apply_updates(raw, updates), state
+
+        raw_lambda_chunk, dual_state_chunk = update_dual(
+            raw_lambda_chunk, dual_state_chunk, chunk_gap
+        )
+        raw_lambda_match, dual_state_match = update_dual(
+            raw_lambda_match, dual_state_match, match_gap
+        )
+        metrics = {
+            "loss": loss,
+            "distance_maximization_loss": maximize,
+            "random_pair_distance_mean": jnp.mean(random_distances),
+            "unmatched_pair_distance_mean": jnp.mean(unmatched_distances),
+            "chunk_constraint_gap": chunk_gap,
+            "match_constraint_gap": match_gap,
+            "chunk_violation_rate": jnp.mean(chunk_distances > constraint_horizon + epsilon_chunk),
+            "match_violation_rate": jnp.mean(
+                matched_distances > matched_reference + epsilon_match
+            ),
+            "chunk_distance_mean": jnp.mean(chunk_distances),
+            "match_distance_mean": jnp.mean(matched_distances),
+            "reference_match_distance_mean": jnp.mean(matched_reference),
+            "lambda_chunk": jax.nn.softplus(raw_lambda_chunk),
+            "lambda_match": jax.nn.softplus(raw_lambda_match),
+            "gradient_norm_preclip": gradient_norm,
+        }
+        return (
+            params, primal_state, raw_lambda_chunk, dual_state_chunk,
+            raw_lambda_match, dual_state_match, key, metrics,
+        )
+
+    return update, primal, dual
+
+
 def initialize_train_state(model, *, seed: int, input_dim: int,
                            primal_optimizer, dual_optimizer):
     jax, jnp, _, _, _ = _jax_modules()

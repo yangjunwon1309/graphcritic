@@ -1,109 +1,82 @@
-# Graph Critic v1.0 — matched-object constraint results
+# Graph Critic v1.0 — execution error fix and S2 audit
 
 Date: 2026-11-11  
 Branch: `quasi_develop`
 
-This file is the v1.0 S1–S6 result record. The implementation and runbook have been prepared and the S0 code checks passed. No v1.0 training, graph build, offline gate, or QC benchmark run has been performed in this work.
-
-## Run provenance and checks
+## Commits, tests, and elapsed time
 
 | Item | Result |
 |---|---|
-| Root implementation commit | Not recorded; implementation is uncommitted |
-| QC submodule commit | Not recorded; QC changes are uncommitted |
-| Root `git_dirty` | `true` (implementation changes present) |
-| QC submodule `git_dirty` | `true` (implementation changes present) |
-| Root focused tests | 34 passed, 1 upstream deprecation warning |
-| QC tests | 5 passed, 3 upstream deprecation warnings |
+| v1.0 implementation commit | `2b7c698` |
+| S2 / d⁺ provenance fixes | `e1ef34b`, `7cb2677`, `118e35f` |
+| Execution commit | `7cb2677af12ebd714623daeb521c22eb9fbe5d3d` |
+| QC submodule commit | `779c721` |
+| Root `git_dirty` during final audit | `false` |
+| QC submodule `git_dirty` during final audit | `false` |
+| Requested tests | `tests/test_v10.py` + `tests/test_quasimetric_v08.py`: **31 passed**, one upstream pytest deprecation warning, 49.59 s |
+| Final S2 audit elapsed time | Approximately 94 s |
+| Push status | Local commits are ready; `git push` could not authenticate because this shell has no GitHub HTTPS credentials. |
 
-| Stage | Elapsed time | Status / stop value |
-|---|---:|---|
-| S0 tests | Root 48.29 s; QC 7.48 s | Pass |
-| S1 d⁺ training, 20k | — | Not run |
-| S2 chunk/P2/P3 audit | — | Not run |
-| S3 L⁺ build and board check | — | Not run |
-| S4 four action heads and offline gates | — | Not run |
-| S5 direct-Q QC and same-checkpoint BC evaluation | — | Not run |
-| S6 discounted-cost critic QC | — | Not run |
+The prescribed S2 command used the existing `v10/dplus/step_020000` checkpoint, v0.8 window-5 candidate cache, and v0.8 reference checkpoint. No training was repeated.
 
-## S1 — d⁺ training
+## Previously measured v1.0 values
 
-| Metric | Result |
+| Stage / metric | Recorded value |
 |---|---:|
-| Train matched / unmatched candidate pairs | Not measured |
-| Held-out matched candidate pairs | Not measured |
-| Final chunk constraint violation | Not measured |
-| Final held-out P2 violation | Not measured |
-| `λ_chunk` / `λ_match` | Not measured |
-| F3 collapse alarm | Not measured |
-| Dead-unit fraction by layer | Not measured |
-| Checkpoint path | Not created |
+| S1 chunk violation; changed / unchanged | 0.178; 0.192 / 0.176 |
+| S1 `P(d≤5)` | 0.1995 |
+| S1 P2 violation | 0.0785 |
+| S1 `λ_chunk` / `λ_match` | 4.22 / 1.41 |
+| S1 matched-pair mean distance; reference | 16.18; 19.15 |
+| L⁺ accepted / retained bridges | 76,056 / 24,704 |
+| L⁺ reachability / impossible-bridge fraction | 0.9784 / 0.792 |
+| L⁺ impossible bridge `n_p=0 / 1 / 2 / 3 / ≥4` | 5,066 / 76 / 54 / 178 / 19,330 |
+| L⁺ discounted target mean / capped fraction | 66.4 / 2.2% |
 
-## S2 — d⁺ audit and stop gates
+## S2 — candidate distance audit
 
-| Model | Held-out chunk violation | Held-out P2 violation | Median d⁺, `n_p=0 / 1 / ≥2` | `n_p≥2`, fraction `d⁺≤20` | `n_p=0`, fraction `d⁺≤20` | Gate |
-|---|---:|---:|---|---:|---:|---|
-| v0.8 `d_θ` reference | 2.9% (historical) | — | To be measured by same audit | To be measured | To be measured | Reference |
-| v1.0 `d⁺` | Not measured | Not measured | Not measured | Not measured | Not measured | Not evaluated |
+The cache contains 6,385,024 cross-episode pairs. The exact C₀ optimistic rule from `build_judged_graph.py` selected 224,910 pairs (`C₀(s) − C₀(s′) ≥ 10` and finite destination). Press counts use the exact GF(2) minimum-weight solution. `d_θ` is the v0.8 reference checkpoint distance. Fractions are the portion of each row with `d⁺≤20`.
 
-| `n_p` group | Candidate count | d⁺ p10 | d⁺ p50 | d⁺ p90 | Fraction `d⁺≤20` |
-|---|---:|---:|---:|---:|---:|
-| 0 | — | — | — | — | — |
-| 1 | — | — | — | — | — |
-| ≥2 | — | — | — | — | — |
-| ∞ | — | — | — | — | — |
+### All cached candidates
 
-| S2 gate | Threshold | Result |
-|---|---:|---|
-| Held-out chunk violation | ≤5% | Not measured |
-| Held-out P2 violation | ≤5% | Not measured |
-| Median order `n_p=0 < 1 < ≥2` | Strictly increasing | Not measured |
-| `n_p≥2` candidates with `d⁺≤20` | ≤1% | Not measured |
-| S2 overall | All four pass | Not evaluated |
+| `n_p` | Candidate count | d⁺ p10 | d⁺ p50 | d⁺ p90 | dθ p50 | Fraction `d⁺≤20` |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 944,245 | 0.468 | 5.788 | 40.124 | 7.099 | 0.7187 |
+| 1 | 43,397 | 3.032 | 35.443 | 89.291 | 26.558 | 0.2811 |
+| 2 | 63,105 | 31.570 | 56.595 | 105.035 | 53.201 | 0.0389 |
+| 3 | 139,226 | 23.163 | 65.910 | 106.374 | 58.465 | 0.0892 |
+| ≥4 | 5,195,051 | 1.012 | 34.488 | 72.564 | 28.985 | 0.3104 |
+| ∞ | 0 | — | — | — | — | — |
 
-## S3 — learned L⁺ graph
+For combined `n_p≥2`, including `∞`, the `d⁺≤20` fraction is **0.3015**.
 
-| Metric | L⁺ result | v0.8.4 L reference | v0.8.4 O reference | v0.6 G-R reference |
-|---|---:|---:|---:|---:|
-| Retained bridge edges | Not measured | 30,209 | 7,707 | 1,401,747 |
-| Reachability | Not measured | 98.2% | 86.1% | 99.7% |
-| Impossible bridge fraction | Not measured | 85.8% | 1.8% | 0 |
-| Shortest-path bridge count 0 / 1 / 2 | Not measured | 1 / 52 / 47% | 2 / 62 / 36% | — |
-| Median cost C | Not measured | 95.5 | 352 | — |
-| L⁺ graph hash | Not created | — | — | — |
-| Board-check artifact | Not created | — | — | — |
+### C₀ optimistic candidates only
 
-## S4 — action heads and offline gates
+| `n_p` | Candidate count | d⁺ p10 | d⁺ p50 | d⁺ p90 | dθ p50 | Fraction `d⁺≤20` |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 24,497 | 0.478 | 6.222 | 40.125 | 7.978 | 0.7129 |
+| 1 | 1,604 | 4.684 | 37.113 | 102.648 | 29.167 | 0.2219 |
+| 2 | 2,571 | 31.156 | 54.489 | 236.894 | 48.732 | 0.0432 |
+| 3 | 5,647 | 27.893 | 68.888 | 366.423 | 58.183 | 0.0784 |
+| ≥4 | 190,591 | 1.081 | 34.788 | 74.856 | 29.232 | 0.3026 |
+| ∞ | 0 | — | — | — | — | — |
 
-| Head seed | C1 violation | C2 violation | F3 alarm | Dead-unit fraction | `λ₁` / `λ₂` | Gate |
-|---:|---:|---:|---|---:|---|---|
-| 0 | — | — | — | — | — | Not measured |
-| 1 | — | — | — | — | — | Not measured |
-| 2 | — | — | — | — | — | Not measured |
-| 3 | — | — | — | — | — | Not measured |
+For combined `n_p≥2`, including `∞`, the `d⁺≤20` fraction is **0.2929**.
 
-| Offline metric | Result |
-|---|---:|
-| G1 ensemble d̄ median | Not measured |
-| G1 fraction d̄ > 6.25 | Not measured |
-| G2 median `|Q − (5 + C(s_{t+5}))|` | Not measured |
-| G3 alternative-action distance increases | Not measured |
-| G3 median distance increase | Not measured |
-| Offline gate result | Not evaluated |
+### S2 gates
 
-## S5/S6 — QC
+| Gate | Measured value | Threshold | Result |
+|---|---:|---:|---|
+| Held-out chunk violation `d⁺>6.25` | 0.1783 | ≤0.05 | Fail |
+| Held-out matched P2 violation `d⁺>dθ+1.25`, both directions | 0.0785 | ≤0.05 | Fail |
+| Median order `n_p=0 < n_p=1 < n_p≥2` | 5.788 < 35.443 < 34.823 | Strictly increasing | Fail |
+| Combined `n_p≥2` candidates with `d⁺≤20` | 0.3015 | ≤0.01 | Fail |
+| S2 overall | 0 / 4 gates passed | All four | **Fail** |
 
-Success and wrong-button counts use 50 evaluation episodes per checkpoint. Wrong buttons are the mean sign-reversed `episode.final_reward`.
+Audit JSON: `outputs/puzzle/standard-3x3-task3/v10/dplus_audit.json`.
 
-| Method | 50k | 100k | 150k | 200k | 250k | 300k | Final graph-target Spearman | Final critic loss | Final wrong buttons | Run directory |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| L⁺ direct-Q, with same-checkpoint BC comparison | — | — | — | — | — | — | N/A | N/A | — | Not run |
-| L⁺ discounted-cost critic | — | — | — | — | — | — | — | — | — | Not run |
-| O_np1 regret critic, v0.8.4 | 0.00 | 0.00 | 0.00 | 0.00 | 0.04 | 0.00 | 0.222 | N/A | 4.16 | Existing reference |
-| O_np1 cost critic, v0.8.4b | 0.04 | 0.24 | 0.26 | 0.16 | 0.28 | 0.30 | 0.980 | 2,978.6704 | 2.98 | Existing reference |
-| L cost critic, v0.8.4b | 0.00 | 0.06 | 0.02 | 0.04 | 0.02 | 0.06 | 0.890 | 610.5286 | 2.96 | Existing reference |
-| TD QC, v0.6 | 0.10 | 1.00 | 0.98 | 1.00 | — | — | N/A | N/A | — | Existing reference |
+## Execution boundary
 
-## Stop point
-
-No benchmark experiments were run. The next action is to commit the implementation and QC submodule changes, confirm a clean checkout, then follow [RUN_v1.0.md](RUN_v1.0.md) in order.
+- The audit stopped at S2 because all four S2 gates failed.
+- S3 graph building and board check were not run. S4, S5, and S6 were not run.
+- No training, QC, simulator run, or other task was executed.

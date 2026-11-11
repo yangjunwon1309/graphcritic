@@ -29,11 +29,15 @@ def _array_sha256(value: np.ndarray) -> str:
 
 
 def _validate_dplus_anchor(graph_meta: dict, checkpoint_meta: dict,
-                           checkpoint_sha256: str) -> None:
+                           checkpoint_sha256: str,
+                           build_result: dict | None = None) -> None:
     """Validate d+ provenance from the model and graph, independent of spec labels."""
-    if graph_meta.get("target_provenance", {}).get("kind") != "learned":
+    provenance_meta = build_result if build_result is not None else graph_meta
+    if provenance_meta.get("target_provenance", {}).get("kind") != "learned":
         raise ValueError("dplus anchoring requires a learned L+ graph")
-    graph_checkpoint_sha = graph_meta.get("model_checkpoint_sha256")
+    graph_checkpoint_sha = provenance_meta.get("model_checkpoint_sha256")
+    if graph_checkpoint_sha is None:
+        graph_checkpoint_sha = graph_meta.get("model_checkpoint_sha256")
     if graph_checkpoint_sha is None:
         graph_checkpoint_sha = graph_meta.get("bridge_model_metadata", {}).get("params_sha256")
     if graph_checkpoint_sha != checkpoint_sha256:
@@ -85,7 +89,11 @@ def main(argv=None):
     if state_sha != state_meta.get("params_sha256"):
         raise ValueError("state checkpoint parameter hash mismatch")
     if args.anchor_mode == "dplus":
-        _validate_dplus_anchor(graph.meta, state_meta, state_sha)
+        result_path = args.graph.parent / "result.json"
+        build_result = (
+            json.loads(result_path.read_text()) if result_path.is_file() else None
+        )
+        _validate_dplus_anchor(graph.meta, state_meta, state_sha, build_result)
     embedding_path = args.embedding_cache
     if embedding_path is None:
         candidates = []

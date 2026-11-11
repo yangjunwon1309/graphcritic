@@ -283,18 +283,20 @@ def test_v10_action_state_embedder_flattens_windows_in_v08_order():
 def test_v10_dplus_anchor_uses_provenance_hash_and_object_constraint():
     _validate_dplus_anchor(
         {
-            "target_provenance": {"kind": "learned"},
             "bridge_model_metadata": {"params_sha256": "checkpoint-sha"},
         },
         {"spec_version": "v0.8", "match_constraint": "object"},
         "checkpoint-sha",
+        {"target_provenance": {"kind": "learned"},
+         "model_checkpoint_sha256": "checkpoint-sha"},
     )
     with pytest.raises(ValueError, match="object-match"):
         _validate_dplus_anchor(
             {
-                "target_provenance": {"kind": "learned"},
                 "bridge_model_metadata": {"params_sha256": "checkpoint-sha"},
             },
             {"spec_version": "v1.0", "match_constraint": "none"},
             "checkpoint-sha",
+            {"target_provenance": {"kind": "learned"},
+             "model_checkpoint_sha256": "checkpoint-sha"},
         )

@@ -3,6 +3,9 @@
 import numpy as np
 
 from experiments.build_judged_graph import _parse
+from experiments.train_action_quasimetric import (
+    flatten_state_windows, gather_endpoint_windows,
+)
 from graphcritic.bridges.insert import (
     layered_reverse_dijkstra,
     used_bridge_mask_for_budget,
@@ -86,3 +89,11 @@ def test_builder_legacy_defaults_remain_any_and_two_bridges():
     ])
     assert args.bridge_object_change == "any"
     assert args.b_max == 2
+
+
+def test_action_head_endpoint_ids_are_gathered_as_flattened_state_windows():
+    windows = np.arange(6 * 15, dtype=np.float32).reshape(6, 15)
+    endpoints = gather_endpoint_windows(windows, np.asarray([4, 1, 5]))
+    assert endpoints.shape == (3, 15)
+    np.testing.assert_array_equal(endpoints, windows[[4, 1, 5]])
+    np.testing.assert_array_equal(flatten_state_windows(endpoints), windows[[4, 1, 5]])

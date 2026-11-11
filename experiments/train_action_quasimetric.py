@@ -68,6 +68,11 @@ def embed_state_windows(embedder, state_params, windows):
     )
 
 
+def gather_endpoint_windows(all_windows, endpoint_rows):
+    """Resolve endpoint row IDs to state windows for action-head training."""
+    return all_windows[endpoint_rows]
+
+
 def _build_data(args):
     trans, transition_meta = load_transitions(args.transitions)
     sim_state = load_sim_state(args.sim_state)
@@ -115,7 +120,7 @@ def _make_train_step(head, embedder, raw_alpha, *, batch_size, eps1, eps2, horiz
         goal_rows = train_rows[jax.random.randint(k2, (batch_size,), 0, len(train_rows))]
         current = all_windows[current_rows]
         actions = all_actions[current_rows]
-        endpoint = all_endpoints[current_rows]
+        endpoint = gather_endpoint_windows(all_windows, all_endpoints[current_rows])
         goal = all_windows[goal_rows]
 
         def loss_fn(action_params):

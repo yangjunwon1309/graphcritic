@@ -77,4 +77,4 @@ For the discounted cost critic, final graph-target Spearman and critic loss are 
 
 ## Push status
 
-Push status is recorded after attempting both configured remotes.
+Report commit: `c24e71b` (updated below with the push outcome). Pushes to both configured remotes were attempted and failed because this environment has no interactive GitHub HTTPS credentials (`fatal: could not read Username for 'https://github.com': No such device or address`). The root and QC commits remain local; both worktrees are clean.

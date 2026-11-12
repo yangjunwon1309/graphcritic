@@ -200,6 +200,10 @@ def _parse(argv: list[str] | None = None):
         "--target-kind", choices=("regret", "cost", "discounted"), default="regret",
         help="critic target representation written for the built graph",
     )
+    parser.add_argument(
+        "--target-h", type=int, default=5,
+        help="transition horizon used to build critic targets (default: 5)",
+    )
     parser.add_argument("--discount-gamma", type=float, default=0.99,
                         help="discount factor used only by discounted targets")
     parser.add_argument(
@@ -367,6 +371,7 @@ def _write_graph_targets(
     write_oracle_targets: bool,
     target_kind: str = "regret",
     discount_gamma: float = 0.99,
+    target_h: int = 5,
 ):
     """Write regular targets or explicitly authorized oracle targets."""
     if diagnostic_oracle_np_max is not None and not write_oracle_targets:
@@ -381,7 +386,7 @@ def _write_graph_targets(
     )
     targets = critic_targets(
         trans, artifact, TargetConfig(
-            h=5, unit="steps", kind=target_kind,
+            h=int(target_h), unit="steps", kind=target_kind,
             discount_gamma=float(discount_gamma) if target_kind == "discounted" else None,
         )
     )
@@ -394,29 +399,30 @@ def _write_graph_targets(
 
 
 def _target_summary(
-    targets, target_kind: str = "regret"
+    targets, target_kind: str = "regret", target_h: int = 5,
 ) -> dict[str, float | None]:
+    prefix = f"h{int(target_h)}"
     if targets is None:
         if target_kind == "discounted":
             return {
-                "h5_discounted_mean": None,
-                "h5_discounted_p50": None,
-                "h5_discounted_p90": None,
-                "h5_discounted_max": None,
-                "h5_discounted_capped_loss_mask_fraction": None,
+                f"{prefix}_discounted_mean": None,
+                f"{prefix}_discounted_p50": None,
+                f"{prefix}_discounted_p90": None,
+                f"{prefix}_discounted_max": None,
+                f"{prefix}_discounted_capped_loss_mask_fraction": None,
             }
         if target_kind == "cost":
             return {
-                "h5_cost_mean": None,
-                "h5_cost_p50": None,
-                "h5_cost_p90": None,
-                "h5_cost_max": None,
-                "h5_cost_capped_loss_mask_fraction": None,
+                f"{prefix}_cost_mean": None,
+                f"{prefix}_cost_p50": None,
+                f"{prefix}_cost_p90": None,
+                f"{prefix}_cost_max": None,
+                f"{prefix}_cost_capped_loss_mask_fraction": None,
             }
         return {
-            "h5_regret_p90": None,
-            "h5_zero_regret_fraction": None,
-            "h5_regret_loss_mask_fraction": None,
+            f"{prefix}_regret_p90": None,
+            f"{prefix}_zero_regret_fraction": None,
+            f"{prefix}_regret_loss_mask_fraction": None,
         }
     included = targets.valid & targets.loss_mask
     values = np.asarray(targets.y[included], dtype=np.float64)
@@ -427,20 +433,20 @@ def _target_summary(
             targets.loss_mask & (np.asarray(targets.source) == 2)
         ))
         return {
-            f"h5_{name}_mean": float(np.mean(values)) if values.size else None,
-            f"h5_{name}_p50": float(np.quantile(values, 0.5)) if values.size else None,
-            f"h5_{name}_p90": float(np.quantile(values, 0.9)) if values.size else None,
-            f"h5_{name}_max": float(np.max(values)) if values.size else None,
-            f"h5_{name}_capped_loss_mask_fraction": (
+            f"{prefix}_{name}_mean": float(np.mean(values)) if values.size else None,
+            f"{prefix}_{name}_p50": float(np.quantile(values, 0.5)) if values.size else None,
+            f"{prefix}_{name}_p90": float(np.quantile(values, 0.9)) if values.size else None,
+            f"{prefix}_{name}_max": float(np.max(values)) if values.size else None,
+            f"{prefix}_{name}_capped_loss_mask_fraction": (
                 float(capped_count / loss_mask_count) if loss_mask_count else None
             ),
         }
     return {
-        "h5_regret_p90": float(np.quantile(values, 0.9)) if values.size else None,
-        "h5_zero_regret_fraction": (
+        f"{prefix}_regret_p90": float(np.quantile(values, 0.9)) if values.size else None,
+        f"{prefix}_zero_regret_fraction": (
             float(np.mean(values <= 1e-8)) if values.size else None
         ),
-        "h5_regret_loss_mask_fraction": float(np.mean(included)),
+        f"{prefix}_regret_loss_mask_fraction": float(np.mean(included)),
     }
 
 
@@ -1015,6 +1021,7 @@ def main(argv: list[str] | None = None) -> int:
         write_oracle_targets=args.write_oracle_targets,
         target_kind=args.target_kind,
         discount_gamma=args.discount_gamma,
+        target_h=args.target_h,
     )
     np.savez_compressed(
         args.out / "layered_paths.npz",
@@ -1154,15 +1161,18 @@ def main(argv: list[str] | None = None) -> int:
         "bridge_count_fraction": bridge_distribution_fraction,
         "bridge_count_fraction_reachable": bridge_distribution_reachable_fraction,
         "target_kind": args.target_kind,
+        "target_h": int(args.target_h),
         **({"discount_gamma": float(args.discount_gamma)}
            if args.target_kind == "discounted" else {}),
-        f"h5_{args.target_kind}_valid_fraction": (
+        f"h{args.target_h}_{args.target_kind}_valid_fraction": (
             float(np.mean(targets.valid)) if targets is not None else None
         ),
-        f"h5_{args.target_kind}_loss_mask_fraction": (
+        f"h{args.target_h}_{args.target_kind}_loss_mask_fraction": (
             float(np.mean(targets.loss_mask)) if targets is not None else None
         ),
-        **_target_summary(targets, target_kind=args.target_kind),
+        **_target_summary(
+            targets, target_kind=args.target_kind, target_h=args.target_h,
+        ),
         "quasimetric_distance_summary": (
             {
                 "accepted_p50": float(np.quantile(accepted_distances, 0.5)),

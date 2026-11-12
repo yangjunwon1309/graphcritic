@@ -144,23 +144,33 @@ def puzzle_observation_window(
     return np.ascontiguousarray(frames.reshape(-1)), board
 
 
-def _make_action_head():
+def _make_action_head(parameterization: str = "free"):
     import jax
     from flax import linen as nn
 
+    if parameterization not in {"free", "residual"}:
+        raise ValueError("action parameterization must be 'free' or 'residual'")
+
     class ActionHead(nn.Module):
         widths: tuple[int, ...] = (1024, 1024, 256, 1024, 1024, 2048)
+        parameterization: str = "free"
 
         @nn.compact
         def __call__(self, inputs, *, return_diagnostics=False):
             value = inputs
             activations = {}
             for index, width in enumerate(self.widths):
+                final = index == len(self.widths) - 1
                 value = nn.Dense(
-                    width, kernel_init=nn.initializers.xavier_uniform(),
+                    width,
+                    kernel_init=(nn.initializers.zeros if final and self.parameterization == "residual"
+                                 else nn.initializers.xavier_uniform()),
+                    bias_init=(nn.initializers.constant(-5.0)
+                               if final and self.parameterization == "residual"
+                               else nn.initializers.zeros),
                     name=f"dense_{index}",
                 )(value)
-                if index < len(self.widths) - 1:
+                if not final:
                     value = nn.LayerNorm(name=f"norm_{index}")(value)
                     if return_diagnostics:
                         activations[f"dense_{index}"] = value
@@ -169,7 +179,18 @@ def _make_action_head():
                 return {"embedding": value, "preactivations": activations}
             return value
 
-    return ActionHead()
+    return ActionHead(parameterization=parameterization)
+
+
+def parameterize_action_embedding(raw_output, state_embedding, parameterization: str):
+    """Convert an action-head output to the learned local IQE source point."""
+    if parameterization == "free":
+        return raw_output
+    if parameterization != "residual":
+        raise ValueError("action parameterization must be 'free' or 'residual'")
+    import jax
+
+    return jax.lax.stop_gradient(state_embedding) - jax.nn.softplus(raw_output)
 
 
 class DirectQScorer:
@@ -193,6 +214,7 @@ class DirectQScorer:
         action_heads: list[tuple[Any, Any]],
         raw_alpha: Any,
         anchor_mode: str = "same_object",
+        action_parameterization: str = "free",
         state_embedder: Any | None = None,
         state_params: Any | None = None,
         k: int = 32,
@@ -217,8 +239,12 @@ class DirectQScorer:
             raise ValueError("direct Q requires exactly four action heads")
         if anchor_mode not in {"same_object", "dplus"}:
             raise ValueError("anchor_mode must be 'same_object' or 'dplus'")
+        if action_parameterization not in {"free", "residual"}:
+            raise ValueError("action parameterization must be 'free' or 'residual'")
         if anchor_mode == "dplus" and (state_embedder is None or state_params is None):
             raise ValueError("dplus anchoring requires the fixed state embedding model and parameters")
+        if action_parameterization == "residual" and (state_embedder is None or state_params is None):
+            raise ValueError("residual action heads require the fixed state embedding model and parameters")
         if embeddings.ndim != 2 or embeddings.shape[1] != 2048:
             raise ValueError("frozen state embeddings must have width 2048")
         if costs.shape != eps.shape or costs.shape != ts.shape:
@@ -244,6 +270,9 @@ class DirectQScorer:
         self.action_heads = action_heads
         self.raw_alpha = raw_alpha
         self.anchor_mode = anchor_mode
+        self.action_parameterization = action_parameterization
+        self.state_embedder = state_embedder
+        self.state_params = state_params
         self._jax, self._jnp = jax, jnp
         self._device = device or jax.devices()[0]
         # Keep the 1.65 GB v0.8 cache memory-mapped on host. Each decision
@@ -273,6 +302,10 @@ class DirectQScorer:
                 lambda values: state_embedder.apply({"params": state_params}, values)
             )
             self._anchor_batch_size = 8192
+        if action_parameterization == "residual":
+            self._state_embedding = jax.jit(
+                lambda values: state_embedder.apply({"params": state_params}, values)
+            )
         self._input_dim = int(features.shape[1])
 
     def _action_embeddings(self, window: np.ndarray, chunks: np.ndarray):
@@ -281,10 +314,16 @@ class DirectQScorer:
         if action.ndim == 3:
             action = action.reshape(len(action), -1)
         inputs = np.concatenate((np.broadcast_to(window, (len(action), len(window))), action), axis=1)
-        return [
-            predict(jax.device_put(jnp.asarray(inputs), self._device)).reshape((len(action), 64, 32))
-            for predict in self._head_predictors
-        ]
+        input_array = jax.device_put(jnp.asarray(inputs), self._device)
+        outputs = [predict(input_array) for predict in self._head_predictors]
+        if self.action_parameterization == "residual":
+            state_embedding = self._state_embedding(
+                jax.device_put(jnp.asarray(window[None, :]), self._device)
+            )
+            state_embedding = jnp.broadcast_to(state_embedding, outputs[0].shape)
+            outputs = [parameterize_action_embedding(value, state_embedding, "residual")
+                       for value in outputs]
+        return [value.reshape((len(action), 64, 32)) for value in outputs]
 
     def distance_to_node(self, window_obs: np.ndarray, chunk: np.ndarray, node_id: int) -> float:
         """Return the ensemble-maximum local distance to a cached graph node."""
@@ -556,10 +595,12 @@ class DirectQScorer:
         return q_values, diagnostics, target_distances
 
     def _action_embeddings_batched(self, inputs):
-        return [
-            predict(inputs).reshape((len(inputs), 64, 32))
-            for predict in self._head_predictors
-        ]
+        outputs = [predict(inputs) for predict in self._head_predictors]
+        if self.action_parameterization == "residual":
+            state_embedding = self._state_embedding(inputs[:, :self._input_dim])
+            outputs = [parameterize_action_embedding(value, state_embedding, "residual")
+                       for value in outputs]
+        return [value.reshape((len(inputs), 64, 32)) for value in outputs]
 
 
 def load_direct_q_scorer(config_path: str | Path):
@@ -609,6 +650,9 @@ def load_direct_q_scorer(config_path: str | Path):
     if state_meta.get("params_sha256") != cfg["state_checkpoint_sha256"]:
         raise ValueError("state checkpoint SHA256 changed after config creation")
     anchor_mode = str(cfg.get("anchor_mode", "same_object"))
+    action_parameterization = str(cfg.get("action_parameterization", "free"))
+    if action_parameterization not in {"free", "residual"}:
+        raise ValueError("direct-Q config has an unsupported action parameterization")
     if cfg.get("spec_version") == "v1.0" and anchor_mode != "dplus":
         raise ValueError("v1.0 direct-Q config must use dplus anchors")
     if cfg.get("spec_version") in {"v1.1", "v1.2"}:
@@ -636,11 +680,23 @@ def load_direct_q_scorer(config_path: str | Path):
     for checkpoint in cfg["action_head_checkpoints"]:
         ckpt = Path(checkpoint)
         meta = json.loads((ckpt / "metadata.json").read_text())
-        if meta.get("model_kind") not in {
+        model_kind = meta.get("model_kind")
+        expected_kind = (
+            "action-conditioned-quasimetric-v1.2b"
+            if action_parameterization == "residual"
+            else None
+        )
+        if expected_kind is not None:
+            if model_kind != expected_kind or meta.get("parameterization") != "residual":
+                raise ValueError(f"action head {ckpt} is not a v1.2b residual checkpoint")
+        elif model_kind not in {
             "action-conditioned-quasimetric-v0.9",
             "action-conditioned-quasimetric-v1.0",
-        } or int(meta.get("step", -1)) != 20_000:
-            raise ValueError(f"action head {ckpt} is not a completed v0.9 20k checkpoint")
+            "action-conditioned-quasimetric-v1.2b",
+        } or meta.get("parameterization", "free") != "free":
+            raise ValueError(f"action head {ckpt} is not a completed free-parameterization checkpoint")
+        if int(meta.get("step", -1)) != 20_000:
+            raise ValueError(f"action head {ckpt} is not a completed 20k checkpoint")
         if cfg.get("spec_version") == "v1.0" and meta.get("model_kind") != "action-conditioned-quasimetric-v1.0":
             raise ValueError(f"action head {ckpt} was not trained for v1.0")
         if meta.get("state_checkpoint_sha256") != cfg["state_checkpoint_sha256"]:
@@ -649,7 +705,7 @@ def load_direct_q_scorer(config_path: str | Path):
             raise ValueError(f"action head {ckpt} dataset ID mismatch")
         if int(meta.get("horizon", -1)) != 5 or int(meta.get("action_dim", -1)) != int(cfg["action_dim"]):
             raise ValueError(f"action head {ckpt} action layout mismatch")
-        head = _make_action_head()
+        head = _make_action_head(action_parameterization)
         in_dim = windows.shape[1] + int(meta["horizon"]) * int(meta["action_dim"])
         if int(meta.get("input_dim", -1)) != in_dim:
             raise ValueError(f"action head {ckpt} input dimension mismatch")
@@ -658,6 +714,7 @@ def load_direct_q_scorer(config_path: str | Path):
         if __import__("hashlib").sha256(raw).hexdigest() != meta.get("params_sha256"):
             raise ValueError(f"action head params hash mismatch: {ckpt}")
         heads.append((head, serialization.from_bytes(template, raw)))
+    state_embedder = make_quasimetric_embedder(model)
     return DirectQScorer(
         candidate_ids=candidate_ids, candidate_features=candidate_features,
         candidate_boards=candidate_boards, candidate_embeddings=embeddings,
@@ -666,10 +723,11 @@ def load_direct_q_scorer(config_path: str | Path):
         state_std=np.asarray(data.metadata["state_std"], dtype=np.float64),
         n_buttons=data.n_bits, action_dim=int(cfg["action_dim"]), horizon=5,
         action_heads=heads, raw_alpha=raw_alpha,
+        action_parameterization=action_parameterization,
         anchor_mode=anchor_mode,
-        state_embedder=(make_quasimetric_embedder(model) if anchor_mode == "dplus" else None),
+        state_embedder=(state_embedder if anchor_mode == "dplus" or action_parameterization == "residual" else None),
         state_params=({k: v for k, v in state_params.items() if k != "raw_alpha"}
-                      if anchor_mode == "dplus" else None),
+                      if anchor_mode == "dplus" or action_parameterization == "residual" else None),
         k=int(cfg.get("k", 32)), successors=int(cfg.get("successors", 4)),
         max_local_distance=float(cfg.get("max_local_distance", 20.0)),
     )

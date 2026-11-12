@@ -59,6 +59,9 @@ def main(argv=None):
 
     scorer = load_direct_q_scorer(args.config)
     config = json.loads(args.config.read_text())
+    action_parameterization = str(config.get("action_parameterization", "free"))
+    if action_parameterization not in {"free", "residual"}:
+        raise ValueError("direct-Q config has an unsupported action parameterization")
     q_values = np.full(len(candidates), np.inf, dtype=np.float64)
     y_values = 5.0 + costs[endpoints].astype(np.float64)
     local_distance = np.full(len(candidates), np.nan, dtype=np.float64)
@@ -108,6 +111,7 @@ def main(argv=None):
     sensitivity_delta = alternative_distance[sensitivity_mask] - local_distance[sensitivity_mask]
     result = {
         "spec_version": config.get("spec_version", "v0.9"),
+        "action_parameterization": action_parameterization,
         "dataset_id": trans_meta["dataset_id"],
         "graph_hash": graph.content_hash,
         "n_requested": int(args.n),

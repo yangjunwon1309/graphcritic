@@ -24,7 +24,10 @@ from experiments.v08_runtime import (
 from graphcritic.bridges.models import prepare_puzzle_model_data
 from graphcritic.bridges.windows import puzzle_state_windows
 from graphcritic.io import load_sim_state, load_transitions
-from graphcritic.direct_q import _make_action_head, action_qrl_loss_components
+from graphcritic.direct_q import (
+    _make_action_head, action_qrl_loss_components,
+    parameterize_action_embedding,
+)
 
 
 def _parse(argv=None):
@@ -37,6 +40,7 @@ def _parse(argv=None):
     parser.add_argument("--horizon", type=int, default=5)
     parser.add_argument("--epsilon-c1", type=float, default=1.25)
     parser.add_argument("--epsilon-c2", type=float, default=0.25)
+    parser.add_argument("--parameterization", choices=("free", "residual"), default="residual")
     parser.add_argument("--steps", type=int, default=20_000)
     parser.add_argument("--log-every", type=int, default=1_000)
     parser.add_argument("--save-every", type=int, default=10_000)
@@ -91,7 +95,8 @@ def _build_data(args):
     return trans, transition_meta, data, windows, rows[train], endpoints[train], rows[heldout], endpoints[heldout]
 
 
-def _make_train_step(head, embedder, raw_alpha, *, batch_size, eps1, eps2, horizon):
+def _make_train_step(head, embedder, raw_alpha, *, batch_size, eps1, eps2, horizon,
+                     parameterization="free"):
     jax, jnp, _, _, optax = _jax_modules()
     optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(5e-4))
     dual_optimizer = optax.adam(1e-2)
@@ -101,14 +106,22 @@ def _make_train_step(head, embedder, raw_alpha, *, batch_size, eps1, eps2, horiz
         endpoints = flatten_state_windows(endpoints)
         goals = flatten_state_windows(goals)
         action_input = jnp.concatenate((windows, actions.reshape((len(actions), -1))), axis=-1)
-        phi = head.apply({"params": action_params}, action_input).reshape((-1, 64, 32))
+        raw_action_output = head.apply({"params": action_params}, action_input)
+        psi_start_flat = embed_state_windows(embedder, state_params, windows)
+        if parameterization == "residual":
+            phi_flat = parameterize_action_embedding(raw_action_output, psi_start_flat, "residual")
+            h_penalty = jax.nn.softplus(raw_action_output)
+        else:
+            phi_flat = raw_action_output
+            h_penalty = jnp.zeros_like(raw_action_output)
+        phi = phi_flat.reshape((-1, 64, 32))
         psi_end = embed_state_windows(embedder, state_params, endpoints).reshape((-1, 64, 32))
-        psi_start = embed_state_windows(embedder, state_params, windows).reshape((-1, 64, 32))
+        psi_start = psi_start_flat.reshape((-1, 64, 32))
         psi_goal = embed_state_windows(embedder, state_params, goals).reshape((-1, 64, 32))
         c1 = iqe_distance_from_embeddings(phi, psi_end, raw_alpha, n_components=64, component_dim=32, jnp=jnp)
         c2 = iqe_distance_from_embeddings(psi_start, phi, raw_alpha, n_components=64, component_dim=32, jnp=jnp)
         goal = iqe_distance_from_embeddings(phi, psi_goal, raw_alpha, n_components=64, component_dim=32, jnp=jnp)
-        return c1, c2, goal
+        return c1, c2, goal, h_penalty
 
     from experiments.v08_runtime import iqe_distance_from_embeddings
 
@@ -124,16 +137,24 @@ def _make_train_step(head, embedder, raw_alpha, *, batch_size, eps1, eps2, horiz
         goal = all_windows[goal_rows]
 
         def loss_fn(action_params):
-            c1, c2, d_goal = distances(action_params, state_params, current, actions, endpoint, goal)
-            lambdas = jax.lax.stop_gradient(jax.nn.softplus(raw_lambdas))
-            total, maximize, gap1, gap2 = action_qrl_loss_components(
-                c1, c2, d_goal, lambdas[0], lambdas[1],
-                horizon=horizon, epsilon_c1=eps1, epsilon_c2=eps2,
+            c1, c2, d_goal, h_penalty = distances(
+                action_params, state_params, current, actions, endpoint, goal
             )
-            gaps = jnp.stack((gap1, gap2))
-            return total, (c1, c2, gaps, maximize)
+            lambdas = jax.lax.stop_gradient(jax.nn.softplus(raw_lambdas))
+            if parameterization == "residual":
+                maximize = jnp.mean(jax.nn.softplus((500.0 - d_goal) * 0.01) / 0.01)
+                gap1 = jnp.mean(jnp.square(jax.nn.relu(c1 - float(horizon)))) - float(eps1) ** 2
+                gaps = jnp.asarray([gap1])
+                total = maximize + lambdas[0] * gap1
+            else:
+                total, maximize, gap1, gap2 = action_qrl_loss_components(
+                    c1, c2, d_goal, lambdas[0], lambdas[1],
+                    horizon=horizon, epsilon_c1=eps1, epsilon_c2=eps2,
+                )
+                gaps = jnp.stack((gap1, gap2))
+            return total, (c1, c2, gaps, maximize, h_penalty)
 
-        (loss, (c1, c2, gaps, maximize)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        (loss, (c1, c2, gaps, maximize, h_penalty)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         grad_norm = optax.global_norm(grads)
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
@@ -147,18 +168,24 @@ def _make_train_step(head, embedder, raw_alpha, *, batch_size, eps1, eps2, horiz
         metrics = {
             "loss": loss, "distance_maximization_loss": maximize,
             "c1_mean": jnp.mean(c1), "c1_violation": jnp.mean(c1 > float(horizon) + eps1),
-            "c2_mean": jnp.mean(c2), "c2_violation": jnp.mean(c2 > eps2),
+            "c2_mean": jnp.mean(c2), "c2_max": jnp.max(c2),
+            "c2_violation": jnp.mean(c2 > eps2),
             "lambda1": jax.nn.softplus(raw_lambdas[0]),
-            "lambda2": jax.nn.softplus(raw_lambdas[1]),
             "grad_norm_preclip": grad_norm,
         }
+        if parameterization == "residual":
+            metrics["softplus_h_mean"] = jnp.mean(h_penalty)
+            metrics["softplus_h_p90"] = jnp.quantile(h_penalty, 0.90)
+        else:
+            metrics["lambda2"] = jax.nn.softplus(raw_lambdas[1])
         return params, opt_state, raw_lambdas, dual_state, key, metrics
 
     return update, optimizer, dual_optimizer, distances
 
 
 def _evaluate_head(head, params, state_params, raw_alpha, embedder, data, windows,
-                   rows, endpoints, actions, horizon, epsilon_c1, epsilon_c2, seed, batch_size):
+                   rows, endpoints, actions, horizon, epsilon_c1, epsilon_c2, seed, batch_size,
+                   parameterization="free"):
     jax, jnp, _, _, _ = _jax_modules()
     from experiments.v08_runtime import iqe_distance_from_embeddings
     del seed
@@ -168,22 +195,37 @@ def _evaluate_head(head, params, state_params, raw_alpha, embedder, data, window
     if len(rows) > 20_000:
         selected = rng.choice(len(rows), 20_000, replace=False)
         rows, endpoints = rows[selected], endpoints[selected]
-    c1_all, c2_all = [], []
+    c1_all, c2_all, reference_all, h_all = [], [], [], []
+    sensitivity_greater, sensitivity_delta = [], []
     offset_d = {k: [] for k in (5, 10, 15, 20)}
-    predict_phi = jax.jit(lambda x: head.apply({"params": params}, x).reshape((-1, 64, 32)))
+    predict_raw = jax.jit(lambda x: head.apply({"params": params}, x))
     predict_psi = jax.jit(lambda x: embedder.apply({"params": state_params}, x).reshape((-1, 64, 32)))
     for start in range(0, len(rows), batch_size):
         r = rows[start : start + batch_size]
         e = endpoints[start : start + batch_size]
         w = jnp.asarray(windows[r])
         a = jnp.asarray(actions[r].reshape(len(r), -1))
-        phi = predict_phi(jnp.concatenate((w, a), axis=1))
+        other_actions = np.roll(actions[r], 1, axis=0).reshape(len(r), -1)
+        raw_h = predict_raw(jnp.concatenate((w, a), axis=1))
+        raw_alt = predict_raw(jnp.concatenate((w, jnp.asarray(other_actions)), axis=1))
         psi_start = predict_psi(w)
         psi_end = predict_psi(jnp.asarray(windows[e]))
+        if parameterization == "residual":
+            phi = parameterize_action_embedding(raw_h, psi_start.reshape((len(r), 2048)), "residual").reshape((-1, 64, 32))
+            phi_alt = parameterize_action_embedding(raw_alt, psi_start.reshape((len(r), 2048)), "residual").reshape((-1, 64, 32))
+            h_all.append(np.asarray(jax.device_get(jax.nn.softplus(raw_h))).reshape(-1))
+        else:
+            phi = raw_h.reshape((-1, 64, 32))
+            phi_alt = raw_alt.reshape((-1, 64, 32))
         c1 = iqe_distance_from_embeddings(phi, psi_end, raw_alpha, n_components=64, component_dim=32, jnp=jnp)
         c2 = iqe_distance_from_embeddings(psi_start, phi, raw_alpha, n_components=64, component_dim=32, jnp=jnp)
+        v_ref = iqe_distance_from_embeddings(psi_start, psi_end, raw_alpha, n_components=64, component_dim=32, jnp=jnp)
+        c1_alt = iqe_distance_from_embeddings(phi_alt, psi_end, raw_alpha, n_components=64, component_dim=32, jnp=jnp)
         c1_all.append(np.asarray(jax.device_get(c1)))
         c2_all.append(np.asarray(jax.device_get(c2)))
+        reference_all.append(np.asarray(jax.device_get(v_ref)))
+        sensitivity_greater.append(np.asarray(jax.device_get(c1_alt > c1)))
+        sensitivity_delta.append(np.asarray(jax.device_get(c1_alt - c1)))
         for k in offset_d:
             target = r + k
             ok = target <= data.episode_end_rows[r]
@@ -195,15 +237,28 @@ def _evaluate_head(head, params, state_params, raw_alpha, embedder, data, window
                 offset_d[k].extend(np.asarray(jax.device_get(dk)).tolist())
     c1_values = np.concatenate(c1_all)
     c2_values = np.concatenate(c2_all)
-    return {
+    reference_values = np.concatenate(reference_all)
+    alt_greater = np.concatenate(sensitivity_greater)
+    alt_delta = np.concatenate(sensitivity_delta)
+    result = {
         "heldout_chunks": int(len(rows)),
         "c1_violation_rate_d_gt_h_plus_epsilon": float(np.mean(c1_values > horizon + epsilon_c1)),
+        "v_ref_violation_rate_d_theta_gt_h_plus_epsilon": float(np.mean(reference_values > horizon + epsilon_c1)),
         "c2_violation_rate_d_gt_epsilon": float(np.mean(c2_values > epsilon_c2)),
+        "c2_max": float(np.max(c2_values)),
         "c1_median": float(np.median(c1_values)),
         "c2_median": float(np.median(c2_values)),
         "distance_median_by_offset": {str(k): float(np.median(v)) if v else None for k, v in offset_d.items()},
         "c1_p95": float(np.quantile(c1_values, 0.95)),
+        "action_sensitivity_alternative_distance_greater_fraction": float(np.mean(alt_greater)),
+        "action_sensitivity_alternative_minus_recorded_distance_median": float(np.median(alt_delta)),
+        "action_sensitivity_alternative_action": "recorded_chunk_from_previous_heldout_row",
     }
+    if h_all:
+        h_values = np.concatenate(h_all)
+        result["softplus_h_mean"] = float(np.mean(h_values))
+        result["softplus_h_p90"] = float(np.quantile(h_values, 0.90))
+    return result
 
 
 def _collapse_diagnostics(head, params, windows, actions, rows, *, seed,
@@ -252,8 +307,11 @@ def main(argv=None):
         raise ValueError("state checkpoint parameter hash does not match metadata")
     embedder = make_quasimetric_embedder(state_model)
     state_params = {k: v for k, v in state_params_all.items() if k != "raw_alpha"}
-    experiment_version = "v1.0" if state_meta.get("spec_version") == "v1.0" else "v0.9"
-    head = _make_action_head()
+    experiment_version = (
+        "v1.2b" if args.parameterization == "residual"
+        else "v1.0" if state_meta.get("spec_version") == "v1.0" else "v0.9"
+    )
+    head = _make_action_head(args.parameterization)
     input_dim = windows.shape[1] + args.horizon * trans.action.shape[1]
     endpoints_lookup = np.full(trans.n_rows, -1, dtype=np.int64)
     endpoints_lookup[train_rows] = train_endpoints
@@ -272,6 +330,7 @@ def main(argv=None):
     train_update, optimizer, dual_optimizer, _ = _make_train_step(
         head, embedder, state_params_all["raw_alpha"], batch_size=args.batch_size,
         eps1=args.epsilon_c1, eps2=args.epsilon_c2, horizon=args.horizon,
+        parameterization=args.parameterization,
     )
     all_windows = jax.device_put(jnp.asarray(windows))
     all_actions = jax.device_put(jnp.asarray(actions))
@@ -287,7 +346,8 @@ def main(argv=None):
         seed_dir.mkdir(parents=True, exist_ok=True)
         params = head.init(jax.random.PRNGKey(seed), jnp.zeros((1, input_dim), jnp.float32))["params"]
         opt_state = optimizer.init(params)
-        raw_lambdas = jnp.asarray([_inverse_softplus(0.01)] * 2, dtype=jnp.float32)
+        n_duals = 1 if args.parameterization == "residual" else 2
+        raw_lambdas = jnp.asarray([_inverse_softplus(0.01)] * n_duals, dtype=jnp.float32)
         dual_state = dual_optimizer.init(raw_lambdas)
         key = jax.random.PRNGKey(seed + 0xA917)
         with hist.open("a", encoding="utf-8") as log:
@@ -315,6 +375,7 @@ def main(argv=None):
                     meta = {
                         **provenance(ROOT), "spec_version": experiment_version,
                         "model_kind": f"action-conditioned-quasimetric-{experiment_version}",
+                        "parameterization": args.parameterization,
                         "dataset_id": dataset_meta["dataset_id"],
                         "state_checkpoint": str(args.state_checkpoint),
                         "state_checkpoint_sha256": params_sha,
@@ -328,7 +389,8 @@ def main(argv=None):
                         "iqe_head": "fixed-v0.8-maxmean", "seed": int(seed), "step": int(step),
                         "learning_rate": 5e-4, "dual": "adam", "dual_learning_rate": 1e-2,
                         "lambda1": float(jax.device_get(jax.nn.softplus(raw_lambdas[0]))),
-                        "lambda2": float(jax.device_get(jax.nn.softplus(raw_lambdas[1]))),
+                        "lambda2": (float(jax.device_get(jax.nn.softplus(raw_lambdas[1])))
+                                    if args.parameterization == "free" else None),
                         "batch_size": args.batch_size,
                         "params_sha256": hashlib.sha256(payload).hexdigest(),
                         **collapse,
@@ -338,12 +400,25 @@ def main(argv=None):
                         head, params, state_params_jax, state_params_all["raw_alpha"], embedder, data, windows,
                         held_rows, held_endpoints, actions, args.horizon,
                         args.epsilon_c1, args.epsilon_c2, seed, args.eval_batch_size,
+                        parameterization=args.parameterization,
                     )
                     (path / "heldout.json").write_text(json.dumps(heldout, indent=2, sort_keys=True) + "\n")
-                    final_gate[str(seed)] = {**heldout, **collapse, "lambda1": meta["lambda1"], "lambda2": meta["lambda2"], "step": step}
+                    head_gate_passed = (
+                        heldout["c1_violation_rate_d_gt_h_plus_epsilon"]
+                        <= heldout["v_ref_violation_rate_d_theta_gt_h_plus_epsilon"] + 0.05
+                        and heldout["c2_max"] <= 1e-4
+                        if args.parameterization == "residual"
+                        else heldout["c1_violation_rate_d_gt_h_plus_epsilon"] <= 0.05
+                    )
+                    final_gate[str(seed)] = {
+                        **heldout, **collapse,
+                        "lambda1": meta["lambda1"], "lambda2": meta["lambda2"],
+                        "step": step, "gate_passed": bool(head_gate_passed and not collapse["collapse_alarm"]),
+                    }
                     if collapse["collapse_alarm"]:
                         summary = {
                             **provenance(ROOT), "spec_version": experiment_version,
+                            "parameterization": args.parameterization,
                             "dataset_id": dataset_meta["dataset_id"],
                             "state_checkpoint_sha256": params_sha,
                             "heads": final_gate,
@@ -354,12 +429,10 @@ def main(argv=None):
                             json.dumps(summary, indent=2, sort_keys=True) + "\n"
                         )
                         return 3
-                    if step == args.steps and (
-                        collapse["max_dead_unit_fraction"] > 0.0
-                        or heldout["c1_violation_rate_d_gt_h_plus_epsilon"] > 0.05
-                    ):
+                    if step == args.steps and not final_gate[str(seed)]["gate_passed"]:
                         summary = {
                             **provenance(ROOT), "spec_version": experiment_version,
+                            "parameterization": args.parameterization,
                             "dataset_id": dataset_meta["dataset_id"],
                             "state_checkpoint_sha256": params_sha,
                             "heads": final_gate,
@@ -372,6 +445,7 @@ def main(argv=None):
                         return 4
     summary = {
         **provenance(ROOT), "spec_version": experiment_version, "dataset_id": dataset_meta["dataset_id"],
+        "parameterization": args.parameterization,
         "state_checkpoint_sha256": params_sha, "heads": final_gate,
         "elapsed_seconds": float(time.time() - started),
     }

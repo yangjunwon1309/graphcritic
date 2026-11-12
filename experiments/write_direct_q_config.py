@@ -156,7 +156,36 @@ def main(argv=None):
     missing = [head for head in heads if not (Path(head) / "metadata.json").is_file()]
     if missing:
         raise FileNotFoundError(f"missing completed action-head checkpoints: {missing}")
-    if args.anchor_mode == "dplus":
+    head_metas = [json.loads((Path(head) / "metadata.json").read_text()) for head in heads]
+    parameterizations = {str(meta.get("parameterization", "free")) for meta in head_metas}
+    if len(parameterizations) != 1:
+        raise ValueError("action heads use mixed parameterizations")
+    action_parameterization = next(iter(parameterizations))
+    if action_parameterization not in {"free", "residual"}:
+        raise ValueError("action heads have an unsupported parameterization")
+    if action_parameterization == "residual":
+        if args.anchor_mode != "same_object":
+            raise ValueError("v1.2b residual action heads require same_object graph anchors")
+        summary_path = args.action_head_root / "summary.json"
+        if not summary_path.is_file():
+            raise FileNotFoundError("residual direct-Q config requires the completed action-head summary.json")
+        summary = json.loads(summary_path.read_text())
+        if summary.get("spec_version") != "v1.2b" or summary.get("parameterization") != "residual":
+            raise ValueError("residual action-head summary is not a completed v1.2b run")
+        if summary.get("stopped_on_collapse") or summary.get("stopped_on_gate"):
+            raise ValueError("v1.2b action-head summary records a failed stop gate")
+        head_results = summary.get("heads", {})
+        for seed in range(4):
+            report = head_results.get(str(seed))
+            if not isinstance(report, dict) or int(report.get("step", -1)) != 20_000:
+                raise ValueError(f"v1.2b action-head seed {seed} did not complete 20k updates")
+            if report.get("collapse_alarm") or not report.get("gate_passed"):
+                raise ValueError(f"v1.2b action-head seed {seed} failed its collapse/C1/C2 gate")
+            c1 = float(report.get("c1_violation_rate_d_gt_h_plus_epsilon", 1.0))
+            v_ref = float(report.get("v_ref_violation_rate_d_theta_gt_h_plus_epsilon", -1.0))
+            if c1 > v_ref + 0.05 or float(report.get("c2_max", 1.0)) > 1e-4:
+                raise ValueError(f"v1.2b action-head seed {seed} failed its measured C1/C2 gate")
+    elif args.anchor_mode == "dplus":
         summary_path = args.action_head_root / "summary.json"
         if not summary_path.is_file():
             raise FileNotFoundError("dplus direct-Q config requires the completed action-head summary.json")
@@ -201,6 +230,7 @@ def main(argv=None):
         "state_checkpoint": str(args.state_checkpoint.resolve()),
         "state_checkpoint_sha256": state_sha,
         "action_head_checkpoints": heads,
+        "action_parameterization": action_parameterization,
         "anchor_mode": args.anchor_mode,
         "transitions": str(args.transitions.resolve()),
         "sim_state": str(args.sim_state.resolve()),

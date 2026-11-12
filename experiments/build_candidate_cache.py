@@ -398,7 +398,14 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("object-change set must contain unique non-empty patterns")
         if not np.any(allowed_changes == 0):
             raise ValueError("object-change set must retain the zero-change pattern")
-        robot_candidate_features = _robot_only_windows(candidate_features)
+        # Puzzle frame width is robot features plus exact button bits. The
+        # supported 3x3/4x4/4x5 layouts therefore have different widths even
+        # though the robot prefix is always 19D.
+        robot_candidate_features = _robot_only_windows(
+            candidate_features,
+            frame_dim=19 + int(model_data.state_bits.shape[1]),
+            robot_dim=19,
+        )
         board_codes = pack_button_states(model_data.state_bits[node_ids])
         candidate_pairs, pair_delta = _gpu_object_candidate_pairs(
             robot_candidate_features, node_ids, candidate_episode, board_codes, source_mask,

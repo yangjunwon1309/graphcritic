@@ -18,7 +18,7 @@ Branch: `quasi_develop`; QC fork branch: `graph-critic`
 | `git_dirty` at A6 TD run start | `true` (the untracked `docs/results_v1.4.md` draft existed) |
 | Allowed test command | `tests/test_cube_double_stats.py tests/test_v14.py tests/test_v12.py` |
 | Allowed test result | **9 passed**, one upstream deprecation warning, 0.46 s |
-| Push | Pending |
+| Push to `origin/quasi_develop` | Failed: `fatal: could not read Username for 'https://github.com': No such device or address` |
 
 The first A2 candidate-cache build stopped with `ValueError: flattened windows do not match the Puzzle frame schema`. The existing helper assumed a 28-dimensional 3×3 frame. The committed fix derives the frame width from the dataset while retaining the 19-dimensional robot feature prefix. A2 then completed and its 50,000-source parity check had 0 mismatches and 0 excluded ties.
 
@@ -178,4 +178,6 @@ Nodes are stationary layouts; edges are same-episode consecutive layouts plus bi
 | 4 cm | 12,013 | 11,013 | 131,171 | 273,355 | 12,011 / 0.999834 | 12,011 / 0.999834 | 12,011 / 0.999834 | 12,011 / 0.999834 | 12,011 / 0.999834 |
 
 Cube-double JSON: `outputs/cube-double/stats_v14.json`. P13 v1.4 outputs: `outputs/puzzle/p13-4x4-task2-100-generated/v14/`.
+
+The results commit is local on `quasi_develop`; the branch could not be pushed because this environment has no interactive GitHub HTTPS credentials.
 

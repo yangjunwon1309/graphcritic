@@ -65,4 +65,4 @@ The Q loss term is computed from the logged actor-loss identity `actor_loss − 
 
 ## Push status
 
-Push status is recorded after attempting both configured remotes.
+Pushes to both configured remotes were attempted and failed because this environment has no interactive GitHub HTTPS credentials (`fatal: could not read Username for 'https://github.com': No such device or address`). The root and QC commits remain local; both worktrees are clean.

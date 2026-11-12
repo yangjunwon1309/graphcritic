@@ -51,4 +51,4 @@ Each evaluation used 50 episodes. Wrong-button count is the mean `episode.final_
 
 ## Push status
 
-Pending.
+The push to `origin/quasi_develop` failed: `fatal: could not read Username for 'https://github.com': No such device or address`. The report commit remains local.

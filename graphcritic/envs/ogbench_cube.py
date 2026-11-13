@@ -50,6 +50,12 @@ def split_observation(observations: np.ndarray) -> tuple[np.ndarray, np.ndarray]
     return robot, objects
 
 
+def decode_cube_xyz(observations: np.ndarray) -> np.ndarray:
+    """Decode cube positions from a 37D observation to metric ``(...,2,3)``."""
+    _, objects = split_observation(observations)
+    return objects[:, :, :3]
+
+
 def cube_double_goals() -> dict[int, np.ndarray]:
     """Return the five ordered two-cube goals from OGBench 1.2.2."""
     try:

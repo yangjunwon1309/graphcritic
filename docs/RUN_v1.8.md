@@ -16,7 +16,8 @@ ROOT=/home/url/graphcritic
 PY=$ROOT/.pixi/envs/bench/bin/python
 DATA=/home/url/.ogbench/data/cube-double-play-v0.npz
 V=$ROOT/outputs/cube-double-play/v18
-STATE=$V/dtheta_robot_window5
+STATE20=$V/dtheta_robot_window5
+STATE=$V/dtheta_robot_window5_r40k
 
 cd "$ROOT"
 git status -sb
@@ -59,7 +60,7 @@ JAX_PLATFORMS=cuda $PY experiments/train_quasimetric.py \
   --window 5 --constraint-horizon 5 --epsilon 1.25 \
   --activation gelu --layernorm --grad-clip 1.0 --dual adam \
   --steps 20000 --log-every 1000 --save-every 10000 --seed 0 \
-  --out "$STATE"
+  --out "$STATE20"
 ```
 
 The command exits nonzero on a collapse alarm. Enforce both the collapse and
@@ -68,12 +69,60 @@ F3 chunk-violation gates with:
 ```bash
 set -euo pipefail
 cd "$ROOT"
-$PY experiments/check_v18_model.py --run "$STATE"
+$PY experiments/check_v18_model.py --run "$STATE20" --step 20000
 ```
 
 This requires `collapse_alarm=false` in the final `train_metrics.jsonl` row and
 `heldout_chunk_constraint.overall_violation_rate_d_gt_limit <= 0.05` in the
 final `training.jsonl` row. The chunk threshold is `d > 6.25`.
+
+### Resume from the saved 20k checkpoint to 40k
+
+For the v1.8 continuation, resume the full serialized state, including primal
+optimizer moments, dual λ and its optimizer moments, and the PRNG key. The new
+directory preserves the original 10k/20k run and saves 30k and 40k checkpoints.
+
+```bash
+set -euo pipefail
+cd "$ROOT"
+JAX_PLATFORMS=cuda $PY experiments/train_quasimetric.py \
+  --cube-double-dataset "$DATA" --input-part robot \
+  --window 5 --constraint-horizon 5 --epsilon 1.25 \
+  --activation gelu --layernorm --grad-clip 1.0 --dual adam \
+  --steps 20000 --log-every 1000 --save-every 10000 --seed 0 \
+  --resume-from "$STATE20/step_020000" --out "$STATE"
+```
+
+The output metadata records the restored step, optimizer/dual restoration flags,
+source training-state SHA256, and starting λ. Confirm those fields against the
+source checkpoint before using the 40k result. Evaluate step 40k with stop mode
+first. If F3 alone fails, report mode permits continuing while recording the
+F3 violation; collapse, dead units, and 19D/95D input checks remain hard gates.
+
+```bash
+set -euo pipefail
+cd "$ROOT"
+$PY experiments/check_v18_model.py --run "$STATE" --step 40000 --violation-gate stop
+```
+
+If stop mode fails only because `F3_passed=false`, run the report-mode check:
+
+```bash
+set -euo pipefail
+cd "$ROOT"
+$PY experiments/check_v18_model.py --run "$STATE" --step 40000 --violation-gate report
+```
+
+The following offline diagnostic divides held-out 5-step pairs into joint-speed
+deciles and compares cube-moving with cube-stationary windows. It does not train
+or use a simulator.
+
+```bash
+set -euo pipefail
+cd "$ROOT"
+$PY experiments/diag_v18_dtheta_violation.py --cube-double-dataset "$DATA" \
+  --checkpoint "$STATE/step_040000" --out "$STATE/violation_diagnostic.json"
+```
 
 ## 3. S3–S5 — δ sweep, G2 audit, task graphs and targets
 
@@ -89,7 +138,7 @@ Each task graph directory contains both QC `discounted` targets
 set -euo pipefail
 cd "$ROOT"
 JAX_PLATFORMS=cuda $PY experiments/sweep_object_delta.py \
-  --cube-double-dataset "$DATA" --checkpoint "$STATE/step_020000" \
+  --cube-double-dataset "$DATA" --checkpoint "$STATE/step_040000" \
   --max-budget 32 --embedding-pair-batch-size 4096 --out "$V/bridge_sweep"
 ```
 

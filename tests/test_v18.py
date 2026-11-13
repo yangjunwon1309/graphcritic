@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 
 from graphcritic.bridges.object_state import (
@@ -150,3 +152,78 @@ def test_five_step_constraint_maps_boundary_endpoint_to_episode_terminal_state()
     rows, endpoints = _targets_at_offset(np.asarray([0, 1, 2]), data, 5)
     np.testing.assert_array_equal(rows, [0])
     np.testing.assert_array_equal(endpoints, [5])
+
+
+def _write_v18_gate_run(path, *, step=30_000, violation=0.04, collapse=False, dead=0.0,
+                        frame_dim=19, input_dim=95):
+    import json
+
+    checkpoint = path / f"step_{step:06d}"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "metadata.json").write_text(json.dumps({
+        "step": step, "input_part": "robot", "frame_dim": frame_dim, "input_dim": input_dim,
+    }))
+    (path / "train_metrics.jsonl").write_text(json.dumps({
+        "step": step,
+        "collapse_alarm": collapse,
+        "collapse_alarm_reason": "synthetic" if collapse else None,
+        "diagnostics": {"dead_unit_frac_by_layer": {"encoder_0": dead}},
+    }) + "\n")
+    (path / "training.jsonl").write_text(json.dumps({
+        "step": step,
+        "heldout_chunk_constraint": {"overall_violation_rate_d_gt_limit": violation},
+        "train_chunk_constraint": {"overall_violation_rate_d_gt_limit": 0.03},
+    }) + "\n")
+
+
+def test_v18_gate_checker_accepts_requested_step_and_report_only_f3(tmp_path):
+    import json
+    import subprocess
+    import sys
+
+    run = tmp_path / "run"
+    run.mkdir()
+    _write_v18_gate_run(run, violation=0.06)
+    script = Path(__file__).resolve().parents[1] / "experiments/check_v18_model.py"
+    stop = subprocess.run(
+        [sys.executable, str(script), "--run", str(run), "--step", "30000"],
+        capture_output=True, text=True,
+    )
+    assert stop.returncode == 2
+    stop_report = json.loads(stop.stdout)
+    assert stop_report["step"] == 30_000
+    assert stop_report["F3_violation_reported"] is False
+    report = subprocess.run(
+        [sys.executable, str(script), "--run", str(run), "--step", "30000",
+         "--violation-gate", "report"],
+        capture_output=True, text=True,
+    )
+    assert report.returncode == 0
+    report_json = json.loads(report.stdout)
+    assert report_json["gate_passed"] is True
+    assert report_json["F3_passed"] is False
+    assert report_json["F3_violation_reported"] is True
+    assert report_json["train_chunk_violation_d_gt_6_25"] == 0.03
+
+
+def test_v18_report_mode_keeps_collapse_dead_unit_and_dimension_hard_gates(tmp_path):
+    import subprocess
+    import sys
+
+    script = Path(__file__).resolve().parents[1] / "experiments/check_v18_model.py"
+    cases = [
+        {"collapse": True},
+        {"dead": 0.001},
+        {"input_dim": 19},
+        {"frame_dim": 20},
+    ]
+    for index, values in enumerate(cases):
+        run = tmp_path / f"run-{index}"
+        run.mkdir()
+        _write_v18_gate_run(run, violation=0.06, **values)
+        result = subprocess.run(
+            [sys.executable, str(script), "--run", str(run), "--step", "30000",
+             "--violation-gate", "report"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 2

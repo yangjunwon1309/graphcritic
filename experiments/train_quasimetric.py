@@ -70,6 +70,31 @@ def _batched_distances(predict, source: np.ndarray, destination: np.ndarray,
     return predict(source, destination)
 
 
+def _chunk_constraint_report(rows: np.ndarray, data, states: np.ndarray, predict,
+                             *, horizon: int, epsilon: float, seed: int,
+                             max_pairs: int = 100_000) -> dict:
+    """Measure a deterministic sample of same-episode chunk constraints."""
+    source_rows, target_rows = _targets_at_offset(rows, data, horizon)
+    if len(source_rows) > max_pairs:
+        rng = np.random.default_rng(seed)
+        selected = np.sort(rng.choice(len(source_rows), size=max_pairs, replace=False))
+        source_rows, target_rows = source_rows[selected], target_rows[selected]
+    distances = np.asarray(predict(states[source_rows], states[target_rows]), dtype=np.float32)
+    threshold = float(horizon) + float(epsilon)
+    return {
+        "n": int(len(distances)),
+        "constraint_horizon": int(horizon),
+        "epsilon": float(epsilon),
+        "threshold": threshold,
+        "sample_seed": int(seed),
+        "overall_violation_rate_d_gt_limit": (
+            float(np.mean(distances > threshold)) if len(distances) else None
+        ),
+        "distance_p50": float(np.quantile(distances, 0.50)) if len(distances) else None,
+        "distance_p90": float(np.quantile(distances, 0.90)) if len(distances) else None,
+    }
+
+
 def heldout_metrics(data, states: np.ndarray, next_index: np.ndarray, predict,
                     *, step: int, seed: int, triangle_count: int = 100_000,
                     eval_batch_size: int = 8192, constraint_horizon: int = 1,
@@ -156,6 +181,13 @@ def heldout_metrics(data, states: np.ndarray, next_index: np.ndarray, predict,
         result["heldout_one_step_constraint"] = constraint_report
     else:
         result["heldout_chunk_constraint"] = constraint_report
+
+    if constraint_horizon > 1:
+        result["train_chunk_constraint"] = _chunk_constraint_report(
+            np.asarray(data.train_rows, dtype=np.int64), data, states, predict,
+            horizon=constraint_horizon, epsilon=epsilon,
+            seed=int(seed + 0x7A1),
+        )
 
     rng = np.random.default_rng(seed + step)
     heldout_terminals = data.terminal_state_index[heldout]
@@ -687,6 +719,13 @@ def main(argv: list[str] | None = None) -> int:
         "invocation_end_step": int(end_step),
         "init_from": str(args.init_from) if args.init_from is not None else None,
         "resume_from": str(args.resume_from) if args.resume_from is not None else None,
+        "resume_optimizer_state_restored": args.resume_from is not None,
+        "resume_dual_state_restored": args.resume_from is not None,
+        "resume_restored_step": int(start_step) if args.resume_from is not None else None,
+        "resume_train_state_sha256": (
+            hashlib.sha256((args.resume_from / "train_state.msgpack").read_bytes()).hexdigest()
+            if args.resume_from is not None else None
+        ),
         "warm_start_source_step": init_from_step,
         "save_every": int(args.save_every),
         "log_every": int(args.log_every),

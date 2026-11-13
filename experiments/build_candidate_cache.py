@@ -312,9 +312,9 @@ def _verify_object_knn_parity(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--g0-graph", type=Path, required=True)
-    parser.add_argument("--transitions", type=Path, required=True)
-    parser.add_argument("--sim-state", type=Path, required=True)
+    parser.add_argument("--g0-graph", type=Path)
+    parser.add_argument("--transitions", type=Path)
+    parser.add_argument("--sim-state", type=Path)
     parser.add_argument("--out", type=Path, required=True,
                         help="candidate cache .npz path")
     parser.add_argument("--knn", type=int, default=32)
@@ -330,6 +330,17 @@ def main(argv: list[str] | None = None) -> int:
                         help="robot uses only continuous robot coordinates in window kNN")
     parser.add_argument("--knn-changed", type=int, default=32,
                         help="neighbors per source for nonzero object changes")
+    parser.add_argument("--object-match", choices=("puzzle", "threshold"), default="puzzle")
+    parser.add_argument("--cube-double-dataset", type=Path,
+                        help="standard OGBench cube-double archive for threshold matching")
+    parser.add_argument("--checkpoint", type=Path,
+                        help="robot-only v0.8 checkpoint required by cube threshold matching")
+    parser.add_argument("--delta-pos", type=float,
+                        help="cube position threshold in meters")
+    parser.add_argument("--delta-rot", type=float, default=15.0,
+                        help="cube rotation threshold in degrees")
+    parser.add_argument("--source-limit", type=int,
+                        help="optional diagnostic limit; omit for benchmark runs")
     args = parser.parse_args(argv)
     if args.knn < 1 or args.parity_size < 0 or args.batch_size < 1:
         parser.error("knn and batch-size must be positive; parity-size must be non-negative")
@@ -337,6 +348,24 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("window must be positive")
     if args.knn_changed < 1:
         parser.error("knn-changed must be positive")
+    if args.object_match == "threshold":
+        if args.cube_double_dataset is None or args.checkpoint is None or args.delta_pos is None:
+            parser.error("threshold mode requires --cube-double-dataset, --checkpoint, and --delta-pos")
+        if args.transitions is not None or args.sim_state is not None or args.g0_graph is not None:
+            parser.error("cube threshold mode uses the OGBench archive directly, not puzzle graph inputs")
+        if args.window != 5 or args.knn != 32 or args.feature_mode != "robot":
+            parser.error("cube threshold mode fixes --window 5, --knn 32, and --feature-mode robot")
+        from graphcritic.bridges.cube_graph import build_cube_candidate_cache
+
+        result = build_cube_candidate_cache(
+            args.cube_double_dataset, args.checkpoint, args.out,
+            delta_pos=args.delta_pos, delta_rot_deg=args.delta_rot,
+            knn=args.knn, source_limit=args.source_limit,
+        )
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.g0_graph is None or args.transitions is None or args.sim_state is None:
+        parser.error("Puzzle candidate construction requires --g0-graph, --transitions, and --sim-state")
     if args.object_change_set is not None:
         if args.window != 5 or args.feature_mode != "robot":
             parser.error("object-change mode requires --window 5 --feature-mode robot")

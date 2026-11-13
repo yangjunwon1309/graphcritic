@@ -24,6 +24,104 @@ from graphcritic.state_schema import OGBenchPuzzleStateSchema
 from graphcritic.types import SchemaError, SimStateSet, TransitionSet
 
 
+def cube_symmetry_rotations() -> np.ndarray:
+    """The 24 proper signed-permutation rotations of a cube."""
+    import itertools
+
+    rotations = []
+    for permutation in itertools.permutations(range(3)):
+        base = np.eye(3, dtype=np.float64)[:, permutation]
+        for signs in itertools.product((-1.0, 1.0), repeat=3):
+            rotation = base * np.asarray(signs, dtype=np.float64)[None, :]
+            if np.linalg.det(rotation) > 0.5:
+                rotations.append(rotation)
+    result = np.stack(rotations)
+    if result.shape != (24, 3, 3):  # defensive check for the group construction
+        raise RuntimeError("cube symmetry group must contain 24 proper rotations")
+    return result
+
+
+_CUBE_SYMMETRIES = cube_symmetry_rotations()
+
+
+def _wxyz_to_rotation(quaternion: np.ndarray) -> np.ndarray:
+    """Convert normalized wxyz quaternions to rotation matrices."""
+    q = np.asarray(quaternion, dtype=np.float64)
+    if q.shape[-1] != 4:
+        raise SchemaError("cube quaternions must have final dimension four in wxyz order")
+    norm = np.linalg.norm(q, axis=-1, keepdims=True)
+    if np.any(~np.isfinite(q)) or np.any(norm < 1e-12):
+        raise SchemaError("cube quaternions must be finite and nonzero")
+    w, x, y, z = np.moveaxis(q / norm, -1, 0)
+    matrix = np.empty(q.shape[:-1] + (3, 3), dtype=np.float64)
+    matrix[..., 0, 0] = 1 - 2 * (y * y + z * z)
+    matrix[..., 0, 1] = 2 * (x * y - z * w)
+    matrix[..., 0, 2] = 2 * (x * z + y * w)
+    matrix[..., 1, 0] = 2 * (x * y + z * w)
+    matrix[..., 1, 1] = 1 - 2 * (x * x + z * z)
+    matrix[..., 1, 2] = 2 * (y * z - x * w)
+    matrix[..., 2, 0] = 2 * (x * z - y * w)
+    matrix[..., 2, 1] = 2 * (y * z + x * w)
+    matrix[..., 2, 2] = 1 - 2 * (x * x + y * y)
+    return matrix
+
+
+def object_distance(o: np.ndarray, o_prime: np.ndarray) -> tuple[np.ndarray | float, np.ndarray | float]:
+    """Return cube-double ``(D_pos, D_rot)`` for ordered cube poses.
+
+    Each input has shape ``(..., 2, 7)`` with two indexed XYZ+wxyz poses.
+    ``D_pos`` is the maximum of the per-cube Euclidean position errors.
+    ``D_rot`` is the maximum cube-symmetry quotient geodesic angle in radians,
+    using ``min_S angle(R_i.T @ S @ R'_i)`` for the 24 proper cube rotations.
+    Quaternion sign flips therefore leave the result unchanged.
+    """
+    left = np.asarray(o, dtype=np.float64)
+    right = np.asarray(o_prime, dtype=np.float64)
+    if left.ndim < 2 or right.ndim < 2 or left.shape[-2:] != (2, 7) or right.shape[-2:] != (2, 7):
+        raise SchemaError("cube object states must have shape (..., 2, 7) [XYZ,wxyz] and retain cube order")
+    try:
+        left, right = np.broadcast_arrays(left, right)
+    except ValueError as exc:
+        raise SchemaError("cube object states must have broadcast-compatible leading dimensions") from exc
+    if np.any(~np.isfinite(left)) or np.any(~np.isfinite(right)):
+        raise SchemaError("cube object states must be finite")
+    pos = np.max(np.linalg.norm(left[..., :, :3] - right[..., :, :3], axis=-1), axis=-1)
+    left_rot = _wxyz_to_rotation(left[..., :, 3:])
+    right_rot = _wxyz_to_rotation(right[..., :, 3:])
+    cube_angles = []
+    for cube in range(2):
+        a = np.swapaxes(left_rot[..., cube, :, :], -1, -2)
+        b = right_rot[..., cube, :, :]
+        minimum = np.full(pos.shape, np.inf, dtype=np.float64)
+        for symmetry in _CUBE_SYMMETRIES:
+            relative = a @ symmetry @ b
+            cosine = np.clip((np.trace(relative, axis1=-2, axis2=-1) - 1.0) * 0.5, -1.0, 1.0)
+            minimum = np.minimum(minimum, np.arccos(cosine))
+        cube_angles.append(minimum)
+    rot = np.maximum(cube_angles[0], cube_angles[1])
+    if pos.ndim == 0:
+        return float(pos), float(rot)
+    return pos, rot
+
+
+def object_threshold_match(
+    o: np.ndarray, o_prime: np.ndarray, *, delta_pos: float, delta_rot: float,
+    representation: str = "cube",
+) -> np.ndarray | bool:
+    """Apply cube tolerances or the discrete Puzzle ``δ=0`` special case."""
+    if not np.isfinite(delta_pos) or delta_pos < 0 or not np.isfinite(delta_rot) or delta_rot < 0:
+        raise ValueError("object tolerances must be finite and non-negative")
+    if representation == "puzzle":
+        if delta_pos != 0 or delta_rot != 0:
+            raise ValueError("the Puzzle button representation is the exact-equality δ=0 special case")
+        return object_match(o, o_prime)
+    if representation != "cube":
+        raise ValueError("representation must be 'cube' or 'puzzle'")
+    distance_pos, distance_rot = object_distance(o, o_prime)
+    matched = (np.asarray(distance_pos) <= float(delta_pos)) & (np.asarray(distance_rot) <= float(delta_rot))
+    return bool(matched) if matched.ndim == 0 else matched
+
+
 def object_match(x: np.ndarray, y: np.ndarray, *, epsilon: float | np.ndarray | None = None) -> np.ndarray | bool:
     """Return whether two object states match.
 

@@ -17,7 +17,7 @@ if str(ROOT) not in sys.path:
 
 import numpy as np
 
-from graphcritic.bridges.models import prepare_puzzle_model_data
+from graphcritic.bridges.models import prepare_cube_robot_model_data, prepare_puzzle_model_data
 from graphcritic.bridges.object_state import load_or_build_object_pair_index
 from graphcritic.bridges.windows import puzzle_state_windows
 from graphcritic.io import load_sim_state, load_transitions
@@ -179,8 +179,12 @@ def heldout_metrics(data, states: np.ndarray, next_index: np.ndarray, predict,
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--transitions", type=Path, required=True)
-    parser.add_argument("--sim-state", type=Path, required=True)
+    parser.add_argument("--transitions", type=Path)
+    parser.add_argument("--sim-state", type=Path)
+    parser.add_argument("--cube-double-dataset", type=Path,
+                        help="standard cube-double-play-v0 archive for --input-part=robot")
+    parser.add_argument("--input-part", choices=("all", "robot"), default="all",
+                        help="model input: existing puzzle vector or only its continuous robot part")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--steps", type=int, default=200_000,
@@ -495,11 +499,25 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("encoder and projector must each have at least one hidden layer")
 
     jax, jnp, _, serialization, _ = _jax_modules()
-    trans, transition_meta = load_transitions(args.transitions)
-    sim_state = load_sim_state(args.sim_state)
-    data = prepare_puzzle_model_data(trans, sim_state, seed=args.seed)
+    if args.cube_double_dataset is not None:
+        if args.transitions is not None or args.sim_state is not None:
+            raise SystemExit("--cube-double-dataset cannot be combined with --transitions/--sim-state")
+        if args.input_part != "robot":
+            raise SystemExit("cube-double training requires --input-part=robot")
+        trans, transition_meta, data = prepare_cube_robot_model_data(
+            str(args.cube_double_dataset), seed=args.seed,
+        )
+    else:
+        if args.transitions is None or args.sim_state is None:
+            raise SystemExit("puzzle training requires both --transitions and --sim-state")
+        trans, transition_meta = load_transitions(args.transitions)
+        sim_state = load_sim_state(args.sim_state)
+        data = prepare_puzzle_model_data(trans, sim_state, seed=args.seed)
     next_index = next_state_indices(trans.terminal)
-    frame_states_np = np.concatenate((data.state_cont, data.state_bits), axis=1).astype(np.float32)
+    frame_states_np = (
+        data.state_cont if args.input_part == "robot"
+        else np.concatenate((data.state_cont, data.state_bits), axis=1)
+    ).astype(np.float32)
     states_np = (
         puzzle_state_windows(
             frame_states_np, trans, data.terminal_state_index, window=args.window
@@ -634,6 +652,7 @@ def main(argv: list[str] | None = None) -> int:
         "input_dim": int(states_np.shape[1]),
         "frame_dim": int(frame_states_np.shape[1]),
         "window": int(args.window),
+        "input_part": args.input_part,
         "constraint_horizon": int(args.constraint_horizon),
         "continuous_dim": int(data.n_cont),
         "button_dim": int(data.n_bits),

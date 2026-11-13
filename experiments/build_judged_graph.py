@@ -190,12 +190,22 @@ def _make_artifact(
 def _parse(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--judge", choices=("flow", "quasimetric"), required=True)
-    parser.add_argument("--g0-graph", type=Path, required=True)
+    parser.add_argument("--g0-graph", type=Path)
     parser.add_argument("--reference-graph", type=Path)
-    parser.add_argument("--transitions", type=Path, required=True)
-    parser.add_argument("--sim-state", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--candidate-cache", type=Path, required=True)
+    parser.add_argument("--transitions", type=Path)
+    parser.add_argument("--sim-state", type=Path)
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--candidate-cache", type=Path)
+    parser.add_argument("--score-cache", type=Path,
+                        help="v1.8 precomputed d_theta scores for threshold candidates")
+    parser.add_argument("--cube-double-dataset", type=Path,
+                        help="standard cube-double archive used by v1.8 graph construction")
+    parser.add_argument("--task", type=int, choices=range(1, 6),
+                        help="cube-double singletask target (1..5)")
+    parser.add_argument("--object-match", choices=("puzzle", "threshold"), default="puzzle")
+    parser.add_argument("--delta-pos", type=float, help="cube position tolerance in meters")
+    parser.add_argument("--delta-rot", type=float, default=15.0,
+                        help="cube orientation tolerance in degrees")
     parser.add_argument(
         "--target-kind", choices=("regret", "cost", "discounted", "gamma_pow"), default="regret",
         help="critic target representation written for the built graph",
@@ -469,6 +479,57 @@ def _target_summary(
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
+    if args.object_match == "threshold":
+        if (args.judge != "quasimetric" or args.cube_double_dataset is None
+                or args.candidate_cache is None or args.score_cache is None
+                or args.task is None or args.delta_pos is None):
+            raise SystemExit(
+                "cube threshold mode requires --judge quasimetric, --cube-double-dataset, "
+                "--candidate-cache, --score-cache, --task, and --delta-pos"
+            )
+        if args.g0_graph is not None or args.transitions is not None or args.sim_state is not None:
+            raise SystemExit("cube threshold mode uses the standard OGBench archive directly")
+        if args.target_h != 5 or args.knn != 32 or args.bridge_lambda_steps != 10.5:
+            raise SystemExit("v1.8 fixes target h=5, k=32, and bridge lambda=10.5")
+        from graphcritic.bridges.cube_graph import (
+            build_cube_judged_graph, load_cube_context, task_budget_sweep,
+        )
+
+        ctx = load_cube_context(args.cube_double_dataset)
+        with np.load(args.candidate_cache, allow_pickle=False) as archive:
+            pairs = np.asarray(archive["pairs"], dtype=np.int64)
+            candidate_hash = str(archive["dataset_hash"].item())
+        with np.load(args.score_cache, allow_pickle=False) as archive:
+            scores = np.asarray(archive["distance_steps"], dtype=np.float32)
+        if candidate_hash != ctx["dataset_hash"]:
+            raise ValueError("cube candidate cache dataset hash mismatch")
+        if args.sweep_only:
+            result = task_budget_sweep(ctx, args.task, pairs, scores, max_budget=args.b_max)
+            serializable = {
+                key: value for key, value in result.items()
+                if key not in {"accepted_candidate_indices", "accepted_bridge_src", "accepted_bridge_dst",
+                               "accepted_bridge_weight_steps", "accepted_bridge_distance_steps",
+                               "c0_node", "cost_by_budget", "node_states", "node_episode", "node_time",
+                               "node_goals", "state_to_node", "base_src", "base_dst", "base_weight_steps"}
+            }
+            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.out).write_text(json.dumps(serializable, indent=2, sort_keys=True) + "\n")
+            print(json.dumps({k: serializable[k] for k in ("task", "n_candidate_pairs", "n_accepted_bridges", "r_sat", "b_star")}, sort_keys=True))
+            return 0
+        if args.target_kind not in {"discounted", "gamma_pow"}:
+            raise SystemExit("cube threshold graphs require --target-kind discounted or gamma_pow")
+        result = build_cube_judged_graph(
+            args.cube_double_dataset, args.candidate_cache, args.score_cache, args.out,
+            task=args.task, b_max=args.b_max, target_kind=args.target_kind,
+            gamma=args.discount_gamma, delta_pos=args.delta_pos,
+            delta_rot_deg=args.delta_rot, bridge_lambda_steps=args.bridge_lambda_steps,
+        )
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.g0_graph is None or args.transitions is None or args.sim_state is None:
+        raise SystemExit("Puzzle graph construction requires --g0-graph, --transitions, and --sim-state")
+    if args.checkpoint is None or args.candidate_cache is None:
+        raise SystemExit("Puzzle graph construction requires --checkpoint and --candidate-cache")
     if (args.knn != 32 or args.delta != 5.0 or args.judge_batch_size < 1
             or args.embedding_pair_batch_size < 1):
         raise SystemExit("v0.8 fixes k=32 and delta=5; judge-batch-size must be positive")

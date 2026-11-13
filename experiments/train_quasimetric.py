@@ -53,7 +53,9 @@ def _targets_at_offset(rows: np.ndarray, data, offset: int) -> tuple[np.ndarray,
     target = positions.copy()
     terminal_mask = positions == terminal_positions
     if np.any(terminal_mask):
-        target[terminal_mask] = data.terminal_state_index[rows[terminal_mask]]
+        # `terminal_state_index` is keyed by the episode's final transition
+        # row, not by every earlier chunk start that lands on that state.
+        target[terminal_mask] = data.terminal_state_index[ends[terminal_mask]]
         if np.any(target[terminal_mask] < 0):
             raise ValueError("held-out terminal endpoint is missing from sim_state")
     return rows[valid], target[valid]

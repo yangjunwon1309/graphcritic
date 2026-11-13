@@ -136,3 +136,17 @@ def test_h5_target_resolves_terminal_endpoint_from_its_own_episode():
     )
     np.testing.assert_array_equal(np.flatnonzero(target.valid), [0, 5])
     np.testing.assert_allclose(target.y[[0, 5]], [0.99**105, 0.99**205], rtol=1e-6)
+
+
+def test_five_step_constraint_maps_boundary_endpoint_to_episode_terminal_state():
+    from types import SimpleNamespace
+
+    from experiments.train_quasimetric import _targets_at_offset
+
+    data = SimpleNamespace(
+        episode_end_rows=np.full(5, 4, dtype=np.int64),
+        terminal_state_index=np.asarray([-1, -1, -1, -1, 5], dtype=np.int64),
+    )
+    rows, endpoints = _targets_at_offset(np.asarray([0, 1, 2]), data, 5)
+    np.testing.assert_array_equal(rows, [0])
+    np.testing.assert_array_equal(endpoints, [5])

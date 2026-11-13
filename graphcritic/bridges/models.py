@@ -164,7 +164,7 @@ def prepare_cube_robot_model_data(
     chunk_rows = train_rows[train_rows + 5 <= ends[train_rows] + 1]
     chunk_end = chunk_rows + 5
     terminal_chunk = chunk_end == ends[chunk_rows] + 1
-    chunk_end[terminal_chunk] = terminal_state_index[chunk_rows[terminal_chunk]]
+    chunk_end[terminal_chunk] = terminal_state_index[ends[chunk_rows[terminal_chunk]]]
     if not len(chunk_rows):
         raise SchemaError("cube-double training split has no valid five-step chunks")
     delta_std = np.maximum(np.std(normalized[chunk_end] - normalized[chunk_rows], axis=0), 1e-6)

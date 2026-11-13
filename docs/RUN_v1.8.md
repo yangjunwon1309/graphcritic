@@ -54,7 +54,7 @@ approved v1.8 window, horizon, and epsilon.
 ```bash
 set -euo pipefail
 cd "$ROOT"
-JAX_PLATFORMS=gpu $PY experiments/train_quasimetric.py \
+JAX_PLATFORMS=cuda $PY experiments/train_quasimetric.py \
   --cube-double-dataset "$DATA" --input-part robot \
   --window 5 --constraint-horizon 5 --epsilon 1.25 \
   --activation gelu --layernorm --grad-clip 1.0 --dual adam \
@@ -88,7 +88,7 @@ Each task graph directory contains both QC `discounted` targets
 ```bash
 set -euo pipefail
 cd "$ROOT"
-JAX_PLATFORMS=gpu $PY experiments/sweep_object_delta.py \
+JAX_PLATFORMS=cuda $PY experiments/sweep_object_delta.py \
   --cube-double-dataset "$DATA" --checkpoint "$STATE/step_020000" \
   --max-budget 32 --embedding-pair-batch-size 4096 --out "$V/bridge_sweep"
 ```

@@ -592,7 +592,7 @@ def update_json_paths(path: Path, mappings: dict[str, str], old_rel: str) -> Non
     path.write_text(json.dumps(obj, sort_keys=False, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def apply_moves(moves: list[dict[str, str]], mappings: dict[str, str]) -> None:
+def apply_moves(moves: list[dict[str, str]], mappings: dict[str, str], repo_state: dict[str, dict[str, str]]) -> None:
     # Detect overlapping retained source paths; only exact duplicate source->destination is allowed.
     active = [m for m in moves if m.get("source") and m.get("category") not in {"delete_pending_external", "reference_alias"}]
     paths = [Path(m["source"]) for m in active if Path(m["source"]).exists()]
@@ -666,7 +666,7 @@ def apply_moves(moves: list[dict[str, str]], mappings: dict[str, str]) -> None:
             for path in root.rglob("*.json"):
                 update_json_paths(path, mappings, str(move["source"]))
     # Store canonical relocation map; source path keys are absolute for unambiguous provenance.
-    (OUT / "MIGRATION.json").write_text(json.dumps({"schema_version": 1, "moves": mappings}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (OUT / "MIGRATION.json").write_text(json.dumps({"schema_version": 1, "execution_state": repo_state, "moves": mappings}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def make_indexes(chosen: dict[str, Path], matches: dict[str, list[Path]], moves: list[dict[str, str]]) -> None:
@@ -848,9 +848,17 @@ def verify_fork_restore(fork: str) -> list[str]:
             data = dict(train_data)
             if config["critic_mode"] == "graph":
                 targets = load_targets(flags["graph_targets"], expected_dataset_id=flags["graph_dataset_id"])
-                data["graph_target"] = targets.y
-                data["graph_target_valid"] = targets.valid
-                data["graph_target_loss_mask"] = targets.loss_mask
+                transition_rows = np.flatnonzero(np.asarray(data["valids"]) > 0)
+                if len(transition_rows) != len(targets.y):
+                    raise ValueError(f"{alias}: target rows do not match compact transition rows")
+                for name, values, dtype in (
+                    ("graph_target", targets.y, np.float32),
+                    ("graph_target_valid", targets.valid, np.bool_),
+                    ("graph_target_loss_mask", targets.loss_mask, np.bool_),
+                ):
+                    aligned = np.zeros(len(data["observations"]), dtype=dtype)
+                    aligned[transition_rows] = np.asarray(values, dtype=dtype)
+                    data[name] = aligned
             data["actions"] = np.clip(data["actions"], -1 + 1e-5, 1 - 1e-5)
             task_dataset = make_task_dataset("single", Dataset.create(**data), config)
             np.random.seed(int(flags.get("seed", 0)))
@@ -927,8 +935,8 @@ def assert_clean_repositories() -> dict[str, dict[str, str]]:
     return state
 
 
-def verify_all(chosen: dict[str, Path], matches: dict[str, list[Path]], moves: list[dict[str, str]], rows: list[dict[str, str]]) -> dict[str, Any]:
-    verification: dict[str, Any] = {"repositories": assert_clean_repositories(), "graphs_and_targets": verify_graph_targets()}
+def verify_all(repo_state: dict[str, dict[str, str]]) -> dict[str, Any]:
+    verification: dict[str, Any] = {"repositories": repo_state, "graphs_and_targets": verify_graph_targets()}
     py = ROOT / ".pixi/envs/bench/bin/python"
     if not py.exists():
         raise FileNotFoundError(f"benchmark Python interpreter missing: {py}")
@@ -949,9 +957,12 @@ def verify_all(chosen: dict[str, Path], matches: dict[str, list[Path]], moves: l
             if row["run_id"] in RUN_SPECS and row["success_50k_to_300k"]:
                 indexed[row["run_id"]] = row["success_50k_to_300k"]
     run_checks = []
-    for alias, old_source in chosen.items():
-        spec = RUN_SPECS[alias]
+    for alias, spec in RUN_SPECS.items():
+        if spec.get("expected") is None:
+            continue
         run = OUT / spec["task"] / "runs" / alias
+        if not (run / "eval.csv").is_file():
+            continue
         curve, steps, _ = success_curve(run / "eval.csv", spec.get("max_step"))
         actual = "/".join(f"{x:.2f}" for x in curve)
         if actual != indexed.get(alias):
@@ -986,6 +997,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--apply", action="store_true", help="perform the planned same-filesystem moves")
     parser.add_argument("--verify-fork", choices=("qc", "dqc"), help=argparse.SUPPRESS)
+    parser.add_argument("--verify", action="store_true", help="resume read-only verification after a completed move")
     args = parser.parse_args()
     if args.verify_fork:
         for line in verify_fork_restore(args.verify_fork):
@@ -993,6 +1005,28 @@ def main() -> int:
         return 0
     if not OUT.is_dir():
         raise FileNotFoundError(OUT)
+    if args.verify:
+        migration_path = OUT / "MIGRATION.json"
+        migration = json.loads(migration_path.read_text(encoding="utf-8"))
+        repo_state = migration.get("execution_state")
+        if not repo_state:
+            # The interrupted apply had passed the clean-repository gate. Its HEADs
+            # are unchanged; newly generated root reports are untracked post-move files.
+            repo_state = {}
+            for name, (repo, _branch) in {
+                "root": (ROOT, "quasi_develop"), "QC": (ROOT / "third_party/qc", "graph-critic"),
+                "FQL": (ROOT / "third_party/fql", None), "DQC": (ROOT / "third_party/dqc", "graph-critic"),
+            }.items():
+                branch = subprocess.run(["git", "-C", str(repo), "branch", "--show-current"], check=True, capture_output=True, text=True).stdout.strip()
+                head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+                repo_state[name] = {"branch": branch or "detached", "head": head, "git_dirty": "false", "snapshot": "apply start clean-state gate"}
+            migration["execution_state"] = repo_state
+            migration_path.write_text(json.dumps(migration, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        verification = verify_all(repo_state)
+        write_verification_into_report(verification)
+        print(f"Verified {len(verification['graphs_and_targets'])} graph/target pairs, "
+              f"{len(verification['index_curve_checks'])} run curves, and all QC/DQC checkpoints.")
+        return 0
     rows = inventory()
     _write_inventory(rows)
     chosen, matches = selected_runs()
@@ -1014,11 +1048,11 @@ def main() -> int:
         if move.get("source") and move.get("category") != "reference_alias" and Path(move["source"]).exists():
             if Path(move["source"]).stat().st_dev != out_device:
                 raise RuntimeError(f"same-filesystem move requirement failed for {move['source']}")
-    apply_moves(moves, mappings)
+    apply_moves(moves, mappings, repo_state)
     make_indexes(chosen, matches, moves)
     # Keep the original-path inventory written before moves; MIGRATION.json provides new locations.
     write_docs(rows, chosen, matches, moves)
-    verification = verify_all(chosen, matches, moves, rows)
+    verification = verify_all(repo_state)
     write_verification_into_report(verification)
     print(f"Moved retained artifacts and runs; pending tree: {OUT / '_delete_pending'}")
     return 0

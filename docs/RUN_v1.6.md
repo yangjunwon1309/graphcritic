@@ -92,7 +92,7 @@ MUJOCO_GL=egl WANDB_MODE=offline PYTHONPATH="$ROOT:$ROOT/third_party/dqc" $PY ma
   --save_dir=$SPEED_DIR
 
 TRAIN_CSV=$(find "$SPEED_DIR" -name train.csv -print -quit)
-$PY -c 'import csv,sys; rows=list(csv.DictReader(open(sys.argv[1]))); row=max(rows,key=lambda r:int(r["step"])); seconds=float(row["training/time/total_time"]); rate=1000/seconds; print(f"seconds={seconds:.3f} updates_per_second={rate:.3f} estimated_300k_hours={300000/rate/3600:.3f}")' "$TRAIN_CSV"
+$PY -c 'import csv,sys; rows=list(csv.DictReader(open(sys.argv[1]))); row=max(rows,key=lambda r:int(r["step"])); seconds=float(row["time/total_time"]); rate=1000/seconds; print(f"seconds={seconds:.3f} updates_per_second={rate:.3f} estimated_300k_hours={300000/rate/3600:.3f}")' "$TRAIN_CSV"
 ```
 
 If the estimate exceeds 3 hours, repeat the same block with `BATCH=1024` and a

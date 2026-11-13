@@ -677,7 +677,7 @@ def make_indexes(chosen: dict[str, Path], matches: dict[str, list[Path]], moves:
         source = chosen.get(alias)
         if source:
             run_path = dest_by_alias.get(alias, source)
-            steps, curve, _ = read_eval(run_path / "eval.csv")
+            curve, steps, _ = success_curve(run_path / "eval.csv", spec.get("max_step"))
             old_path = rel(source)
             target_path = "outputs/" + Path(move_by_alias[alias]["destination"]).relative_to(OUT).as_posix() if alias in move_by_alias else ""
             success = "/".join(f"{x:.2f}" for x in curve)
@@ -998,6 +998,7 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true", help="perform the planned same-filesystem moves")
     parser.add_argument("--verify-fork", choices=("qc", "dqc"), help=argparse.SUPPRESS)
     parser.add_argument("--verify", action="store_true", help="resume read-only verification after a completed move")
+    parser.add_argument("--refresh-index", action="store_true", help="refresh run curves from relocated eval CSVs")
     args = parser.parse_args()
     if args.verify_fork:
         for line in verify_fork_restore(args.verify_fork):
@@ -1005,6 +1006,22 @@ def main() -> int:
         return 0
     if not OUT.is_dir():
         raise FileNotFoundError(OUT)
+    if args.refresh_index:
+        chosen: dict[str, Path] = {}
+        with (OUT / "_inventory.csv").open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row["item_type"] == "run" and row["notes"] in RUN_SPECS:
+                    chosen[row["notes"]] = OUT / row["path"]
+        # Inventory paths are original locations; use them only as the provenance
+        # column while the destination map points to each moved run.
+        run_moves = [
+            {"alias": alias, "category": "retained_run", "destination": str(OUT / spec["task"] / "runs" / alias)}
+            for alias, spec in RUN_SPECS.items() if alias in chosen
+        ]
+        make_indexes(chosen, {}, run_moves)
+        (ROOT / "docs/results_index.md").write_text((OUT / "INDEX.md").read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"Refreshed {len(chosen)} run rows from relocated eval CSVs.")
+        return 0
     if args.verify:
         migration_path = OUT / "MIGRATION.json"
         migration = json.loads(migration_path.read_text(encoding="utf-8"))

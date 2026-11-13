@@ -6,3 +6,7 @@
 	path = third_party/qc
 	url = https://github.com/yangjunwon1309/qc.git
 	branch = graph-critic
+[submodule "third_party/dqc"]
+	path = third_party/dqc
+	url = https://github.com/yangjunwon1309/dqc.git
+	branch = graph-critic

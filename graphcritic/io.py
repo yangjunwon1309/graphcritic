@@ -353,7 +353,7 @@ def _target_config(targets: TargetSet) -> dict[str, Any]:
         "kind": targets.kind,
         "regret_max": targets.regret_max,
     }
-    if targets.kind == "discounted":
+    if targets.kind in {"discounted", "gamma_pow"}:
         config["gamma"] = float(targets.discount_gamma)
     return config
 

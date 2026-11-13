@@ -84,6 +84,21 @@ def critic_targets(
             source[:n_starts][valid[:n_starts] & ~chunk_success & end_finite] = 1
             source[:n_starts][capped] = 2
             loss_mask[:n_starts] = valid[:n_starts]
+        elif cfg.kind == "gamma_pow":
+            gamma_discounted = float(cfg.discount_gamma)
+            success_steps = first_success.astype(np.float64) + 1.0
+            values = np.power(gamma_discounted, float(h) + end_cost)
+            # Unreachable endpoints have zero probability of eventual success.
+            values[~end_reachable] = 0.0
+            values[has_success] = np.power(
+                gamma_discounted, success_steps[has_success]
+            )
+            values[trans.success_cur[:n_starts]] = 1.0
+            capped = valid[:n_starts] & ~chunk_success & ~end_finite
+            source[:n_starts][valid[:n_starts] & chunk_success] = 0
+            source[:n_starts][valid[:n_starts] & ~chunk_success & end_finite] = 1
+            source[:n_starts][capped] = 2
+            loss_mask[:n_starts] = valid[:n_starts]
         else:
             # A temporal path of h edges from the chunk start to endpoint
             # makes C(start) <= h + C(end). An unreachable start behind a

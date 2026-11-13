@@ -197,7 +197,7 @@ def _parse(argv: list[str] | None = None):
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--candidate-cache", type=Path, required=True)
     parser.add_argument(
-        "--target-kind", choices=("regret", "cost", "discounted"), default="regret",
+        "--target-kind", choices=("regret", "cost", "discounted", "gamma_pow"), default="regret",
         help="critic target representation written for the built graph",
     )
     parser.add_argument(
@@ -387,7 +387,8 @@ def _write_graph_targets(
     targets = critic_targets(
         trans, artifact, TargetConfig(
             h=int(target_h), unit="steps", kind=target_kind,
-            discount_gamma=float(discount_gamma) if target_kind == "discounted" else None,
+            discount_gamma=float(discount_gamma)
+            if target_kind in {"discounted", "gamma_pow"} else None,
         )
     )
     if len(targets.y) != trans.n_rows:
@@ -411,6 +412,13 @@ def _target_summary(
                 f"{prefix}_discounted_max": None,
                 f"{prefix}_discounted_capped_loss_mask_fraction": None,
             }
+        if target_kind == "gamma_pow":
+            return {
+                f"{prefix}_gamma_pow_mean": None,
+                f"{prefix}_gamma_pow_p50": None,
+                f"{prefix}_gamma_pow_p90": None,
+                f"{prefix}_gamma_pow_unreachable_fraction": None,
+            }
         if target_kind == "cost":
             return {
                 f"{prefix}_cost_mean": None,
@@ -426,6 +434,15 @@ def _target_summary(
         }
     included = targets.valid & targets.loss_mask
     values = np.asarray(targets.y[included], dtype=np.float64)
+    if targets.kind == "gamma_pow":
+        return {
+            f"{prefix}_gamma_pow_mean": float(np.mean(values)) if values.size else None,
+            f"{prefix}_gamma_pow_p50": float(np.quantile(values, 0.5)) if values.size else None,
+            f"{prefix}_gamma_pow_p90": float(np.quantile(values, 0.9)) if values.size else None,
+            f"{prefix}_gamma_pow_unreachable_fraction": (
+                float(np.mean(values == 0.0)) if values.size else None
+            ),
+        }
     if targets.kind in {"cost", "discounted"}:
         name = targets.kind
         loss_mask_count = int(np.count_nonzero(targets.loss_mask))
@@ -1163,7 +1180,7 @@ def main(argv: list[str] | None = None) -> int:
         "target_kind": args.target_kind,
         "target_h": int(args.target_h),
         **({"discount_gamma": float(args.discount_gamma)}
-           if args.target_kind == "discounted" else {}),
+           if args.target_kind in {"discounted", "gamma_pow"} else {}),
         f"h{args.target_h}_{args.target_kind}_valid_fraction": (
             float(np.mean(targets.valid)) if targets is not None else None
         ),

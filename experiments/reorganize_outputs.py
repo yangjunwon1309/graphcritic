@@ -968,8 +968,12 @@ def verify_all(chosen: dict[str, Path], matches: dict[str, list[Path]], moves: l
 def write_verification_into_report(verification: dict[str, Any]) -> None:
     report = ROOT / "docs/results_cleanup.md"
     content = report.read_text(encoding="utf-8")
+    repo_summary = ", ".join(
+        "{} `{}` at `{}` ({})".format(name, value["git_dirty"], value["head"], value["branch"])
+        for name, value in verification["repositories"].items()
+    )
     section = ["### Verification results", "",
-               f"- Repository cleanliness at apply/verification: {', '.join(f'{k} `{v['git_dirty']}` at `{v['head']}` ({v['branch']})' for k, v in verification['repositories'].items())}.",
+               f"- Repository cleanliness at apply/verification: {repo_summary}.",
                f"- Retained graph/target pairs loaded: {len(verification['graphs_and_targets'])}; all stored graph hashes, dataset IDs, and target graph links validated.",
                f"- Checkpoint restores: QC {len(verification['checkpoint_restores']['qc'])}/{len(verification['checkpoint_restores']['qc'])}; DQC {len(verification['checkpoint_restores']['dqc'])}/{len(verification['checkpoint_restores']['dqc'])}.",
                f"- INDEX success curves matched relocated eval CSVs: {len(verification['index_curve_checks'])}/{len(RUN_SPECS)-2}; all selected curves matched.", ""]

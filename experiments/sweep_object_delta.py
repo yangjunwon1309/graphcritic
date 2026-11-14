@@ -39,6 +39,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--max-budget", type=int, default=32)
+    parser.add_argument("--bridge-filter", choices=("c0", "none"), default="none")
     parser.add_argument("--embedding-pair-batch-size", type=int, default=4096)
     parser.add_argument("--no-build-graphs", action="store_true")
     args = parser.parse_args(argv)
@@ -74,6 +75,7 @@ def main(argv: list[str] | None = None) -> int:
     ctx = load_cube_context(args.cube_double_dataset)
     sweep, selected = summarize_delta_sweep(
         ctx, candidate_paths, score_paths, max_budget=args.max_budget,
+        bridge_filter=args.bridge_filter,
     )
     stages["delta_cost_sweep_seconds"] = time.perf_counter() - sweep_started
     sweep["elapsed_seconds"] = dict(stages)
@@ -101,7 +103,10 @@ def main(argv: list[str] | None = None) -> int:
     accepted_pos: list[np.ndarray] = []
     accepted_rot: list[np.ndarray] = []
     for task in range(1, 6):
-        result = task_budget_sweep(ctx, task, pairs, distances, max_budget=args.max_budget)
+        result = task_budget_sweep(
+            ctx, task, pairs, distances, max_budget=args.max_budget,
+            bridge_filter=args.bridge_filter,
+        )
         accepted_ids = result["accepted_candidate_indices"]
         accepted_pairs = pairs[accepted_ids]
         mismatch = compute_grasp_mismatch(ctx, accepted_pairs)
@@ -149,6 +154,7 @@ def main(argv: list[str] | None = None) -> int:
             args.out / "graphs" / f"task{task}", task=task, b_max=b_star,
             target_kind="discounted", gamma=0.99, delta_pos=selected,
             delta_rot_deg=15.0, max_budget_for_sweep=args.max_budget,
+            bridge_filter=args.bridge_filter,
         )
         graph_results[str(task)] = result
         print(json.dumps({"task": task, "graph_hash": result["graph_hash"], "b_star": b_star,

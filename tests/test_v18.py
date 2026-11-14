@@ -3,6 +3,7 @@ from pathlib import Path
 import numpy as np
 
 from graphcritic.bridges.object_state import (
+    cube_object_threshold_match,
     cube_symmetry_rotations,
     object_distance,
     object_threshold_match,
@@ -227,3 +228,117 @@ def test_v18_report_mode_keeps_collapse_dead_unit_and_dimension_hard_gates(tmp_p
             capture_output=True, text=True,
         )
         assert result.returncode == 2
+
+
+def _cube_pose_pair():
+    poses = np.zeros((2, 7), dtype=np.float64)
+    poses[:, 3] = 1.0
+    poses[:, :3] = [[0.42, 0.0, 0.02], [0.52, 0.0, 0.02]]
+    return poses
+
+
+def test_v18b_component_match_rejects_height_gap_and_contact_mismatch_but_keeps_cube_symmetry():
+    first = _cube_pose_pair()
+    raised = first.copy()
+    raised[1, 2] += 0.015
+    assert not cube_object_threshold_match(
+        first, raised, delta_xy=0.04, delta_z=0.01, contact=False, contact_prime=False
+    )
+    assert not cube_object_threshold_match(
+        first, first, delta_xy=0.04, delta_z=0.01, contact=False, contact_prime=True
+    )
+    symmetric = first.copy()
+    symmetric[:, 3:] = _matrix_to_wxyz(cube_symmetry_rotations()[7])
+    assert cube_object_threshold_match(
+        first, symmetric, delta_xy=0.04, delta_z=0.01,
+        delta_rot=np.deg2rad(15), contact=False, contact_prime=False,
+    )
+
+
+def _budget_context(contact_flags):
+    from types import SimpleNamespace
+
+    states = np.zeros((4, 37), dtype=np.float32)
+    states[:, 18] = np.asarray(contact_flags, dtype=np.float32)
+    objects = _cube_pose_pair()[None, :, :].repeat(4, axis=0)
+    return {
+        "states": states,
+        "objects": objects,
+        "graph_node_state_ids": np.arange(4, dtype=np.int64),
+        "state_episode": np.asarray([0, 0, 1, 1], dtype=np.int64),
+        "state_time": np.asarray([0, 1, 0, 1], dtype=np.int64),
+        "state_success_by_task": {1: np.asarray([False, False, False, True])},
+        "transitions": SimpleNamespace(
+            episode_id=np.asarray([0, 1], dtype=np.int64),
+            terminal=np.asarray([True, True], dtype=bool),
+            n_rows=2,
+        ),
+    }
+
+
+def test_v18b_free_robot_distance_cap_only_applies_when_both_endpoints_are_free():
+    from graphcritic.bridges.cube_graph import task_budget_sweep
+
+    pairs = np.asarray([[0, 2]], dtype=np.int64)
+    free_ctx = _budget_context([0, 0, 0, 0])
+    raised_ctx = _budget_context([0, 0, 1, 0])
+    free = task_budget_sweep(
+        free_ctx, 1, pairs, np.asarray([30.0]), max_budget=1,
+        bridge_filter="none", k_free=40,
+    )
+    with_contact = task_budget_sweep(
+        raised_ctx, 1, pairs, np.asarray([30.0]), max_budget=1,
+        bridge_filter="none", k_free=40,
+    )
+    assert free["n_accepted_bridges"] == 1
+    assert with_contact["n_accepted_bridges"] == 0
+
+
+def test_v18b_none_filter_allows_a_two_bridge_chain():
+    from graphcritic.bridges.cube_graph import budget_cost_sweep
+
+    costs = budget_cost_sweep(
+        4, np.asarray([3]),
+        np.asarray([2]), np.asarray([3]), np.asarray([1.0]),
+        np.asarray([0, 1]), np.asarray([1, 2]), np.asarray([2.0, 2.0]),
+        max_budget=2,
+    )
+    assert np.isinf(costs[0, 0])
+    assert np.isinf(costs[1, 0])
+    assert np.isfinite(costs[2, 0])
+    assert costs[2, 0] == 5.0
+
+
+def test_v18b_puzzle_graph_hash_regression_fixture_is_unchanged():
+    # Keep the generic/puzzle artifact construction covered while v1.8b
+    # changes only the cube-specific bridge builder.
+    from graphcritic.config import FeatureConfig, GraphConfig
+    from graphcritic.types import EdgeSet, GraphArtifact, NodeSet
+    from experiments.build_judged_graph import _make_artifact
+
+    base = GraphArtifact(
+        config=GraphConfig(graph_kind="node", feature=FeatureConfig(standardize=False)),
+        feature_stats={"mean": np.asarray([0.0], np.float32), "std": np.asarray([1.0], np.float32)},
+        nodes=NodeSet(
+            rep_feat=np.asarray([[0.0], [1.0], [2.0]], np.float32),
+            rep_ref=np.asarray([[-1, 0], [-1, 0], [-1, 0]], np.int64),
+            assign_cur=np.empty(0, np.int64), assign_next=np.empty(0, np.int64),
+            is_goal=np.asarray([False, False, True]),
+        ),
+        edges=EdgeSet(
+            src=np.asarray([0, 1]), dst=np.asarray([1, 2]),
+            kappa=np.ones(2, np.int64), n_pos=np.ones(2, np.int64),
+            n_neg=np.zeros(2, np.int64), kind=np.zeros(2, np.int8),
+        ),
+        weights=np.asarray([1.0, 1.0]), cost=np.asarray([2.0, 1.0, 0.0]),
+        succ=np.asarray([1, 2, -1]),
+        meta={"dataset_id": "lambda-test", "source": "test", "core_version": "0.5.0",
+              "n_rows": 0, "c_max_steps": 3},
+    )
+    artifact = _make_artifact(
+        base, np.asarray([0]), np.asarray([2]), np.asarray([2.5]), np.asarray([2.5]),
+        np.asarray([3.0, 1.0, 0.0]), np.asarray([1, 2, -1]),
+        judge_name="quasimetric", model_metadata={"params_sha256": "abc"},
+        candidate_rule="test", window_size=5, bridge_lambda_steps=0.0,
+    )
+    assert artifact.content_hash == "5122c919d2bca72b4e3b8003d2cb3c782340b0256c79eb4fb76bf0219fa00012"

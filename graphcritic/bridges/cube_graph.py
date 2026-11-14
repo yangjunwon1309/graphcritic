@@ -23,7 +23,7 @@ from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import cKDTree
 
 from graphcritic.bridges.insert import layered_reverse_dijkstra, used_bridge_mask_for_budget
-from graphcritic.bridges.object_state import object_distance
+from graphcritic.bridges.object_state import cube_object_distance_components, object_distance
 from graphcritic.bridges.windows import puzzle_state_windows
 from graphcritic.config import TargetConfig
 from graphcritic.envs.ogbench_cube import (
@@ -44,6 +44,9 @@ MAX_DISTANCE_STEPS = 20.0
 BRIDGE_LAMBDA_STEPS = 10.5
 DELTA_ROT_DEG = 15.0
 DELTA_POS_CANDIDATES_M = (0.005, 0.01, 0.02, 0.03, 0.04)
+DELTA_Z_V18B_M = 0.01
+DELTA_XY_V18B_CANDIDATES_M = (0.02, 0.03, 0.04)
+K_FREE_V18B_CANDIDATES = (20, 40, 80)
 
 
 def _next_state_indices(terminal: np.ndarray) -> np.ndarray:
@@ -150,14 +153,23 @@ def build_cube_candidate_cache(
     checkpoint: str | Path,
     out: str | Path,
     *,
-    delta_pos: float,
+    delta_pos: float | None = None,
+    delta_xy: float | None = None,
+    delta_z: float = DELTA_Z_V18B_M,
+    require_contact_match: bool = False,
     delta_rot_deg: float = DELTA_ROT_DEG,
     knn: int = K_NEIGHBORS,
     source_limit: int | None = None,
 ) -> dict[str, Any]:
     """Create cross-episode object-matched robot-window kNN candidates."""
-    if not math.isfinite(delta_pos) or delta_pos < 0:
+    if (delta_pos is None) == (delta_xy is None):
+        raise ValueError("provide exactly one of delta_pos or delta_xy")
+    if delta_pos is not None and (not math.isfinite(delta_pos) or delta_pos < 0):
         raise ValueError("delta_pos must be finite and non-negative, in meters")
+    if delta_xy is not None and (not math.isfinite(delta_xy) or delta_xy < 0):
+        raise ValueError("delta_xy must be finite and non-negative, in meters")
+    if not math.isfinite(delta_z) or delta_z < 0:
+        raise ValueError("delta_z must be finite and non-negative, in meters")
     if not math.isfinite(delta_rot_deg) or delta_rot_deg < 0:
         raise ValueError("delta_rot_deg must be finite and non-negative, in degrees")
     if knn != K_NEIGHBORS:
@@ -190,18 +202,27 @@ def build_cube_candidate_cache(
     source_local = local_of_state[source_ids]
     if np.any(source_local < 0):
         raise RuntimeError("every chunk boundary must be in the candidate destination table")
-    radius = math.sqrt(2.0) * float(delta_pos) + 1e-12
+    strict_components = delta_xy is not None
+    radius = (
+        math.sqrt(2.0) * float(delta_pos)
+        if not strict_components
+        else math.sqrt(2.0 * float(delta_xy) ** 2 + 2.0 * float(delta_z) ** 2)
+    ) + 1e-12
     angle_limit = math.radians(float(delta_rot_deg))
     pair_src: list[np.ndarray] = []
     pair_dst: list[np.ndarray] = []
     pair_pos: list[np.ndarray] = []
+    pair_xy: list[np.ndarray] = []
+    pair_z: list[np.ndarray] = []
     pair_rot: list[np.ndarray] = []
+    pair_contact_mismatch: list[np.ndarray] = []
     position_tolerance_pairs = 0
     rotation_pairs_checked = 0
     # Layouts repeat heavily. Bound query_ball_point's Python result size even
     # at the largest δ candidate.
     query_batch = 32
     robot_features = windows[node_ids]
+    node_contact = np.asarray(ctx["states"][:, 18] > 0.5, dtype=bool)[node_ids]
     for batch_start in range(0, len(source_ids), query_batch):
         batch_src_ids = source_ids[batch_start : batch_start + query_batch]
         batch_src_local = source_local[batch_start : batch_start + query_batch]
@@ -219,9 +240,20 @@ def build_cube_candidate_cache(
                 continue
             source_xyz = ctx["objects"][src_id, :, :3]
             candidate_xyz = node_objects[candidate_local, :, :3]
-            candidate_dpos = np.max(np.linalg.norm(candidate_xyz - source_xyz[None, :, :], axis=2), axis=1)
-            position_local = candidate_local[candidate_dpos <= delta_pos]
-            position_dpos = candidate_dpos[candidate_dpos <= delta_pos]
+            candidate_delta_xyz = candidate_xyz - source_xyz[None, :, :]
+            candidate_dpos = np.max(np.linalg.norm(candidate_delta_xyz, axis=2), axis=1)
+            candidate_dxy = np.max(np.linalg.norm(candidate_delta_xyz[:, :, :2], axis=2), axis=1)
+            candidate_dz = np.max(np.abs(candidate_delta_xyz[:, :, 2]), axis=1)
+            if strict_components:
+                keep = (candidate_dxy <= float(delta_xy)) & (candidate_dz <= float(delta_z))
+                if require_contact_match:
+                    keep &= node_contact[candidate_local] == bool(ctx["states"][src_id, 18] > 0.5)
+            else:
+                keep = candidate_dpos <= float(delta_pos)
+            position_local = candidate_local[keep]
+            position_dpos = candidate_dpos[keep]
+            position_dxy = candidate_dxy[keep]
+            position_dz = candidate_dz[keep]
             if not len(position_local):
                 continue
             position_tolerance_pairs += len(position_local)
@@ -230,9 +262,14 @@ def build_cube_candidate_cache(
             order = np.lexsort((node_ids[position_local], feature_dist))
             ranked_local = position_local[order]
             ranked_dpos = position_dpos[order]
+            ranked_dxy = position_dxy[order]
+            ranked_dz = position_dz[order]
             chosen_local: list[np.ndarray] = []
             chosen_dpos: list[np.ndarray] = []
+            chosen_dxy: list[np.ndarray] = []
+            chosen_dz: list[np.ndarray] = []
             chosen_drot: list[np.ndarray] = []
+            chosen_contact_mismatch: list[np.ndarray] = []
             chosen_count = 0
             # Position filtering is cheap and broad. Check the more expensive
             # 24-way rotational quotient in robot-distance order, stopping as
@@ -248,7 +285,12 @@ def build_cube_candidate_cache(
                 if np.any(good):
                     chosen_local.append(local[good])
                     chosen_dpos.append(ranked_dpos[offset : offset + len(local)][good])
+                    chosen_dxy.append(ranked_dxy[offset : offset + len(local)][good])
+                    chosen_dz.append(ranked_dz[offset : offset + len(local)][good])
                     chosen_drot.append(drot[good])
+                    chosen_contact_mismatch.append(
+                        node_contact[local[good]] != bool(ctx["states"][src_id, 18] > 0.5)
+                    )
                     chosen_count += int(np.count_nonzero(good))
                 if chosen_count >= knn:
                     break
@@ -256,51 +298,73 @@ def build_cube_candidate_cache(
                 continue
             valid_local = np.concatenate(chosen_local)[:knn]
             valid_pos = np.concatenate(chosen_dpos)[:knn]
+            valid_xy = np.concatenate(chosen_dxy)[:knn]
+            valid_z = np.concatenate(chosen_dz)[:knn]
             valid_rot = np.concatenate(chosen_drot)[:knn]
+            valid_contact_mismatch = np.concatenate(chosen_contact_mismatch)[:knn]
             order = np.arange(len(valid_local), dtype=np.int64)
             pair_src.append(np.full(len(order), int(src_id), dtype=np.int64))
             pair_dst.append(node_ids[valid_local[order]].astype(np.int64))
             pair_pos.append(valid_pos[order].astype(np.float32))
+            pair_xy.append(valid_xy[order].astype(np.float32))
+            pair_z.append(valid_z[order].astype(np.float32))
             pair_rot.append(valid_rot[order].astype(np.float32))
+            pair_contact_mismatch.append(valid_contact_mismatch[order])
         done = batch_start + len(batch_src_ids)
         if done == len(source_ids) or done % 20_000 == 0:
             print(
-                f"cube object kNN δp={delta_pos * 100:.1f}cm: sources={done}/{len(source_ids)}",
+                f"cube object kNN δ={'xy '+str(round(float(delta_xy)*100,1))+'cm' if strict_components else str(round(float(delta_pos)*100,1))+'cm'}: sources={done}/{len(source_ids)}",
                 file=sys.stderr, flush=True,
             )
     if pair_src:
         src = np.concatenate(pair_src)
         dst = np.concatenate(pair_dst)
         dpos = np.concatenate(pair_pos)
+        dxy = np.concatenate(pair_xy)
+        dz = np.concatenate(pair_z)
         drot = np.concatenate(pair_rot)
+        contact_mismatch = np.concatenate(pair_contact_mismatch)
         order = np.lexsort((dst, src))
         pairs = np.column_stack((src[order], dst[order])).astype(np.int32)
-        dpos, drot = dpos[order], drot[order]
+        dpos, dxy, dz, drot, contact_mismatch = (
+            dpos[order], dxy[order], dz[order], drot[order], contact_mismatch[order]
+        )
     else:
         pairs = np.empty((0, 2), dtype=np.int32)
-        dpos = drot = np.empty(0, dtype=np.float32)
+        dpos = dxy = dz = drot = np.empty(0, dtype=np.float32)
+        contact_mismatch = np.empty(0, dtype=bool)
     out_path = Path(out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         out_path,
         pairs=pairs,
         object_distance_pos_m=dpos,
+        object_distance_xy_m=dxy,
+        object_distance_z_m=dz,
         object_distance_rot_rad=drot,
+        contact_mismatch=contact_mismatch,
         node_ids=node_ids.astype(np.int32),
         dataset_hash=np.asarray(ctx["dataset_hash"]),
         dataset_id_base=np.asarray(ctx["dataset_id_base"]),
-        delta_pos_m=np.asarray(delta_pos, dtype=np.float64),
+        delta_pos_m=np.asarray(np.nan if delta_pos is None else delta_pos, dtype=np.float64),
+        delta_xy_m=np.asarray(np.nan if delta_xy is None else delta_xy, dtype=np.float64),
+        delta_z_m=np.asarray(delta_z, dtype=np.float64),
+        require_contact_match=np.asarray(require_contact_match, dtype=bool),
         delta_rot_rad=np.asarray(angle_limit, dtype=np.float64),
         window=np.asarray(WINDOW, dtype=np.int64),
         knn=np.asarray(knn, dtype=np.int64),
     )
     report = {
-        "spec_version": "v1.8",
+        "spec_version": "v1.8b" if strict_components or require_contact_match else "v1.8",
         "dataset_id_base": ctx["dataset_id_base"],
         "dataset_hash": ctx["dataset_hash"],
         "checkpoint": str(checkpoint_path.resolve()),
         "checkpoint_sha256": str(metadata.get("params_sha256")),
-        "delta_pos_m": float(delta_pos),
+        "delta_pos_m": None if delta_pos is None else float(delta_pos),
+        "delta_xy_m": None if delta_xy is None else float(delta_xy),
+        "delta_z_m": float(delta_z),
+        "require_contact_match": bool(require_contact_match),
+        "match_mode": "v18b_components" if strict_components else "legacy_isotropic",
         "delta_rot_deg": float(delta_rot_deg),
         "window": WINDOW,
         "knn": knn,
@@ -626,8 +690,13 @@ def _summarize_cost(cost: np.ndarray) -> dict[str, float | int]:
 
 def task_budget_sweep(
     ctx: dict[str, Any], task: int, pairs_state: np.ndarray, distances: np.ndarray,
-    *, max_budget: int = 32,
+    *, max_budget: int = 32, bridge_filter: str = "none", k_free: int = 20,
+    contact_sensitive_cap: bool = True,
 ) -> dict[str, Any]:
+    if bridge_filter not in {"none", "c0"}:
+        raise ValueError("bridge_filter must be 'none' or 'c0'")
+    if k_free not in {20, 40, 80}:
+        raise ValueError("k_free must be one of 20, 40, or 80 steps")
     inputs = _task_graph_inputs(ctx, task)
     state_to_node, node_states, node_ep, node_time, goals_mask, base_src, base_dst, base_weight = inputs
     pairs = np.asarray(pairs_state, dtype=np.int64)
@@ -639,10 +708,23 @@ def task_budget_sweep(
     if np.any(local_src < 0) or np.any(local_dst < 0):
         raise ValueError("candidate endpoint is absent from the task graph node set")
     c0 = _base_costs(len(node_states), np.flatnonzero(goals_mask), base_src, base_dst, base_weight)
-    target_finite = np.isfinite(c0[local_dst])
-    gain = c0[local_src] - c0[local_dst]
-    optimistic = target_finite & (gain >= 10.0)
-    accepted = optimistic & (dtheta <= MAX_DISTANCE_STEPS)
+    if bridge_filter == "c0":
+        target_finite = np.isfinite(c0[local_dst])
+        gain = c0[local_src] - c0[local_dst]
+        optimistic = target_finite & (gain >= 10.0)
+    else:
+        # All judged edges enter the layered reverse-Dijkstra recurrence. This
+        # permits bridge chains whose intermediate destinations are not
+        # reachable through temporal edges alone.
+        optimistic = np.ones(len(pairs), dtype=bool)
+    if contact_sensitive_cap:
+        contact = np.asarray(ctx["states"][:, 18] > 0.5, dtype=bool)
+        both_free = ~contact[pairs[:, 0]] & ~contact[pairs[:, 1]]
+        dtheta_cap = np.where(both_free, int(k_free), int(MAX_DISTANCE_STEPS))
+    else:
+        both_free = np.zeros(len(pairs), dtype=bool)
+        dtheta_cap = np.full(len(pairs), MAX_DISTANCE_STEPS, dtype=np.float64)
+    accepted = optimistic & (dtheta <= dtheta_cap)
     bsrc = local_src[accepted]
     bdst = local_dst[accepted]
     bweight = dtheta[accepted].astype(np.float64) + BRIDGE_LAMBDA_STEPS
@@ -672,6 +754,10 @@ def task_budget_sweep(
         "accepted_bridge_dst": bdst,
         "accepted_bridge_weight_steps": bweight,
         "accepted_bridge_distance_steps": dtheta[accepted],
+        "accepted_both_free": both_free[accepted],
+        "accepted_free_extended_distance_steps": dtheta[accepted & both_free & (dtheta > MAX_DISTANCE_STEPS)],
+        "bridge_filter": bridge_filter,
+        "k_free": int(k_free),
         "accepted_pair_pos_m": None,
         "accepted_pair_rot_rad": None,
         "c0_node": c0,
@@ -705,7 +791,12 @@ def build_cube_judged_graph(
     b_max: int,
     target_kind: str = "discounted",
     gamma: float = 0.99,
-    delta_pos: float,
+    delta_pos: float | None = None,
+    delta_xy: float | None = None,
+    delta_z: float = DELTA_Z_V18B_M,
+    require_contact_match: bool = False,
+    bridge_filter: str = "none",
+    k_free: int = 20,
     delta_rot_deg: float = DELTA_ROT_DEG,
     bridge_lambda_steps: float = BRIDGE_LAMBDA_STEPS,
     max_budget_for_sweep: int = 32,
@@ -720,9 +811,14 @@ def build_cube_judged_graph(
         candidate_pairs = np.asarray(cache["pairs"], dtype=np.int64)
         cached_dataset_hash = str(cache["dataset_hash"].item())
         cached_delta_pos = float(cache["delta_pos_m"].item())
+        cached_delta_xy = float(cache["delta_xy_m"].item()) if "delta_xy_m" in cache.files else np.nan
+        cached_delta_z = float(cache["delta_z_m"].item()) if "delta_z_m" in cache.files else DELTA_Z_V18B_M
+        cached_contact_match = bool(cache["require_contact_match"].item()) if "require_contact_match" in cache.files else False
         cached_delta_rot = float(cache["delta_rot_rad"].item())
         cached_node_ids = np.asarray(cache["node_ids"], dtype=np.int64)
         pair_pos = np.asarray(cache["object_distance_pos_m"], dtype=np.float32)
+        pair_xy = np.asarray(cache["object_distance_xy_m"], dtype=np.float32) if "object_distance_xy_m" in cache.files else pair_pos.copy()
+        pair_z = np.asarray(cache["object_distance_z_m"], dtype=np.float32) if "object_distance_z_m" in cache.files else np.zeros_like(pair_pos)
         pair_rot = np.asarray(cache["object_distance_rot_rad"], dtype=np.float32)
     with np.load(score_cache, allow_pickle=False) as cache:
         score_pairs = np.asarray(cache["pairs"], dtype=np.int64)
@@ -730,13 +826,27 @@ def build_cube_judged_graph(
         score_hash = str(cache["dataset_hash"].item())
     if cached_dataset_hash != ctx["dataset_hash"] or score_hash != ctx["dataset_hash"]:
         raise ValueError("candidate/score cache dataset hash mismatch")
-    if not np.array_equal(candidate_pairs, score_pairs) or pair_pos.shape != distance.shape or pair_rot.shape != distance.shape:
+    if (not np.array_equal(candidate_pairs, score_pairs) or pair_pos.shape != distance.shape
+            or pair_xy.shape != distance.shape or pair_z.shape != distance.shape or pair_rot.shape != distance.shape):
         raise ValueError("candidate and dθ score caches are not aligned")
     if not np.array_equal(cached_node_ids, ctx["candidate_node_ids"]):
         raise ValueError("candidate node table does not match cube state ordering")
-    if not math.isclose(cached_delta_pos, delta_pos) or not math.isclose(cached_delta_rot, math.radians(delta_rot_deg)):
-        raise ValueError("requested δ differs from candidate cache tolerances")
-    sweep = task_budget_sweep(ctx, task, candidate_pairs, distance, max_budget=max_budget_for_sweep)
+    if delta_xy is not None:
+        if (not math.isclose(cached_delta_xy, delta_xy) or not math.isclose(cached_delta_z, delta_z)
+                or cached_contact_match != require_contact_match):
+            raise ValueError("requested component δ/contact match differs from candidate cache")
+    elif delta_pos is not None:
+        if not math.isclose(cached_delta_pos, delta_pos):
+            raise ValueError("requested δ differs from candidate cache tolerance")
+    else:
+        raise ValueError("provide delta_pos or delta_xy")
+    if not math.isclose(cached_delta_rot, math.radians(delta_rot_deg)):
+        raise ValueError("requested rotation δ differs from candidate cache tolerance")
+    sweep = task_budget_sweep(
+        ctx, task, candidate_pairs, distance, max_budget=max_budget_for_sweep,
+        bridge_filter=bridge_filter, k_free=k_free,
+        contact_sensitive_cap=(delta_xy is not None),
+    )
     inputs = _task_graph_inputs(ctx, task)
     state_to_node, node_states, node_ep, node_time, node_goals, base_src, base_dst, base_weight = inputs
     if b_max > sweep["cost_by_budget"].shape[0] - 1:
@@ -780,14 +890,22 @@ def build_cube_judged_graph(
         "successor": successor.astype(np.int32),
     }
     graph_meta = {
-        "schema_version": "cube-graph-v1.8",
-        "spec_version": "v1.8",
+        "schema_version": "cube-graph-v1.8b" if delta_xy is not None else "cube-graph-v1.8",
+        "spec_version": "v1.8b" if delta_xy is not None else "v1.8",
         "dataset_id": dataset_id,
         "dataset_hash": ctx["dataset_hash"],
         "task": task,
-        "object_match": "cube-indexed-position-and-cube-symmetry-rotation-threshold",
-        "delta_pos_m": float(delta_pos),
+        "object_match": (
+            "indexed-cubes-Dxy-Dz-cube-symmetry-rotation-and-contact"
+            if delta_xy is not None else "cube-indexed-position-and-cube-symmetry-rotation-threshold"
+        ),
+        "delta_pos_m": None if delta_pos is None else float(delta_pos),
+        "delta_xy_m": None if delta_xy is None else float(delta_xy),
+        "delta_z_m": float(delta_z),
+        "require_contact_match": bool(require_contact_match),
         "delta_rot_deg": float(delta_rot_deg),
+        "bridge_filter": bridge_filter,
+        "k_free_steps": int(k_free),
         "judge": "robot-window-5 IQE d_theta",
         "dtheta_max_steps": MAX_DISTANCE_STEPS,
         "bridge_lambda_steps": float(bridge_lambda_steps),
@@ -800,7 +918,9 @@ def build_cube_judged_graph(
         "n_optimistic_candidates": int(sweep["n_optimistic_candidates"]),
         "n_accepted_bridges": int(sweep["n_accepted_bridges"]),
         "n_retained_bridges": int(len(retained_src)),
-        "candidate_delta_pos_m": cached_delta_pos,
+        "candidate_delta_pos_m": None if not np.isfinite(cached_delta_pos) else cached_delta_pos,
+        "candidate_delta_xy_m": None if not np.isfinite(cached_delta_xy) else cached_delta_xy,
+        "candidate_delta_z_m": cached_delta_z,
         "candidate_delta_rot_rad": cached_delta_rot,
     }
     graph_hash = _graph_hash(graph_meta, graph_arrays)
@@ -820,7 +940,7 @@ def build_cube_judged_graph(
         filename = "targets.npz" if kind == target_kind else f"targets_{kind}.npz"
         target_hashes[kind] = save_targets(
             target, out_path / filename,
-            target_provenance={"kind": "learned", "spec_version": "v1.8", "graph_hash": graph_hash},
+            target_provenance={"kind": "learned", "spec_version": graph_meta["spec_version"], "graph_hash": graph_hash},
         )
         targets_by_kind[kind] = target
     target = targets_by_kind[target_kind]
@@ -861,11 +981,27 @@ def build_cube_judged_graph(
         "accepted_object_distance_pos_p90_cm": float(np.quantile(pair_pos[accepted_idxs], 0.9) * 100) if len(accepted_idxs) else None,
         "accepted_object_distance_rot_p50_deg": float(np.median(pair_rot[accepted_idxs]) * 180 / math.pi) if len(accepted_idxs) else None,
         "accepted_object_distance_rot_p90_deg": float(np.quantile(pair_rot[accepted_idxs], 0.9) * 180 / math.pi) if len(accepted_idxs) else None,
-        "retained_object_distance_pos_violation_count": int(np.count_nonzero(pair_pos[retained_idxs] > delta_pos)),
+        "retained_object_distance_pos_violation_count": int(np.count_nonzero(
+            pair_pos[retained_idxs] > delta_pos
+        )) if delta_pos is not None else int(np.count_nonzero(pair_xy[retained_idxs] > float(delta_xy))),
+        "retained_object_distance_xy_violation_count": int(np.count_nonzero(pair_xy[retained_idxs] > float(delta_xy))) if delta_xy is not None else 0,
+        "retained_object_distance_z_violation_count": int(np.count_nonzero(pair_z[retained_idxs] > float(delta_z))) if delta_xy is not None else 0,
+        "retained_contact_mismatch_count": int(np.count_nonzero(
+            (np.asarray(ctx["states"])[candidate_pairs[retained_idxs, 0], 18] > 0.5)
+            != (np.asarray(ctx["states"])[candidate_pairs[retained_idxs, 1], 18] > 0.5)
+        )) if require_contact_match else 0,
         "accepted_grasp_mismatch_fraction": compute_grasp_mismatch(ctx, candidate_pairs[accepted_idxs]),
         "accepted_grasp_mismatch_count": int(round(
             compute_grasp_mismatch(ctx, candidate_pairs[accepted_idxs]) * len(accepted_idxs)
         )),
+        "accepted_free_extended_dtheta_p50": (
+            float(np.median(sweep["accepted_free_extended_distance_steps"]))
+            if len(sweep["accepted_free_extended_distance_steps"]) else None
+        ),
+        "accepted_free_extended_dtheta_p90": (
+            float(np.quantile(sweep["accepted_free_extended_distance_steps"], 0.9))
+            if len(sweep["accepted_free_extended_distance_steps"]) else None
+        ),
         "target_rows": int(len(target.y)),
     }
     (out_path / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
@@ -894,9 +1030,57 @@ def compute_grasp_mismatch(ctx: dict[str, Any], pair_indices: np.ndarray) -> flo
     return float(np.mean(grasped[pairs[:, 0]] != grasped[pairs[:, 1]]))
 
 
+def cube_support_states(objects: np.ndarray) -> np.ndarray:
+    """Classify each indexed cube as table, stacked, or lifted."""
+    poses = np.asarray(objects, dtype=np.float64)
+    if poses.ndim < 2 or poses.shape[-2:] != (2, 7):
+        raise ValueError("objects must have shape (...,2,7)")
+    xyz = poses[..., :, :3]
+    labels = np.full(xyz.shape[:-1], 2, dtype=np.uint8)  # lifted
+    labels[xyz[..., 2] < 0.03] = 0  # table
+    for cube in range(2):
+        other = 1 - cube
+        horizontal = np.linalg.norm(xyz[..., cube, :2] - xyz[..., other, :2], axis=-1)
+        vertical = xyz[..., cube, 2] - xyz[..., other, 2]
+        stacked = (horizontal < 0.02) & (vertical >= 0.03) & (vertical <= 0.05)
+        labels[..., cube][stacked] = 1
+    return labels
+
+
+def cube_support_mismatch(ctx: dict[str, Any], pair_indices: np.ndarray) -> np.ndarray:
+    """Return per-pair mismatch if either cube's support class differs."""
+    pairs = np.asarray(pair_indices, dtype=np.int64)
+    if pairs.ndim != 2 or pairs.shape[1] != 2:
+        raise ValueError("pair_indices must have shape (N,2)")
+    if not len(pairs):
+        return np.zeros(0, dtype=bool)
+    states = cube_support_states(np.asarray(ctx["objects"]))
+    return np.any(states[pairs[:, 0]] != states[pairs[:, 1]], axis=1)
+
+
+def cube_pair_structure(ctx: dict[str, Any], pair_indices: np.ndarray) -> dict[str, np.ndarray]:
+    """Compute exact component deltas and structural match flags for pairs."""
+    pairs = np.asarray(pair_indices, dtype=np.int64)
+    left, right = np.asarray(ctx["objects"])[pairs[:, 0]], np.asarray(ctx["objects"])[pairs[:, 1]]
+    dxy, dz, drot = cube_object_distance_components(left, right)
+    contact = np.asarray(ctx["states"][:, 18] > 0.5, dtype=bool)
+    return {
+        "dxy_m": np.asarray(dxy, dtype=np.float64),
+        "dz_m": np.asarray(dz, dtype=np.float64),
+        "drot_rad": np.asarray(drot, dtype=np.float64),
+        "contact_mismatch": contact[pairs[:, 0]] != contact[pairs[:, 1]],
+        "support_mismatch": cube_support_mismatch(ctx, pairs),
+        "legacy_grasp_mismatch": np.asarray([
+            (contact[a] or np.any(ctx["objects"][a, :, 2] > 0.04))
+            != (contact[b] or np.any(ctx["objects"][b, :, 2] > 0.04))
+            for a, b in pairs
+        ], dtype=bool),
+    }
+
+
 def summarize_delta_sweep(
     ctx: dict[str, Any], candidate_paths: dict[float, Path], score_paths: dict[float, Path],
-    *, max_budget: int = 32,
+    *, max_budget: int = 32, bridge_filter: str = "none", k_free: int = 20,
 ) -> tuple[dict[str, Any], float]:
     """Run task-specific C sweeps and select the strictest δp within 0.5 pp."""
     table: dict[str, Any] = {"spec_version": "v1.8", "rows": {}, "tasks": {}}
@@ -910,10 +1094,15 @@ def summarize_delta_sweep(
             raise ValueError("candidate and score arrays differ in δ sweep")
         task_sweeps = {}
         for task in range(1, 6):
-            task_sweeps[task] = task_budget_sweep(ctx, task, pairs, distances, max_budget=max_budget)
+            task_sweeps[task] = task_budget_sweep(
+                ctx, task, pairs, distances, max_budget=max_budget,
+                bridge_filter=bridge_filter, k_free=k_free,
+            )
         mean_reachability = float(np.mean([task_sweeps[t]["r_sat"] for t in range(1, 6)]))
         table["rows"][f"{delta_pos:.3f}"] = {
             "delta_pos_m": delta_pos,
+            "bridge_filter": bridge_filter,
+            "k_free": int(k_free),
             "candidate_pairs": int(len(pairs)),
             "mean_accepted_bridges_over_tasks": float(np.mean([task_sweeps[t]["n_accepted_bridges"] for t in range(1, 6)])),
             "mean_reachability_b32": mean_reachability,

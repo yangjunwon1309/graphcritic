@@ -104,6 +104,59 @@ def object_distance(o: np.ndarray, o_prime: np.ndarray) -> tuple[np.ndarray | fl
     return pos, rot
 
 
+def cube_object_distance_components(
+    o: np.ndarray, o_prime: np.ndarray,
+) -> tuple[np.ndarray | float, np.ndarray | float, np.ndarray | float]:
+    """Return indexed-cube ``(D_xy, D_z, D_rot)`` in physical units.
+
+    ``D_xy`` is the maximum across cubes of their planar Euclidean distance;
+    ``D_z`` is the maximum absolute height difference. ``D_rot`` uses the
+    same 24-element cube-symmetry quotient as :func:`object_distance`.
+    """
+    left = np.asarray(o, dtype=np.float64)
+    right = np.asarray(o_prime, dtype=np.float64)
+    if left.ndim < 2 or right.ndim < 2 or left.shape[-2:] != (2, 7) or right.shape[-2:] != (2, 7):
+        raise SchemaError("cube object states must have shape (..., 2, 7) [XYZ,wxyz] and retain cube order")
+    try:
+        left, right = np.broadcast_arrays(left, right)
+    except ValueError as exc:
+        raise SchemaError("cube object states must have broadcast-compatible leading dimensions") from exc
+    if np.any(~np.isfinite(left)) or np.any(~np.isfinite(right)):
+        raise SchemaError("cube object states must be finite")
+    delta = left[..., :, :3] - right[..., :, :3]
+    d_xy = np.max(np.linalg.norm(delta[..., :2], axis=-1), axis=-1)
+    d_z = np.max(np.abs(delta[..., 2]), axis=-1)
+    # Reuse the established symmetry-aware rotation implementation.
+    _, d_rot = object_distance(left, right)
+    return d_xy, d_z, d_rot
+
+
+def cube_object_threshold_match(
+    o: np.ndarray,
+    o_prime: np.ndarray,
+    *,
+    delta_xy: float,
+    delta_z: float = 0.01,
+    delta_rot: float = np.deg2rad(15.0),
+    contact: np.ndarray | bool = False,
+    contact_prime: np.ndarray | bool = False,
+) -> np.ndarray | bool:
+    """Apply v1.8b indexed position, height, rotation, and contact matches."""
+    tolerances = (delta_xy, delta_z, delta_rot)
+    if any(not np.isfinite(value) or value < 0 for value in tolerances):
+        raise ValueError("cube object tolerances must be finite and non-negative")
+    d_xy, d_z, d_rot = cube_object_distance_components(o, o_prime)
+    try:
+        same_contact = np.asarray(contact, dtype=bool) == np.asarray(contact_prime, dtype=bool)
+        matched = ((np.asarray(d_xy) <= float(delta_xy))
+                   & (np.asarray(d_z) <= float(delta_z))
+                   & (np.asarray(d_rot) <= float(delta_rot))
+                   & same_contact)
+    except ValueError as exc:
+        raise SchemaError("contact flags must broadcast with cube object state pairs") from exc
+    return bool(matched) if np.ndim(matched) == 0 else matched
+
+
 def object_threshold_match(
     o: np.ndarray, o_prime: np.ndarray, *, delta_pos: float, delta_rot: float,
     representation: str = "cube",

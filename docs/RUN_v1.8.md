@@ -257,3 +257,121 @@ done
 For the remaining runs, repeat each block with `SEED=1` and then `SEED=2`.
 Record the 25k–300k success curve, last-four-evaluation mean, first steps above
 0.5 and 0.9, and area under the 25k–300k curve.
+
+## 6. v1.8b — split cube state and multi-bridge sweep
+
+This continuation uses the fixed 40k robot-only dθ checkpoint. It keeps the
+32-neighbor robot-window candidate rule and changes the cube match to separate
+planar position, height, cube-symmetry rotation, and gripper contact. The cube
+bridge filter defaults to `none`, so all judged bridges enter the layered
+budgeted shortest-path calculation. `c0` remains available for comparison.
+All new outputs go under `v18/v18b/`; the v1.8 artifacts are read-only.
+
+```bash
+set -euo pipefail
+ROOT=/home/url/graphcritic
+PY=$ROOT/.pixi/envs/bench/bin/python
+DATA=/home/url/.ogbench/data/cube-double-play-v0.npz
+V18=$ROOT/outputs/cube-double-play/v18
+VB=$V18/v18b
+STATE=$V18/dtheta_robot_window5_r40k/step_040000
+cd "$ROOT"
+git status -sb
+git -C third_party/qc status -sb
+git -C third_party/fql status -sb
+git -C third_party/dqc status -sb
+JAX_PLATFORMS=cuda $PY experiments/sweep_object_delta_v18b.py \
+  --cube-double-dataset "$DATA" --checkpoint "$STATE" \
+  --legacy-dir "$V18/bridge_sweep" --bridge-filter none \
+  --embedding-pair-batch-size 4096 --out "$VB"
+```
+
+The driver builds candidates for `δxy={2,3,4} cm`, `δz=1 cm`, `δrot=15°`,
+and same-contact endpoints. It sweeps `Kfree={20,40,80}` while retaining the
+32-neighbor candidate rule; a 40/80-step cap applies only when both endpoints
+are non-contact, otherwise the cap is 20. The two v1.8 diagnostic rows reuse
+the existing `bridge_sweep` cache. The driver records the C0 comparison and
+stops before S4′ if the selected five-task mean reachability is below 0.5.
+It then audits G2′ and stops before S5 if any structural mismatch remains or
+support-state disagreement exceeds 5%. If both gates pass, it builds each
+task's QC discounted and DQC gamma-power targets under `v18/v18b/graphs/`.
+
+### S6/S8 — QC
+
+Run only when `sweep_v18b.json` records S3′ and S4′ as passed and all five task
+graph directories exist. These are the v1.8 commands with `VB` as the output
+root; run sequentially and use `SEED=0` before seeds 1 and 2.
+
+```bash
+set -euo pipefail
+ROOT=/home/url/graphcritic
+PY=$ROOT/.pixi/envs/bench/bin/python
+DATA=/home/url/.ogbench/data/cube-double-play-v0.npz
+VB=$ROOT/outputs/cube-double-play/v18/v18b
+SEED=0
+cd "$ROOT/third_party/qc"
+for TASK in 1 2 3 4 5; do
+  ENV=cube-double-play-singletask-task${TASK}-v0
+  TARGET=$VB/graphs/task${TASK}
+  DATASET_ID=$($PY -c 'import json,sys; print(json.load(open(sys.argv[1]))["config"]["dataset_id"])' "$TARGET/targets.json")
+  MUJOCO_GL=egl WANDB_MODE=offline PYTHONPATH="$ROOT:$ROOT/third_party/qc" $PY main.py \
+    --run_group="v18b-cube-t${TASK}-qc-td-s${SEED}" --agent.actor_type=best-of-n \
+    --agent.actor_num_samples=32 --agent.action_chunking=True --agent.critic_mode=td \
+    --agent.alpha=100 --agent.batch_size=256 --agent.lr=0.0003 --agent.num_qs=2 \
+    --agent.layer_norm=True --agent.q_agg=mean --env_name="$ENV" \
+    --ogbench_dataset_path="$DATA" --sparse=False --horizon_length=5 \
+    --offline_steps=300000 --online_steps=0 --eval_interval=25000 \
+    --eval_episodes=50 --save_interval=25000 --seed="$SEED" \
+    --save_dir="$VB/runs/QC_td/task${TASK}/seed${SEED}"
+  MUJOCO_GL=egl WANDB_MODE=offline PYTHONPATH="$ROOT:$ROOT/third_party/qc" $PY main.py \
+    --run_group="v18b-cube-t${TASK}-qc-graph-s${SEED}" --agent.actor_type=best-of-n \
+    --agent.actor_num_samples=32 --agent.action_chunking=True --agent.critic_mode=graph \
+    --agent.graph_target_kind=discounted --agent.graph_target_unit=steps \
+    --agent.graph_target_gamma=0.99 --agent.alpha=100 --agent.batch_size=256 \
+    --agent.lr=0.0003 --agent.num_qs=2 --agent.layer_norm=True --agent.q_agg=mean \
+    --env_name="$ENV" --ogbench_dataset_path="$DATA" --sparse=False --horizon_length=5 \
+    --offline_steps=300000 --online_steps=0 --eval_interval=25000 \
+    --eval_episodes=50 --save_interval=25000 --seed="$SEED" \
+    --graph_targets="$TARGET/targets.npz" --graph_dataset_id="$DATASET_ID" \
+    --save_dir="$VB/runs/QC_graph/task${TASK}/seed${SEED}"
+done
+```
+
+### S7/S8 — DQC
+
+Run after QC seed 0 completes, then repeat with seed 1 and seed 2 only after
+the full seed-0 QC/DQC blocks. The TD and direct graph-action flags match v1.8.
+
+```bash
+set -euo pipefail
+ROOT=/home/url/graphcritic
+PY=$ROOT/.pixi/envs/bench/bin/python
+DATA=/home/url/.ogbench/data/cube-double-play-v0.npz
+VB=$ROOT/outputs/cube-double-play/v18/v18b
+SEED=0
+cd "$ROOT/third_party/dqc"
+for TASK in 1 2 3 4 5; do
+  ENV=cube-double-play-singletask-task${TASK}-v0
+  TARGET=$VB/graphs/task${TASK}
+  DATASET_ID=$($PY -c 'import json,sys; print(json.load(open(sys.argv[1]))["config"]["dataset_id"])' "$TARGET/targets_gamma_pow.json")
+  MUJOCO_GL=egl WANDB_MODE=offline PYTHONPATH="$ROOT:$ROOT/third_party/dqc" $PY main.py \
+    --run_group="v18b-cube-t${TASK}-dqc-td-s${SEED}" --task_mode=single --critic_mode=td \
+    --agent.backup_horizon=25 --agent.policy_chunk_size=5 --agent.use_chunk_critic=True \
+    --agent.kappa_b=0.93 --agent.kappa_d=0.8 --agent.discount=0.99 \
+    --agent.distill_method=expectile --agent.implicit_backup_type=quantile \
+    --agent.batch_size=256 --agent.num_qs=2 --agent.q_agg=mean --agent.best_of_n=32 \
+    --agent.flow_steps=10 --agent.lr=0.0003 --env_name="$ENV" --ogbench_dataset_path="$DATA" \
+    --offline_steps=300000 --eval_interval=25000 --eval_episodes=50 --video_episodes=0 \
+    --save_interval=25000 --seed="$SEED" --save_dir="$VB/runs/DQC_td/task${TASK}/seed${SEED}"
+  MUJOCO_GL=egl WANDB_MODE=offline PYTHONPATH="$ROOT:$ROOT/third_party/dqc" $PY main.py \
+    --run_group="v18b-cube-t${TASK}-dqc-graph-s${SEED}" --task_mode=single --critic_mode=graph \
+    --graph_targets="$TARGET/targets_gamma_pow.npz" --graph_dataset_id="$DATASET_ID" \
+    --agent.backup_horizon=5 --agent.policy_chunk_size=5 --agent.use_chunk_critic=False \
+    --agent.graph_target_level=action --agent.kappa_b=0.9 --agent.kappa_d=0.5 \
+    --agent.discount=0.99 --agent.distill_method=expectile --agent.implicit_backup_type=quantile \
+    --agent.batch_size=256 --agent.num_qs=2 --agent.q_agg=mean --agent.best_of_n=32 \
+    --agent.flow_steps=10 --agent.lr=0.0003 --env_name="$ENV" --ogbench_dataset_path="$DATA" \
+    --offline_steps=300000 --eval_interval=25000 --eval_episodes=50 --video_episodes=0 \
+    --save_interval=25000 --seed="$SEED" --save_dir="$VB/runs/DQC_graph/task${TASK}/seed${SEED}"
+done
+```
